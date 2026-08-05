@@ -1,0 +1,235 @@
+# JavaScript/TypeScript rules — Node/Express back ends.
+#
+# Why these exist: run against NodeGoat, a deliberately vulnerable application,
+# the stock rule set produced 16 findings and missed the NoSQL injection, the
+# prototype pollution and the unsigned-JWT acceptance the application is *built*
+# to demonstrate. A triage layer cannot recover a finding the scanner never made.
+#
+# Same policy as rules/semgrep/php.yaml: catch generously and let triage sort it
+# out. A pattern here that fires on safe code costs one review; a class with no
+# pattern at all costs a silent miss.
+#
+# Untrusted input in Express is req.body / req.query / req.params / req.headers
+# / req.cookies. Several rules below match those directly rather than relying on
+# taint mode, because taint mode needs the source and sink in one file and real
+# handlers split them across a router and a service.
+
+rules:
+  # --- code execution ----------------------------------------------------
+  - id: js-eval-with-input
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Code evaluated at runtime. If any part of the string comes from a request,
+      this is remote code execution — check where the argument originates.
+    metadata:
+      cwe: "CWE-95: Eval Injection"
+      category: security
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: $VM.runInThisContext(...)
+      - pattern: $VM.runInNewContext(...)
+      # Both take a *string* body in this form and compile it, which is eval by
+      # another name. The function form is safe and is deliberately not matched.
+      - pattern-regex: \b(setTimeout|setInterval)\s*\(\s*["'`]
+
+  - id: js-child-process-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A shell command is executed. `exec`/`execSync` pass the string to a shell,
+      so any request-derived part is command injection. `execFile`/`spawn` with an
+      argument array are the safe forms.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      category: security
+    pattern-either:
+      - pattern: $CP.exec($CMD, ...)
+      - pattern: $CP.execSync($CMD, ...)
+      - pattern: "$CP.spawn($CMD, ..., {shell: true})"
+      - pattern: "$CP.execFile($CMD, ..., {shell: true})"
+
+  - id: js-unsafe-deserialization
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Deserialization that can construct arbitrary objects or evaluate embedded
+      functions. Feeding it request data is remote code execution.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      category: security
+    pattern-either:
+      - pattern: $S.unserialize(...)
+      - pattern: $Y.load($DATA)          # js-yaml < 4 defaults to the unsafe schema
+      - pattern: $Y.loadAll($DATA)
+
+  # --- injection into data stores ---------------------------------------
+  - id: js-nosql-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A request value is used directly in a MongoDB query. Objects survive query
+      parsing, so `{"$gt": ""}` in the body turns an equality check into a match-all
+      — the classic authentication bypass. Confirm the value is cast to a string.
+    metadata:
+      cwe: "CWE-943: Injection into NoSQL Datastore"
+      category: security
+    pattern-either:
+      - pattern: "$COLL.find({..., $F: $REQ.body.$X, ...}, ...)"
+      - pattern: "$COLL.findOne({..., $F: $REQ.body.$X, ...}, ...)"
+      - pattern: "$COLL.find({..., $F: $REQ.query.$X, ...}, ...)"
+      - pattern: "$COLL.findOne({..., $F: $REQ.query.$X, ...}, ...)"
+      - pattern: "$COLL.deleteOne({..., $F: $REQ.body.$X, ...}, ...)"
+      - pattern: "$COLL.updateOne({..., $F: $REQ.body.$X, ...}, ...)"
+      # `$where` runs server-side JavaScript no matter where the string came from.
+      - pattern: "$COLL.find({..., $where: ...}, ...)"
+
+  - id: js-sql-string-built
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      SQL assembled by template literal or concatenation. Parameter placeholders
+      ($1, ?) are the fix; quoting the interpolated value is not.
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      category: security
+    pattern-either:
+      - pattern-regex: '`[^`]*\b(?i:SELECT|INSERT|UPDATE|DELETE)\b[^`]*\$\{[^`]*`'
+      - pattern-regex: '["''][^"'']*\b(?i:SELECT|INSERT|UPDATE|DELETE)\b[^"'']*["'']\s*\+\s*'
+
+  # --- prototype pollution ----------------------------------------------
+  - id: js-prototype-pollution-merge
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A recursive merge or dynamic property write reached by request data can set
+      `__proto__` and change every object in the process. Check that the key is
+      validated, or that the target is a null-prototype object.
+    metadata:
+      cwe: "CWE-1321: Prototype Pollution"
+      category: security
+    pattern-either:
+      - pattern: $_.merge($TARGET, $REQ.body, ...)
+      - pattern: $_.mergeWith($TARGET, $REQ.body, ...)
+      - pattern: $_.defaultsDeep($TARGET, $REQ.body, ...)
+      - pattern: Object.assign($TARGET, $REQ.body, ...)
+      - pattern: $OBJ[$REQ.body.$K] = $V
+      - pattern: $OBJ[$REQ.query.$K] = $V
+      - pattern: $OBJ[$REQ.params.$K] = $V
+
+  # --- authentication and session ---------------------------------------
+  - id: js-jwt-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A JWT is read without verifying its signature, or verification accepts the
+      `none` algorithm. Anyone can then mint a token with any claims they like.
+    metadata:
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      category: security
+    pattern-either:
+      - pattern: $JWT.decode(...)
+      - pattern: '$JWT.verify(..., {..., algorithms: [..., "none", ...], ...})'
+      - pattern: "$JWT.verify(..., {..., ignoreExpiration: true, ...})"
+
+  - id: js-insecure-cookie-flags
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A session cookie without httpOnly/secure. httpOnly keeps it out of reach of
+      injected script; secure keeps it off plaintext connections.
+    metadata:
+      cwe: "CWE-1004: Sensitive Cookie Without HttpOnly Flag"
+      category: security
+    pattern-either:
+      - pattern: "$APP.use($SESSION({..., cookie: {..., httpOnly: false, ...}, ...}))"
+      - pattern: "$APP.use($SESSION({..., cookie: {..., secure: false, ...}, ...}))"
+      - pattern: "$RES.cookie($NAME, $VAL, {..., httpOnly: false, ...})"
+
+  - id: js-weak-random-for-security
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Math.random() is not a cryptographic generator and its output is
+      predictable. For a token, session id or password reset it must be
+      crypto.randomBytes / crypto.randomUUID.
+    metadata:
+      cwe: "CWE-338: Use of Cryptographically Weak PRNG"
+      category: security
+    pattern-regex: (?i)\b(token|secret|session|nonce|salt|otp|reset|api_?key)\w*\s*[:=][^;\n]*Math\.random\s*\(
+
+  # --- request-driven file and network access ---------------------------
+  - id: js-path-traversal
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A filesystem path is built from request data. `../` escapes the intended
+      directory; the defence is resolving and then checking the result is still
+      inside the root, not stripping dots.
+    metadata:
+      cwe: "CWE-22: Path Traversal"
+      category: security
+    patterns:
+      - pattern-either:
+          - pattern: $FS.readFile($PATH, ...)
+          - pattern: $FS.readFileSync($PATH, ...)
+          - pattern: $FS.createReadStream($PATH, ...)
+          - pattern: $RES.sendFile($PATH, ...)
+          - pattern: $RES.download($PATH, ...)
+      # The path must come from the request. Without this the rule fires on every
+      # static file read in the project and buries the one that matters.
+      - pattern-regex: req\.(body|query|params)
+
+  - id: js-ssrf
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      An outbound request to a URL taken from the request. Reachable internal
+      services and cloud metadata endpoints are the risk — check for an allow-list
+      of hosts, and note that blocking by hostname alone is bypassable.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery"
+      category: security
+    pattern-either:
+      - pattern: fetch($REQ.body.$X, ...)
+      - pattern: fetch($REQ.query.$X, ...)
+      - pattern: $AXIOS.get($REQ.body.$X, ...)
+      - pattern: $AXIOS.get($REQ.query.$X, ...)
+      - pattern: $AXIOS.post($REQ.body.$X, ...)
+      - pattern: $HTTP.request($REQ.query.$X, ...)
+      - pattern: $REQUEST($REQ.query.$X, ...)
+
+  # --- transport and rendering ------------------------------------------
+  - id: js-tls-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Certificate verification is switched off, so the connection is open to an
+      active network attacker. Encryption without verification proves nothing
+      about who is on the other end.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      category: security
+    pattern-either:
+      - pattern: rejectUnauthorized = false
+      - pattern-regex: rejectUnauthorized\s*:\s*false
+      - pattern-regex: NODE_TLS_REJECT_UNAUTHORIZED\s*\]?\s*=\s*["']?0
+
+  - id: js-xss-sink
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Markup written from a value rather than text. If the value is request-derived
+      and not escaped, this is stored or reflected XSS.
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      category: security
+    pattern-either:
+      - pattern: $EL.innerHTML = $V
+      - pattern: $EL.outerHTML = $V
+      - pattern: $EL.insertAdjacentHTML($POS, $V)
+      - pattern: document.write($V)
+      - pattern: "$X.dangerouslySetInnerHTML = {__html: $V}"
+      # Express: sending a template string straight into the response body.
+      - pattern-regex: res\.send\(\s*`[^`]*\$\{[^`]*`

@@ -1,0 +1,68 @@
+# PHP-профиль. Отдельный файл — дефолтный pipeline.yaml остаётся полиязычным.
+#
+# Для PHP CodeQL нет, поэтому кросс-функциональный контекст даёт LSP (phpactor,
+# включается через configs/lsp.yaml) + taint semgrep/Psalm. LSP здесь несущий, а
+# не вспомогательный: без него весь CWE-89 уходит в unknown (замерено на реальном
+# Symfony-проекте). Запускать из WSL с выставленным PHPACTOR_PHAR.
+
+provider: ollama
+prompt_pack: default
+max_workers: 4
+fail_fast: false
+
+code_context_lines: 6
+max_code_chars: 4000
+max_trace_steps: 12
+
+# Второй, состязательный проход. Для PHP важнее обычного: паттерн-сканеры дают
+# много закрытий на тяжёлых классах (CWE-89/78/98), а опасный пропуск живёт
+# именно в закрытии. Перепроверяем и confirmed (точность), и закрытия на классах
+# с весом последствия >= 26 (SQLi/authn и выше).
+verification:
+  enabled: true
+  mode: advisory
+  challenge_verdicts: [confirmed]
+  challenge_on_override: false
+  challenge_cwes: []
+  challenge_closures_above_consequence: 26
+
+# Очередь на ручной разбор. Бюджет = целевой потолок 10%. Это ПОТОЛОК, а не план:
+# unknown и exempt-позиции (живые секреты, самопротиворечивые вердикты) в разбор
+# идут всегда, даже сверх бюджета — и тогда очередь честно сообщает overflow.
+# Реальная доля ручного разбора снижается не бюджетом, а тем, что LSP+taint
+# закрывают unknown обоснованными вердиктами.
+queue:
+  enabled: true
+  review_budget_pct: 10
+  cluster: true
+  min_score: 50
+
+# Скоуп PHP-прогона. B101 (bandit assert) неактуален для PHP, но безвреден.
+# only_cwes оставлен пустым намеренно: сужать до PHP-семейства — решение прогона,
+# а не профиля; при желании раскомментировать список ниже.
+scope:
+  enabled: true
+  exclude_rules: ["B101 assert_used"]
+  exclude_paths: []
+  only_cwes: []
+  # only_cwes: [CWE-89, CWE-78, CWE-79, CWE-98, CWE-95, CWE-502, CWE-918, CWE-22, CWE-90, CWE-611, CWE-327, CWE-798]
+  min_severity: null
+
+heuristics:
+  enabled: true
+  autoclose_on_hard_fp: false
+  min_secret_entropy: 3.5
+  min_secret_length: 16
+  noisy_path_patterns: []
+  placeholder_markers: []
+
+post_validation:
+  enabled: true
+  require_evidence_quotes: true
+  quote_match_threshold: 0.85
+  confidence_floor: 0.7
+  confirmed_confidence_floor: 0.75
+  escalate_severities: [critical, high]
+  # Закрытие тяжёлого класса (вес >= 26) требует названной и процитированной
+  # защиты, иначе → unknown. Дешёвая страховка от опасного пропуска на PHP.
+  closure_requires_named_defence_above: 26

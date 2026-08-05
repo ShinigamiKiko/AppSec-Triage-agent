@@ -1,0 +1,29 @@
+# ВНИМАНИЕ: внешний API. Evidence package содержит фрагменты исходников и пути.
+# Использовать только на публичном коде / OSS-зависимостях, либо при включённой
+# редакции (redact.enabled в pipeline.yaml) и подписанном DPA.
+kind: openai
+model: ${OPENAI_MODEL:-gpt-4.1-mini}
+base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+api_key: ${OPENAI_API_KEY}
+
+temperature: 0.0
+max_tokens: 2200          # вердикт с трассой и обоснованием; на 1400 бывали обрывы
+
+# Единственный из трёх, кто гарантирует схему на уровне декодера (strict: true).
+json_mode: json_schema
+
+timeout_s: 60
+connect_timeout_s: 10
+max_retries: 3          # у внешнего API 429 — норма жизни, ретраев больше
+backoff_base_s: 1.0
+backoff_max_s: 30.0
+
+concurrency: 8          # сеть, а не GPU — можно параллелить агрессивнее
+
+pricing:
+  input_usd_per_mtok: 0.40
+  output_usd_per_mtok: 1.60
+
+options:
+  seed: 42
+  service_tier: default

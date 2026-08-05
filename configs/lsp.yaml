@@ -1,0 +1,114 @@
+# Языковые серверы. Отвечают на два вопроса, которые не закрывает ни сканер,
+# ни модель: «откуда взялось это значение» и «вызывается ли этот код снаружи».
+#
+# Для PHP это единственный путь к межфункциональному анализу: CodeQL язык не
+# поддерживает и поддерживать не будет.
+
+enabled: true
+# Достижимость дороже: prepareCallHierarchy + incomingCalls на каждую находку.
+reachability: true
+
+# Языки, для которых резолвер ОБЯЗАТЕЛЕН, а не best-effort. Закрытие
+# dataflow-класса без трассы — догадка о недостающем плече потока, и это ровно
+# то место, где живут опасные пропуски. Для php это критично вдвойне (CodeQL
+# язык не поддерживает), но требование единое: у первоклассных языров вердикт
+# без символьной трассы невалиден. Прогон с находками этих языков либо получает
+# работающий сервер на старте, либо завершается ошибкой; --no-lsp — явное
+# согласие на деградацию, и тогда закрытия dataflow-классов уходят в unknown,
+# а не в отчёт как решённые.
+#
+# ts/js обслуживает один сервер typescript (расширения .ts/.tsx/.js/.jsx), так
+# что ключ `typescript` делает строгими оба. Остальные CodeQL-языки (c/cpp, c#,
+# java, kotlin, ruby, rust, swift) остаются best-effort: их трассу даёт CodeQL,
+# а LSP лишь обогащает.
+required_languages: [php, python, go, typescript]
+
+# Границы намеренно жёсткие. Задача — ответить «откуда пришло значение»,
+# а не вклеить модуль в промпт.
+max_definitions: 4
+max_callers: 8
+
+startup_timeout_s: 120     # индексация репозитория на первом запросе
+index_timeout_s: 90         # индекс строится асинхронно после initialize
+request_timeout_s: 20
+
+servers:
+  # Ставится `pipx install python-lsp-server` → бинарь `pylsp` в ~/.local/bin.
+  # Запускаем сам бинарь, а не `python -m pylsp`: в системе интерпретатор зовётся
+  # python3 (не python), и pipx держит pylsp в изолированном venv, недоступном
+  # системному python.
+  python:
+    command: [pylsp]
+    language_id: python
+    extensions: [".py"]
+
+  # PHP-сервер живёт в WSL: на Windows-хосте нет ни php, ни composer.
+  # path_map обязателен — сервер видит проект как /mnt/c/..., а этот процесс
+  # как C:\... Без трансляции каждый запрос называет путь, которого сервер не
+  # видит, и он молча не отвечает. Выглядит как «сервер не работает».
+  #
+  # Phpactor: строит свой индекс и не требует composer install в целевом
+  # репозитории — в отличие от Psalm, которому нужен автозагрузчик проекта.
+  # Запускается как phar, потому что DNS в WSL не резолвит packagist: phar
+  # скачивается на хосте, где сеть есть, и исполняется интерпретатором Linux.
+  #
+  # Конфигурация рассчитана на запуск агента ИЗ WSL — тогда и сервер, и триаж
+  # видят одну файловую систему, и path_map не нужен. Если запускать с
+  # Windows-хоста, потребуется обёртка и карта путей:
+  #   command: [wsl.exe, -d, Ubuntu, --, php, /mnt/c/.../phpactor.phar, language-server]
+  #   path_map: {"C:/": "/mnt/c/"}
+  php:
+    command: [php, "${PHPACTOR_PHAR:-/opt/phpactor.phar}", language-server]
+    language_id: php
+    extensions: [".php"]
+
+  # typescript-language-server ставится через npm.
+  typescript:
+    command: [typescript-language-server, --stdio]
+    language_id: typescript
+    extensions: [".ts", ".tsx", ".js", ".jsx"]
+
+  # gopls ставится через `go install golang.org/x/tools/gopls@latest`.
+  # Для Go основной анализ — CodeQL; LSP отвечает на тот же вопрос, что и для PHP:
+  # откуда пришло значение и вызывается ли код снаружи.
+  go:
+    command: [gopls]
+    language_id: go
+    extensions: [".go"]
+
+  # Optional resolvers for the remaining CodeQL languages.  They enrich triage
+  # with definitions/callers; CodeQL remains responsible for SAST findings.
+  c-cpp:
+    command: [clangd]
+    language_id: cpp
+    extensions: [".c", ".h", ".cc", ".cp", ".cpp", ".cxx", ".c++"]
+
+  csharp:
+    command: [OmniSharp, --languageserver, --stdio]
+    language_id: csharp
+    extensions: [".cs"]
+
+  java:
+    command: [jdtls]
+    language_id: java
+    extensions: [".java"]
+
+  kotlin:
+    command: [kotlin-language-server]
+    language_id: kotlin
+    extensions: [".kt"]
+
+  ruby:
+    command: [solargraph, stdio]
+    language_id: ruby
+    extensions: [".rb"]
+
+  rust:
+    command: [rust-analyzer]
+    language_id: rust
+    extensions: [".rs"]
+
+  swift:
+    command: [sourcekit-lsp]
+    language_id: swift
+    extensions: [".swift"]

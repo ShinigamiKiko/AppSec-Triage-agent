@@ -1,0 +1,20 @@
+# PHP-only LSP profile. Используется для смешанных репозиториев (Laravel, Symfony+Vite),
+# где typescript-language-server пытается проиндексировать весь node_modules и висит.
+# Всё остальное — идентично lsp.yaml: phpactor обязателен, reachability включена.
+
+enabled: true
+reachability: true
+required_languages: [php]
+
+max_definitions: 4
+max_callers: 8
+
+startup_timeout_s: 120
+index_timeout_s: 90
+request_timeout_s: 20
+
+servers:
+  php:
+    command: [php, "${PHPACTOR_PHAR:-/opt/phpactor.phar}", language-server]
+    language_id: php
+    extensions: [".php"]

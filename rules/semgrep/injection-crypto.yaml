@@ -1,0 +1,117 @@
+# Инъекции, крипта, транспорт, случайность.
+#
+# Разделение по типу правила, а не по теме: Semgrep не разрешает смешивать
+# `generic` с реальными языками в одном правиле, а AST-паттерн валиден не во
+# всех языках сразу. Поэтому regex-правила — `generic`, AST-паттерны — строго
+# со списком языков, где такой синтаксис разбирается.
+
+rules:
+  # --- regex, любой язык --------------------------------------------------
+  - id: sql-string-concatenation
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      SQL built by concatenation or interpolation. Check whether any interpolated
+      part is attacker-controlled.
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      category: security
+    pattern-regex: (?i)(select|insert|update|delete)\s[^;\n]*["']\s*[+.]\s*[\$\w]
+
+  - id: tls-verification-disabled
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      Certificate validation is disabled. Exploitable by any attacker on the
+      network path, regardless of whether the URL is a constant.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      category: security
+    pattern-regex: >-
+      (verify\s*=\s*False|InsecureSkipVerify\s*:\s*true|rejectUnauthorized\s*:\s*false|CERT_NONE|_create_unverified_context|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|CURLOPT_SSL_VERIFYPEER\s*(?:,|=>)\s*(?:false|0))
+
+  - id: weak-hash-algorithm
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      Weak hash algorithm. Only a finding when it protects something — check what
+      the digest is used for before deciding.
+    metadata:
+      cwe: "CWE-327: Broken Cryptographic Algorithm"
+      category: security
+    pattern-regex: >-
+      (?i)(hashlib\.(md5|sha1)|MessageDigest\.getInstance\(\s*"(MD5|SHA-?1)"|md5Hex|createHash\(\s*['"](md5|sha1)['"]|md5\.New\(\))
+
+  - id: weak-cipher
+    languages: [generic]
+    severity: ERROR
+    message: Broken or risky cipher / mode.
+    metadata:
+      cwe: "CWE-327: Broken Cryptographic Algorithm"
+      category: security
+    pattern-regex: (?i)(\bRC4\b|\bBlowfish\b|Cipher\.getInstance\(\s*"[^"]*ECB|["']AES/ECB)
+
+  - id: unescaped-html-sink
+    languages: [generic]
+    severity: ERROR
+    message: Value written to the DOM without escaping.
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      category: security
+    paths:
+      include: ["*.js", "*.jsx", "*.ts", "*.tsx", "*.vue", "*.html"]
+    pattern-regex: (innerHTML\s*=|outerHTML\s*=|dangerouslySetInnerHTML|document\.write\(|v-html)
+
+  # --- AST-паттерны, по языкам ---------------------------------------------
+  - id: python-shell-command
+    languages: [python]
+    severity: ERROR
+    message: Command executed through a shell. Verify the source of every interpolated part.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      category: security
+    pattern-either:
+      - pattern: subprocess.$F(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: python-weak-randomness
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Non-cryptographic PRNG. A vulnerability only when the value guards
+      something — token, session id, nonce, salt.
+    metadata:
+      cwe: "CWE-330: Use of Insufficiently Random Values"
+      category: security
+    pattern: random.$F(...)
+
+  - id: python-unsafe-deserialization
+    languages: [python]
+    severity: ERROR
+    message: Deserialization of untrusted data executes arbitrary code.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      category: security
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: yaml.load($X)
+      - pattern: marshal.loads(...)
+
+  - id: java-weak-randomness
+    languages: [java]
+    severity: WARNING
+    message: Non-cryptographic PRNG. Depends entirely on what consumes the value.
+    metadata:
+      cwe: "CWE-330: Use of Insufficiently Random Values"
+      category: security
+    pattern: new Random(...)
+
+  - id: java-unsafe-deserialization
+    languages: [java]
+    severity: ERROR
+    message: Java deserialization of untrusted data.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      category: security
+    pattern: new ObjectInputStream(...)

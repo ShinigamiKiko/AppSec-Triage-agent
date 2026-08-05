@@ -1,0 +1,6 @@
+# Gitleaks: секреты в рабочем дереве.
+mode: auto
+image: zricethezav/gitleaks:latest
+rules: []
+docker_network: false      # работает полностью офлайн
+timeout_s: 900

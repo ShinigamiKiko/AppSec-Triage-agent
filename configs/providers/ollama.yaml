@@ -1,0 +1,30 @@
+# Локальный инференс в закрытом контуре — дефолт.
+# Ничего не покидает периметр: код, пути, конфиги остаются на хосте.
+kind: ollama
+model: ${OLLAMA_MODEL:-qwen3-coder:30b}
+base_url: ${OLLAMA_BASE_URL:-http://localhost:11434}
+
+temperature: 0.0
+max_tokens: 2200          # вердикт с трассой и обоснованием; на 1400 бывали обрывы
+
+# Ollama умеет constrained decoding по полной JSON Schema — самый строгий режим
+# из трёх провайдеров. Именно поэтому здесь ollama_format, а не json_object.
+json_mode: ollama_format
+
+# Локальная модель на 4080 отвечает ~3 c/finding, но первый вызов грузит веса.
+timeout_s: 180
+connect_timeout_s: 5
+max_retries: 2
+backoff_base_s: 2.0
+
+# GPU держит одну модель — параллелить смысла мало, упрёмся в VRAM.
+concurrency: 2
+
+# Локально денег не стоит; поле оставлено, чтобы отчёт был однородным.
+pricing: {}
+
+options:
+  num_ctx: 8192          # evidence package + промпт укладываются с запасом
+  repeat_penalty: 1.05
+  seed: 42               # воспроизводимость прогонов бенчмарка
+  num_keep: 24

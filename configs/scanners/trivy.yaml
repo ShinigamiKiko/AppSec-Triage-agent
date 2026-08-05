@@ -1,0 +1,7 @@
+# Trivy: конфиги, секреты и уязвимые зависимости.
+# Единственный тут инструмент, у которого CVE осмысленны — это SCA, не SAST.
+mode: auto
+image: aquasec/trivy:latest
+rules: ["vuln", "secret", "misconfig"]
+docker_network: true       # база уязвимостей подтягивается из сети
+timeout_s: 1800

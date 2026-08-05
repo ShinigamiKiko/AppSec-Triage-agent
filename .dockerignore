@@ -1,0 +1,15 @@
+# Keep the build context (and the image) small. `out/` alone is tens of MB of
+# scan artifacts and reports that must never end up baked into the image.
+.git
+.gitignore
+out/
+samples/
+__pycache__/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+tools/semgrep-venv/
+.env
+.agents/
+.codex/

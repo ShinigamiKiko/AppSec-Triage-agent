@@ -1,0 +1,36 @@
+# Прогон только по critical + high. Отдельный файл, чтобы дефолтный pipeline.yaml
+# оставался полным: сужение скоупа — решение конкретного прогона, а не настройка
+# инструмента.
+provider: ollama
+prompt_pack: default
+max_workers: 4
+fail_fast: false
+
+code_context_lines: 6
+max_code_chars: 4000
+max_trace_steps: 12
+
+scope:
+  enabled: true
+  exclude_rules: ["B101 assert_used"]
+  exclude_paths: []
+  only_cwes: []
+  # Отсечённые medium/low не исчезают: они попадают в аудит с decided_by=scope
+  # и посчитаны в summary. Это отложенная работа, а не закрытая.
+  min_severity: high
+
+heuristics:
+  enabled: true
+  autoclose_on_hard_fp: false
+  min_secret_entropy: 3.5
+  min_secret_length: 16
+  noisy_path_patterns: []
+  placeholder_markers: []
+
+post_validation:
+  enabled: true
+  require_evidence_quotes: true
+  quote_match_threshold: 0.85
+  confidence_floor: 0.7
+  confirmed_confidence_floor: 0.75
+  escalate_severities: [critical, high]

@@ -1,0 +1,28 @@
+# Psalm taint-анализ — единственный настоящий source→sink dataflow для PHP.
+#
+# CodeQL PHP не поддерживает, поэтому для PHP это единственный инструмент,
+# отвечающий «доходит ли недоверенный ввод до стока», а не «похоже ли на
+# опасный паттерн». В SARIF Psalm кладёт codeFlows — ingest предпочтёт эту
+# запись любому паттерн-совпадению semgrep на том же месте (см. _richness).
+#
+# ВАЖНО: Psalm нужен автозагрузчик целевого проекта — taint идёт по вызовам
+# между файлами, значит классы должны резолвиться. Отсюда run_in_target: сканер
+# работает ВНУТРИ таргета и читает там psalm.xml + vendor/autoload.php. Без
+# `composer install` (или хотя бы `composer dump-autoload`) Psalm не по чему
+# трассировать — и он это честно сообщает, а не молчит.
+#
+# На Symfony-проектах распознавание $request->get() как источника и Doctrine
+# как стока требует psalm/plugin-symfony. Без него taint виден только на прямых
+# потоках ($_GET → sink). Это ограничение плагина, а не конфигурации.
+
+mode: native                 # docker не предлагается: контейнер не видит vendor таргета
+# Psalm ставится через composer global и обычно не на PATH.
+binary:
+  - psalm
+  - /opt/composer/vendor/bin/psalm
+  - ~/.config/composer/vendor/bin/psalm
+image: null
+language: php
+run_in_target: true          # cwd = таргет: нужен для psalm.xml и автозагрузчика
+timeout_s: 1800
+docker_network: false
