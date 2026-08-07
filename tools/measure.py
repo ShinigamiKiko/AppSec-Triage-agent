@@ -74,6 +74,7 @@ def summarise(path: Path) -> None:
 
     verdicts = Counter(r["verdict"]["verdict"] for r in records)
     bands = Counter(r["verdict"].get("confidence_band") or "not-calibrated" for r in records)
+    priorities = Counter(r.get("priority") or "not-prioritized" for r in records)
     decided_by = Counter(r.get("decided_by") for r in records)
     review = sum(1 for r in records if r["verdict"].get("requires_human_review"))
     scoped_out = decided_by.get("scope", 0)
@@ -102,6 +103,7 @@ def summarise(path: Path) -> None:
     print(f"  unknowns explained  {answerable}/{len(unknowns)}")
     print(f"  reachability known  {reachable}/{len(records)}")
     print(f"  certainty bands     {dict(bands)}")
+    print(f"  priorities          {dict(priorities)}")
     print(
         f"  tokens              {prompt_tok + completion_tok:,} "
         f"(in {prompt_tok:,} / out {completion_tok:,}) over {called} model call(s)"

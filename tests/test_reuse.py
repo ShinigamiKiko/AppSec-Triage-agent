@@ -123,7 +123,10 @@ def test_unexplained_closure_on_a_heavy_class_becomes_unknown():
     from appsec_triage.config import PostValidationConfig
 
     cfg = _cfg()
-    cfg.post_validation = PostValidationConfig(closure_requires_named_defence_above=26)
+    cfg.post_validation = PostValidationConfig(
+        closure_requires_named_defence_above=26,
+        require_sast_reachability=False,
+    )
 
     finding = _finding("$cmd = shell_exec($target);", cwe="CWE-78")
     client = FakeClient(
@@ -147,7 +150,10 @@ def test_a_named_and_quoted_defence_still_closes_a_heavy_class():
     from appsec_triage.config import PostValidationConfig
 
     cfg = _cfg()
-    cfg.post_validation = PostValidationConfig(closure_requires_named_defence_above=26)
+    cfg.post_validation = PostValidationConfig(
+        closure_requires_named_defence_above=26,
+        require_sast_reachability=False,
+    )
 
     finding = _finding("$stmt = $pdo->prepare('SELECT * FROM t WHERE id = ?');", cwe="CWE-89")
     client = FakeClient(

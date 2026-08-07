@@ -1,10 +1,7 @@
-"""Dependency findings without a scanner.
+"""Dependency findings from the sole SCA path: cdxgen plus advisory APIs.
 
-The SCA half used to get its finding list from Trivy. In an image built for the
-dependency question — cdxgen present, advisory databases reachable, no scanner —
-that left the pipeline with nothing to triage. These tests cover the path that
-replaced it, and the one behaviour that matters most: a database that did not
-answer is a recorded failure, never a clean package.
+The behaviour that matters most is that a database that did not answer is a
+recorded failure, never a clean package.
 """
 
 from __future__ import annotations
@@ -74,6 +71,7 @@ def test_a_database_failure_is_recorded_not_treated_as_clean(monkeypatch, tmp_pa
     assert result.findings == []
     assert len(result.problems) == 2
     assert all("timed out" in p for p in result.problems)
+    assert result.usable is False
 
 
 def test_no_sbom_is_reported_and_produces_nothing(monkeypatch, tmp_path):

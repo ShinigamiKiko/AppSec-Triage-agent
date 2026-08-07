@@ -19,7 +19,7 @@ def usable_scanners() -> list[str]:
 
 _LANG_SCANNERS = {
     ".php": ["semgrep", "psalm"],
-    ".go":  ["codeql"],
+    ".go":  ["govulncheck", "codeql"],
     ".ts": ["codeql"], ".tsx": ["codeql"],
     ".js": ["codeql"], ".jsx": ["codeql"],
     ".py": ["codeql"],
@@ -30,17 +30,19 @@ _LANG_SCANNERS = {
     ".cxx": ["codeql"], ".c++": ["codeql"],
     ".rs": ["codeql"], ".swift": ["codeql"],
 }
-_ALWAYS_SCANNERS = ["gitleaks", "trivy"]
+_ALWAYS_SCANNERS: list[str] = []
 _SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "vendor", "target", "build", "dist", "__pycache__"}
 
 
 def scanners_for_target(target: Path) -> list[str]:
-    """Pick scanners by the languages actually present, then keep only usable ones.
+    """Pick required scanners by the languages actually present.
 
     This is what makes a PHP target run semgrep+Psalm and a Go target run
     CodeQL, without the operator having to know which tool covers which
-    language. Falls back to every usable scanner when nothing is recognised —
-    a strange tree should still get looked at, not silently skipped.
+    language. A required but unavailable scanner remains selected so the scan
+    fails visibly instead of degrading to Gitleaks-only coverage. Falls back to
+    no language scanner when nothing is recognised; the CLI reports that as a
+    setup error instead of guessing a scanner family.
     """
     wanted: list[str] = []
     seen_ext: set[str] = set()
@@ -55,12 +57,11 @@ def scanners_for_target(target: Path) -> list[str]:
                     wanted.append(s)
     wanted += [s for s in _ALWAYS_SCANNERS if s not in wanted]
 
-    usable = set(usable_scanners())
-    chosen = [s for s in wanted if s in usable]
-    if chosen:
+    if wanted:
+        usable = set(usable_scanners())
         skipped = [s for s in wanted if s not in usable]
         if skipped:
             print(f"→ language-relevant but unavailable: {', '.join(skipped)} "
-                  "(run `appsec-triage doctor`)", file=sys.stderr)
-        return chosen
-    return sorted(usable)
+                  "(the scan will be incomplete; run `appsec-triage doctor`)", file=sys.stderr)
+        return wanted
+    return []

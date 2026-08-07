@@ -16,9 +16,10 @@ vulnerable functions are library internals reached through public API.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 from . import advisories as adv
 from . import conditions as conditions_mod
@@ -29,8 +30,9 @@ from . import reach as reach_mod
 from . import receiver as receiver_mod
 from . import registries
 from .bridge import BridgeResult, find_bridge
-from .graph import DependencyGraph, Placement
+from .graph import DependencyGraph, Node, Placement
 from .resolve import SymbolResolver, VulnerableSymbol
+from .source_cache import PackageSourceCache, SourceSnapshot
 from .verdict import CVEDecision, CVEVerdict, decide
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -39,6 +41,34 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..models import Finding
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class BridgeHop:
+    package: str
+    version: str
+    status: str
+    detail: str
+    source_url: str = ""
+    cache_status: str = ""
+
+    def render(self) -> str:
+        identity = f"{self.package}@{self.version}" if self.version else self.package
+        source = f"; source={self.source_url}; cache={self.cache_status}" if self.source_url else ""
+        return f"{identity}: {self.detail}{source}"
+
+
+@dataclass(slots=True)
+class BridgePath:
+    packages: list[str]
+    status: str = "unknown"
+    hops: list[BridgeHop] = field(default_factory=list)
+    targets: list[tuple[str, str]] = field(default_factory=list)
+    detail: str = ""
+
+    @property
+    def description(self) -> str:
+        return " -> ".join(self.packages)
 
 
 @dataclass(slots=True)
@@ -53,6 +83,8 @@ class ChainResult:
     searched_for: list[str] = field(default_factory=list)
     condition: conditions_mod.Condition | None = None
     exploitability: exploit_mod.Exploitability | None = None
+    bridge_paths: list[BridgePath] = field(default_factory=list)
+    source_snapshots: list[SourceSnapshot] = field(default_factory=list)
 
     @property
     def needs_a_person(self) -> bool:
@@ -95,13 +127,36 @@ class ChainResult:
             owner=owner,
             exploitability=(self.exploitability.render() if self.exploitability else ""),
             problems=self.problems[:4],
+            resolution_error=(self.symbol.resolution_error if self.symbol else ""),
+            dependency_paths=[path.description for path in self.bridge_paths],
+            source_url=(self.source_snapshots[0].source_url if self.source_snapshots else ""),
+            source_version=(self.source_snapshots[0].version if self.source_snapshots else ""),
+            source_cache_status=(self.source_snapshots[0].cache_status if self.source_snapshots else ""),
+            source_sha256=(self.source_snapshots[0].archive_sha256 if self.source_snapshots else ""),
+            bridge_status=self._bridge_status(),
+            bridge_hops=[hop.render() for path in self.bridge_paths for hop in path.hops],
         )
+
+    def _bridge_status(self) -> str:
+        statuses = {path.status for path in self.bridge_paths}
+        if statuses == {"closed"}:
+            return "closed"
+        if "reachable" in statuses:
+            return "reachable"
+        return "unresolved" if statuses else ""
 
     def render(self) -> str:
         """The section handed to the model, or shown when the model is skipped."""
         lines = ["## Проверка уязвимой функции", "", self.decision.headline, ""]
         if self.exploitability is not None and (rendered := self.exploitability.render()):
             lines.append(f"- эксплуатируемость: {rendered}")
+        if self.reach is not None:
+            if self.reach.entrypoint:
+                lines.append(f"- LSP/route entrypoint: {self.reach.entrypoint}")
+            if self.reach.taint_path:
+                lines.append(f"- CodeQL targeted dataflow: {self.reach.taint_path}")
+            if self.reach.detail:
+                lines.append(f"- результат reachability: {self.reach.detail}")
         if self.placement is not None:
             lines.append(f"- положение в графе: {self.placement.describe()}")
             note = self.placement.upgrade_note()
@@ -109,6 +164,9 @@ class ChainResult:
                 lines.append(f"- что обновлять: {note}")
         if self.bridge is not None and self.bridge.detail:
             lines.append(f"- посредник: {self.bridge.detail}")
+        for path in self.bridge_paths:
+            lines.append(f"- dependency path [{path.status}]: {path.description}")
+            lines.extend(f"  - {hop.render()}" for hop in path.hops)
         if self.searched_for:
             lines.append(f"- искали в коде проекта: {', '.join(self.searched_for)}")
         if self.condition is not None and (rendered := self.condition.render()):
@@ -140,18 +198,23 @@ class DependencyChain:
         deployment=None,
     ) -> None:
         self._client = client
-        self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
+        self._source_cache = PackageSourceCache()
+        self._resolver = SymbolResolver(
+            client, roots=[Path(r) for r in roots], source_cache=self._source_cache)
         self._roots = [Path(r) for r in roots]
         self._lsp = lsp
         self._routes = routes
         self._nvd_api_key = nvd_api_key
         self._deployment = deployment
         self._advisories: dict[tuple[str, str, str, str], adv.Advisory] = {}
+        self._symbols: dict[tuple[str, str, str], VulnerableSymbol] = {}
         self._graphs: dict[str, DependencyGraph] = {}
         self._wirings: dict[str, container_mod.Wiring] = {}
         self._exploit = exploit_mod.ExploitabilityService()
         self.stats = {"resolved": 0, "called": 0, "absent": 0,
-                      "not_distributed": 0, "undecided": 0}
+                      "not_distributed": 0, "undecided": 0,
+                      "source_download_failures": 0, "unresolved_bridges": 0,
+                      "successful_closures": 0}
 
     @staticmethod
     def _identifiers(finding: "Finding") -> list[str]:
@@ -172,8 +235,84 @@ class DependencyChain:
             upper = token.strip().upper()
             if upper.startswith(("GHSA-", "CVE-")) and upper not in out:
                 out.append(upper)
+        if finding.dependency:
+            for alias in finding.dependency.advisory_aliases:
+                upper = alias.strip().upper()
+                if upper.startswith(("GHSA-", "CVE-")) and upper not in out:
+                    out.append(upper)
         out.sort(key=lambda i: not i.startswith("GHSA-"))
         return out
+
+    def _advisory_and_symbol(
+        self, finding: "Finding"
+    ) -> tuple[adv.Advisory | None, VulnerableSymbol | None, list[str]]:
+        dependency = finding.dependency
+        if dependency is None:
+            return None, None, []
+        problems: list[str] = []
+        identifiers = self._identifiers(finding)
+        key = (identifiers[0] if identifiers else "", dependency.package or "",
+               dependency.ecosystem or "", dependency.installed_version or "")
+        try:
+            advisory = self._advisories.get(key)
+            if advisory is None:
+                advisory = adv.collect(*key, nvd_api_key=self._nvd_api_key)
+                self._advisories[key] = advisory
+        except adv.DatabaseUnavailable as exc:
+            return None, None, [f"базы уязвимостей недоступны: {exc}"]
+        if advisory.problem:
+            problems.append(advisory.problem)
+
+        symbol_key = (advisory.advisory_id, dependency.package.lower(),
+                      dependency.installed_version or "")
+        symbol = self._symbols.get(symbol_key)
+        if symbol is None:
+            symbol = self._resolver.resolve(advisory, dependency.installed_version or "")
+            self._symbols[symbol_key] = symbol
+        if symbol.note and not symbol.usable:
+            problems.append(symbol.note)
+        return advisory, symbol, problems
+
+    def prepare(self, findings: Iterable["Finding"]) -> None:
+        """Resolve all CVE symbols and warm exact cdxgen package sources before workers run."""
+        grouped: dict[tuple[str, str, str], list["Finding"]] = {}
+        for finding in findings:
+            dependency = finding.dependency
+            if dependency is None or (finding.scanner or "").lower() == "govulncheck":
+                continue
+            key = ((dependency.ecosystem or "").lower(), dependency.package.lower(),
+                   dependency.installed_version or "")
+            grouped.setdefault(key, []).append(finding)
+
+        for package_findings in grouped.values():
+            for finding in package_findings:
+                _advisory, symbol, _problems = self._advisory_and_symbol(finding)
+                if symbol is None:
+                    continue
+                dependency = finding.dependency
+                placement = self._placement(
+                    dependency.package, dependency.installed_version or "")
+                if placement is None:
+                    continue
+                refs = {
+                    ref for introduction in placement.introductions
+                    for ref in introduction.refs
+                } | set(placement.target_refs)
+                for ref in refs:
+                    node = self._node(ref)
+                    if node is not None:
+                        self._resolver.source_snapshot(
+                            node.ecosystem, node.name, node.version)
+
+    def stats_snapshot(self) -> dict[str, int]:
+        source = self._source_cache.stats()
+        return {
+            **self.stats,
+            "source_packages": source["packages"],
+            "source_downloads": source["downloads"],
+            "source_cache_hits": source["cache_hits"],
+            "source_download_failures": source["failures"],
+        }
 
     def _wiring(self, root: Path):
         """Service configuration, read once per project — it cannot change mid-run."""
@@ -188,7 +327,7 @@ class DependencyChain:
                 log.info("container config unavailable at %s: %s", root, wiring.problem)
         return self._wirings[key]
 
-    def _placement(self, package: str) -> Placement | None:
+    def _placement(self, package: str, version: str = "") -> Placement | None:
         """Read each project's lockfile once; the graph does not change mid-run."""
         if not package:
             return None
@@ -196,7 +335,7 @@ class DependencyChain:
             key = str(root)
             if key not in self._graphs:
                 self._graphs[key] = DependencyGraph.from_project(root)
-            placement = self._graphs[key].placement(package)
+            placement = self._graphs[key].placement(package, version)
             if placement.known:
                 return placement
         return placement if self._roots else None
@@ -225,11 +364,11 @@ class DependencyChain:
         if not parents:
             return None, default
 
-        for parent in parents[:2]:
+        for parent in parents:
             if not registries.supported(dependency.ecosystem or ""):
                 continue
             version = self._graph_version(parent)
-            source = self._resolver._source_for(  # noqa: SLF001 - one reuse point per run
+            source = self._resolver._source_for(
                 dependency.ecosystem or "", parent, version)
             if not source:
                 return None, default
@@ -242,6 +381,85 @@ class DependencyChain:
                 return bridge, default
         return None, default
 
+    def _node(self, ref: str) -> Node | None:
+        for graph in self._graphs.values():
+            if node := graph.node(ref):
+                return node
+        return None
+
+    def _recursive_bridges(
+        self, symbol: VulnerableSymbol, placement: Placement | None
+    ) -> tuple[list[BridgePath], list[SourceSnapshot]]:
+        """Walk every cdxgen path from the vulnerable node back to a direct dependency."""
+        if placement is None or placement.direct or not symbol.function:
+            return [], []
+        if not placement.introductions:
+            return [BridgePath([], detail=placement.problem or "cdxgen path unavailable")], []
+
+        paths: list[BridgePath] = []
+        snapshots: dict[tuple[str, str, str], SourceSnapshot] = {}
+        for introduction in placement.introductions:
+            path = BridgePath(list(introduction.path))
+            targets = [(symbol.function, symbol.klass)]
+            for parent_ref in reversed(introduction.refs[:-1]):
+                node = self._node(parent_ref)
+                if node is None:
+                    path.detail = f"cdxgen node {parent_ref} is unavailable"
+                    break
+                snapshot = self._resolver.source_snapshot(
+                    node.ecosystem, node.name, node.version)
+                snapshots[(node.ecosystem, node.name, node.version)] = snapshot
+                if not snapshot.usable:
+                    path.hops.append(BridgeHop(
+                        node.name, node.version, "unknown", snapshot.problem,
+                        snapshot.source_url, snapshot.cache_status))
+                    path.detail = snapshot.problem
+                    self.stats["source_download_failures"] += 1
+                    break
+
+                results = [
+                    find_bridge(function, snapshot.files, parent_package=node.name)
+                    for function, _klass in targets
+                ]
+                calling = [result for result in results if result.calls_it is True]
+                if not calling and all(result.calls_it is False for result in results):
+                    detail = "; ".join(result.detail for result in results)
+                    path.hops.append(BridgeHop(
+                        node.name, node.version, "closed", detail,
+                        snapshot.source_url, snapshot.cache_status))
+                    path.status = "closed"
+                    path.detail = detail
+                    break
+                if not calling:
+                    detail = "; ".join(result.detail for result in results)
+                    path.hops.append(BridgeHop(
+                        node.name, node.version, "unknown", detail,
+                        snapshot.source_url, snapshot.cache_status))
+                    path.detail = detail
+                    break
+
+                public = {
+                    (item.function, item.klass)
+                    for result in calling for item in result.public_symbols
+                }
+                detail = "; ".join(result.detail for result in calling)
+                if not public:
+                    path.hops.append(BridgeHop(
+                        node.name, node.version, "unknown",
+                        detail + "; public bridge symbol was not established",
+                        snapshot.source_url, snapshot.cache_status))
+                    path.detail = "parent call exists but no public bridge symbol was established"
+                    break
+                path.hops.append(BridgeHop(
+                    node.name, node.version, "open", detail,
+                    snapshot.source_url, snapshot.cache_status))
+                targets = sorted(public)
+            else:
+                path.status = "open"
+                path.targets = targets
+            paths.append(path)
+        return paths, list(snapshots.values())
+
     def _graph_version(self, package: str) -> str:
         for graph in self._graphs.values():
             version = graph.version_of(package)
@@ -249,49 +467,135 @@ class DependencyChain:
                 return version
         return ""
 
+    def _from_govulncheck(
+        self, finding: "Finding", codeql_findings: Iterable["Finding"]
+    ) -> ChainResult:
+        """Use govulncheck's symbol result directly instead of re-discovering it.
+
+        A completed symbol scan already answered the expensive dependency-specific
+        question. Asking a model to infer the function from advisory prose again
+        both loses evidence and can contradict the scanner.
+        """
+        dependency = finding.dependency
+        placement = self._placement(
+            dependency.package if dependency else "",
+            dependency.installed_version if dependency else "",
+        )
+        if not finding.trace:
+            self.stats["absent"] += 1
+            return ChainResult(
+                CVEDecision(
+                    CVEVerdict.NO_VULNERABLE_SYMBOL,
+                    "govulncheck завершил symbol-level анализ: уязвимый символ не вызывается",
+                    [
+                        "пакет присутствует, но source-level call stack к уязвимой функции отсутствует",
+                        "это результат govulncheck -scan=symbol, а не неудачный текстовый поиск",
+                    ],
+                ),
+                placement=placement,
+                searched_for=["govulncheck -scan=symbol"],
+            )
+
+        sink = finding.trace[-1]
+        symbol_name = finding.sink or sink.message or "vulnerable symbol"
+        function = symbol_name.rsplit(".", 1)[-1].lstrip("*")
+        symbol = VulnerableSymbol(
+            finding.rule_id or "govulncheck",
+            dependency.package if dependency else "",
+            function=function,
+            confirmed_in_source=True,
+            evidence=symbol_name,
+            aliases=tuple(dependency.advisory_aliases if dependency else ()),
+        )
+        app = finding.trace[0]
+        hit = presence_mod.Hit(
+            app.file_path or finding.code_context.file_path,
+            app.line or finding.code_context.start_line or 1,
+            app.message or symbol_name,
+        )
+        presence = presence_mod.PresenceResult(
+            presence_mod.SymbolPresence.CALLED,
+            symbol_name,
+            [hit],
+            detail="govulncheck supplied a source-level call stack to the vulnerable symbol",
+        )
+        reached = None
+        codeql_findings = list(codeql_findings)
+        if reach_mod.needs_input_path(finding.cwe) or reach_mod.has_taint_path(
+            codeql_findings, presence.hits
+        ):
+            reached = reach_mod.assess(
+                presence.hits,
+                self._roots[0] if self._roots else Path("."),
+                lsp=self._lsp,
+                routes=self._routes,
+                codeql_findings=codeql_findings,
+                client=self._client,
+            )
+        self.stats["resolved"] += 1
+        self.stats["called"] += 1
+        return ChainResult(
+            decide(symbol, presence, reached, cwe=finding.cwe),
+            symbol,
+            presence,
+            reached,
+            placement=placement,
+            searched_for=[symbol_name],
+        )
+
     def run(
         self, finding: "Finding", *, codeql_findings: Iterable["Finding"] = ()
     ) -> ChainResult:
         dependency = finding.dependency
         if dependency is None:
             return ChainResult(decide(None, None, None))
+        if (finding.scanner or "").lower() == "govulncheck":
+            return self._from_govulncheck(finding, codeql_findings)
 
-        problems: list[str] = []
         identifiers = self._identifiers(finding)
-
-        key = (identifiers[0] if identifiers else "", dependency.package or "",
-               dependency.ecosystem or "", dependency.installed_version or "")
-        try:
-            if key in self._advisories:
-                advisory = self._advisories[key]
-            else:
-                advisory = adv.collect(*key, nvd_api_key=self._nvd_api_key)
-                self._advisories[key] = advisory
-        except adv.DatabaseUnavailable as exc:
-            problems.append(f"базы уязвимостей недоступны: {exc}")
+        advisory, symbol, problems = self._advisory_and_symbol(finding)
+        if advisory is None or symbol is None:
             self.stats["undecided"] += 1
             return ChainResult(decide(None, None, None), problems=problems)
-        if advisory.problem:
-            problems.append(advisory.problem)
-
-        symbol = self._resolver.resolve(advisory, dependency.installed_version or "")
-        if symbol.note and not symbol.usable:
-            problems.append(symbol.note)
         if symbol.usable:
             self.stats["resolved"] += 1
 
-        placement = self._placement(dependency.package or "")
+        placement = self._placement(
+            dependency.package or "", dependency.installed_version or "")
 
-        bridge, targets = self._bridge(symbol, placement, dependency)
-        if bridge is not None and bridge.detail and bridge.calls_it is None:
-            problems.append(bridge.detail)
+        target_snapshot = self._resolver.source_snapshot(
+            dependency.ecosystem or "", dependency.package or "",
+            dependency.installed_version or "")
+        bridge = None
+        bridge_paths, source_snapshots = self._recursive_bridges(symbol, placement)
+        all_snapshots = [target_snapshot]
+        all_snapshots.extend(
+            snapshot for snapshot in source_snapshots
+            if (snapshot.ecosystem, snapshot.package, snapshot.version) !=
+            (target_snapshot.ecosystem, target_snapshot.package, target_snapshot.version))
+        if bridge_paths:
+            targets = sorted({target for path in bridge_paths if path.status == "open"
+                              for target in path.targets})
+            if all(path.status == "closed" for path in bridge_paths):
+                self.stats["successful_closures"] += 1
+                decision = CVEDecision(
+                    CVEVerdict.NO_DEPENDENCY_PATH,
+                    "все cdxgen dependency paths разорваны в исходниках parent-пакетов",
+                    [f"{path.description}: {path.detail}" for path in bridge_paths],
+                )
+                return ChainResult(
+                    decision, symbol, problems=problems, placement=placement,
+                    bridge_paths=bridge_paths, source_snapshots=all_snapshots)
+            if any(path.status == "unknown" for path in bridge_paths):
+                self.stats["unresolved_bridges"] += 1
+                problems.extend(
+                    f"unresolved bridge {path.description or dependency.package}: {path.detail}"
+                    for path in bridge_paths if path.status == "unknown")
+        else:
+            targets = [(symbol.function, symbol.klass)]
 
         found: presence_mod.PresenceResult | None = None
         searched: list[str] = []
-        if bridge is not None and bridge.closes:
-            found = presence_mod.PresenceResult(
-                presence_mod.SymbolPresence.ABSENT, str(symbol), detail=bridge.detail)
-            targets = []
         for function, klass in targets:
             searched.append(f"{klass}::{function}" if klass else function)
             for root in self._roots:
@@ -308,6 +612,12 @@ class DependencyChain:
                     break
             if found is not None and found.found:
                 break
+        if bridge_paths:
+            for path in bridge_paths:
+                if path.status == "open":
+                    path.status = "reachable" if found is not None and found.found else "unknown"
+                    if path.status == "unknown":
+                        path.detail = "public bridge reached the application boundary, but no call was established"
         if not self._roots:
             problems.append("не задан ни один корень исходников — поиск не выполнялся")
 
@@ -356,6 +666,7 @@ class DependencyChain:
             symbol, found, reached, problems,
             placement=placement, bridge=bridge, searched_for=searched,
             condition=condition, exploitability=exploit,
+            bridge_paths=bridge_paths, source_snapshots=all_snapshots,
         )
         verdict = result.decision.verdict
         if verdict is CVEVerdict.NOT_APPLICABLE:

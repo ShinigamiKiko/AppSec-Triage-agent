@@ -102,6 +102,14 @@ def calibrate(verdict: Verdict, pkg: EvidencePackage, finding: Finding, override
     if pkg.lsp_required_missing:
         score = min(score, 0.55)
         reasons.append("the mandatory language server answered nothing for this file")
+    if verdict.verdict is VerdictLabel.external_fp:
+        control_id = verdict.external_control.control_id if verdict.external_control else None
+        if control_id and any(c.control_id == control_id and c.bypass_precluded for c in pkg.external_controls):
+            score += 0.15
+            reasons.append("the named compensating control is verified and covers this finding")
+        if pkg.sast_reachability and pkg.sast_reachability.status == "established":
+            score += 0.1
+            reasons.append("the control is placed on an established source-to-sink attack path")
     if overrides:
         score = min(score, 0.6)
         reasons.append(f"post-validation had to rewrite this verdict ({len(overrides)} override(s))")
@@ -115,7 +123,19 @@ def _signal_weight(pkg: EvidencePackage, verdict: Verdict, *, agree: bool) -> fl
     `unknown` has no direction to agree with, so it scores neither way — an
     abstention is not made more certain by evidence it declined to weigh.
     """
-    if verdict.verdict is VerdictLabel.unknown:
+    if verdict.verdict in (VerdictLabel.unknown, VerdictLabel.external_fp):
+        return 0.0
+    if (
+        not agree
+        and verdict.verdict is VerdictLabel.false_positive
+        and verdict.evidence_class.value == "SANITIZED_DATAFLOW"
+        and any(
+            step.role.value == "sanitizer" and step.grounded and not step.tainted
+            for step in verdict.dataflow
+        )
+    ):
+        # Reachability and attacker control are expected on a sanitized path;
+        # they do not contradict a closure whose grounded defence is the reason.
         return 0.0
     wanted = "toward_confirmed" if verdict.verdict is VerdictLabel.confirmed else "toward_fp"
     other = "toward_fp" if wanted == "toward_confirmed" else "toward_confirmed"

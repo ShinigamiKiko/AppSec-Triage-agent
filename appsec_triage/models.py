@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Confidence(float):
@@ -69,6 +69,7 @@ class DependencyInfo(BaseModel):
     ecosystem: str | None = None
     installed_version: str | None = None
     fixed_versions: list[str] = Field(default_factory=list)
+    advisory_aliases: list[str] = Field(default_factory=list)
     advisory_url: str | None = None
     dev_only: bool | None = None
     imported: bool | None = None
@@ -142,6 +143,24 @@ class HeuristicSignal(BaseModel):
     weight: float = 0.0
 
 
+class RiskContext(BaseModel):
+    """Per-service CI facts plus the platform baseline shared by all services."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    internet_exposed: bool | None = None
+    auth_required: bool | None = None
+    business_critical: bool | None = None
+    platform: Literal["kubernetes"] = "kubernetes"
+    egress_restricted: bool = True
+    shared_ingress: bool = True
+    ingress_type: str = "nginx"
+    external_load_balancer: bool = True
+    direct_backend_exposure: bool = False
+    source: Literal["runtime_environment"] = "runtime_environment"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class EvidencePackage(BaseModel):
     """What the model actually sees. Never the raw finding."""
 
@@ -168,10 +187,13 @@ class EvidencePackage(BaseModel):
     heuristic_signals: list[HeuristicSignal]
     symbol_context: list[str] = Field(default_factory=list)
     reachability: str | None = None
+    sast_reachability: SASTReachability | None = None
+    external_controls: list[ExternalControlEvidence] = Field(default_factory=list)
     lsp_required_missing: bool = False
     lsp_resolved_clean: bool = False
     dependency: DependencyInfo | None = None
     history: list[str] = Field(default_factory=list)
+    risk_context: RiskContext = Field(default_factory=RiskContext)
 
     def quotable_text(self) -> str:
         """Exactly the text the model was shown, used to verify its quotes.
@@ -192,7 +214,54 @@ class EvidencePackage(BaseModel):
 class VerdictLabel(str, Enum):
     confirmed = "confirmed"
     false_positive = "false_positive"
+    external_fp = "external_fp"
     unknown = "unknown"
+
+    @property
+    def is_closed(self) -> bool:
+        return self in (VerdictLabel.false_positive, VerdictLabel.external_fp)
+
+
+class Priority(str, Enum):
+    critical = "Critical"
+    high = "High"
+    medium = "Medium"
+    low = "Low"
+
+
+class SASTReachability(BaseModel):
+    """Machine-established halves of a SAST attack path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["established", "partial", "unknown"] = "unknown"
+    trace_scanner: str | None = None
+    source_to_sink: bool = False
+    production_entrypoint: bool = False
+    route: str | None = None
+    detail: str = ""
+
+
+class ExternalControlEvidence(BaseModel):
+    """A declared compensating control eligible to mitigate this finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    control_id: str
+    kind: str
+    direction: Literal["inbound", "outbound", "bidirectional"] = "inbound"
+    coverage: str
+    evidence: str
+    bypass_precluded: bool = True
+
+
+class ExternalControlReference(BaseModel):
+    """The exact declared control on which an `external_fp` verdict rests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    control_id: str
+    why_effective: str
 
 
 class EvidenceClass(str, Enum):
@@ -293,7 +362,17 @@ class Verdict(BaseModel):
         default=None,
         description="For `unknown` only: the single fact that would settle it. Tells the human where to look.",
     )
+    external_control: ExternalControlReference | None = None
     requires_human_review: bool = True
+
+    @model_validator(mode="after")
+    def enforce_external_disposition(self):
+        if self.verdict is VerdictLabel.external_fp:
+            self.requires_human_review = False
+            self.blocking_question = None
+        elif self.external_control is not None:
+            self.external_control = None
+        return self
 
 
 class SCASummary(BaseModel):
@@ -320,6 +399,14 @@ class SCASummary(BaseModel):
     owner: str = ""
     exploitability: str = ""
     problems: list[str] = Field(default_factory=list)
+    resolution_error: str = ""
+    dependency_paths: list[str] = Field(default_factory=list)
+    source_url: str = ""
+    source_version: str = ""
+    source_cache_status: str = ""
+    source_sha256: str = ""
+    bridge_status: str = ""
+    bridge_hops: list[str] = Field(default_factory=list)
 
 
 class TriageRecord(BaseModel):
@@ -333,8 +420,15 @@ class TriageRecord(BaseModel):
     kind: Literal["weakness", "dependency", "misconfiguration"] = "weakness"
     rule_id: str | None = None
     start_line: int | None = None
+    scanner_severity: Severity = Severity.unknown
     symbol_context: list[str] = Field(default_factory=list)
     reachability: str | None = None
+    sast_reachability: SASTReachability | None = None
+    external_controls: list[ExternalControlEvidence] = Field(default_factory=list)
+    risk_context: RiskContext = Field(default_factory=RiskContext)
+    priority: Priority = Priority.medium
+    priority_score: int = 0
+    priority_reasons: list[str] = Field(default_factory=list)
     challenge_note: str | None = None
     verdict: Verdict
     original_verdict: Verdict | None = None

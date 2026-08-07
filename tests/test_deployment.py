@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import textwrap
 
-import pytest
-
 from appsec_triage import deployment
+from appsec_triage.models import CodeContext, Finding
 
 
 def _write(tmp_path, body: str):
@@ -86,3 +85,87 @@ def test_a_broken_file_is_loud_and_claims_nothing(tmp_path, caplog):
     ctx = deployment.load(path)
     assert ctx.usable is False
     assert any("deployment context unavailable" in r.message for r in caplog.records)
+
+
+def test_only_verified_non_bypassable_controls_match_the_finding(tmp_path):
+    ctx = _write(
+        tmp_path,
+        BASE
+        + """
+    compensating_controls:
+      - id: public-waf
+        kind: waf
+        covered_cwes: [CWE-89]
+        covered_routes: ["*"]
+        evidence: managed SQLi policy is enabled
+        verified: true
+        bypass_possible: false
+      - id: plain-nginx
+        kind: load_balancer
+        covered_cwes: [CWE-89]
+        covered_routes: ["*"]
+        evidence: nginx forwards traffic
+        verified: false
+        bypass_possible: true
+        """,
+    )
+    finding = Finding(
+        finding_id="sqli",
+        scanner="codeql",
+        cwe="CWE-89",
+        code_context=CodeContext(file_path="src/Controller.php", start_line=10, snippet="$db->query($q);"),
+    )
+
+    controls = ctx.matching_controls(finding)
+    assert [control.control_id for control in controls] == ["public-waf"]
+
+
+def test_route_scoped_control_requires_the_actual_route(tmp_path):
+    ctx = _write(
+        tmp_path,
+        BASE
+        + """
+    compensating_controls:
+      - id: api-waf
+        kind: waf
+        covered_cwes: [CWE-89]
+        covered_routes: [/api/*]
+        evidence: API WAF policy
+        verified: true
+        bypass_possible: false
+        """,
+    )
+    finding = Finding(
+        finding_id="sqli",
+        scanner="codeql",
+        cwe="CWE-89",
+        code_context=CodeContext(file_path="src/Controller.php", start_line=10),
+    )
+    assert ctx.matching_controls(finding, "/admin/users") == []
+    assert [c.control_id for c in ctx.matching_controls(finding, "/api/users")] == ["api-waf"]
+
+
+def test_platform_owned_check_is_reported_as_ai_closed_external_fp(tmp_path):
+    from _helpers import _PROVIDER, FakeClient
+
+    from appsec_triage.config import PipelineConfig
+    from appsec_triage.models import VerdictLabel
+    from appsec_triage.pipeline import TriagePipeline
+
+    path = tmp_path / "deployment.yaml"
+    path.write_text(textwrap.dedent(BASE), encoding="utf-8")
+    cfg = PipelineConfig(provider="fake", deployment_config=str(path))
+    finding = Finding(
+        finding_id="healthcheck",
+        scanner="trivy",
+        rule_id="DS-0026",
+        cwe="CWE-693",
+        code_context=CodeContext(file_path="Dockerfile", start_line=1, snippet="FROM app"),
+        misconfiguration=True,
+    )
+
+    record = TriagePipeline(FakeClient(), _PROVIDER, cfg).triage_one(finding)
+
+    assert record.verdict.verdict is VerdictLabel.external_fp
+    assert record.verdict.requires_human_review is False
+    assert record.verdict.external_control.control_id == "platform:DS-0026"

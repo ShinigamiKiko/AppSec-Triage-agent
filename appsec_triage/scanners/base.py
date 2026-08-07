@@ -4,7 +4,7 @@ Two execution modes, because the tools genuinely differ in how they ship:
 
 * `native`  — a binary on PATH, or a Python module (`python -m bandit`).
 * `docker`  — the only sane route for Semgrep on Windows, which has no native
-              Windows build, and a reasonable default for Trivy.
+              Windows build, and a reasonable default for container-only tools.
 
 Safety rules that are not negotiable here:
 

@@ -1,4 +1,4 @@
-"""SARIF 2.1.0 adapter — covers Semgrep, CodeQL, Trivy, and Checkmarx exports.
+"""SARIF 2.1.0 adapter — covers Semgrep, CodeQL, and other standard exports.
 
 SARIF is verbose and every tool fills it slightly differently, so this adapter
 sticks to the fields all four actually populate, and reaches into

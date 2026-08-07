@@ -58,6 +58,9 @@ heuristics:
 
 post_validation:
   enabled: true
+  # Psalm/Semgrep дают source→sink, phpactor/routes — production entrypoint.
+  # Одной половины недостаточно для решённого dataflow verdict.
+  require_sast_reachability: true
   require_evidence_quotes: true
   quote_match_threshold: 0.85
   confidence_floor: 0.7

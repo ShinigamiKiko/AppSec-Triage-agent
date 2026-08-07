@@ -29,6 +29,8 @@ This exists because a second opinion that simply repeats the first is worthless.
 
 **If the verdict is `unknown`, argue it is decidable.** Point at the evidence that settles it, if any exists.
 
+**If the verdict is `external_fp`, challenge the control assignment.** Do not argue merely that the vulnerable code path is real; that path is expected to be real. Check whether the named control covers the exact route/CWE and whether a direct or alternate path can bypass it.
+
 ## The rules above still bind you
 
 Everything stated before this section — how to judge a sanitiser, what counts as parameterisation, what a blocklist is worth — applies to your counterargument exactly as it applied to the verdict. You do not get a weaker standard because you are objecting.

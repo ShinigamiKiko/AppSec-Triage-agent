@@ -3,7 +3,7 @@
 Three numbers matter, and they are deliberately reported separately because the
 article's headline figures (47.5% / 80.8% / 93.8%) are three different questions:
 
-* `agreement_all`   — strict 3-class match including `unknown`. Pessimistic:
+* `agreement_all`   — strict 4-class match including `unknown` and `external_fp`. Pessimistic:
                       the model saying "I don't know" where a human decided
                       counts as a miss, even though it is the safe behaviour.
 * `agreement_decided` — accuracy on findings the model actually decided.
@@ -34,6 +34,7 @@ class Scorecard:
     agree_all: int = 0
     agree_decided: int = 0
     unknown_count: int = 0
+    external_fp_count: int = 0
     dangerous_misses: list[str] = field(default_factory=list)
     false_alarms: list[str] = field(default_factory=list)
     by_cwe: dict[str, dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: {"n": 0, "agree": 0, "decided": 0, "agree_decided": 0}))
@@ -58,6 +59,7 @@ class Scorecard:
             "agreement_all": _pct(self.agree_all, self.total),
             "agreement_decided": _pct(self.agree_decided, self.decided),
             "abstention_rate": _pct(self.unknown_count, self.total),
+            "external_fp_rate": _pct(self.external_fp_count, self.total),
             "dangerous_misses": len(self.dangerous_misses),
             "dangerous_miss_ids": self.dangerous_misses[:20],
             "false_alarms": len(self.false_alarms),
@@ -110,7 +112,7 @@ def _bucket(confidence: float) -> str:
 
 
 def score(records: Iterable[TriageRecord], labels: dict[str, str], provider: str, model: str) -> Scorecard:
-    """`labels` maps finding_id -> one of confirmed/false_positive/unknown."""
+    """`labels` maps finding_id -> confirmed/false_positive/external_fp/unknown."""
     card = Scorecard(provider=provider, model=model)
 
     for r in records:
@@ -153,14 +155,19 @@ def score(records: Iterable[TriageRecord], labels: dict[str, str], provider: str
             if r.verdict.blocking_question:
                 card.unknowns_with_blocking_question += 1
         else:
+            if predicted is VerdictLabel.external_fp:
+                card.external_fp_count += 1
             card.decided += 1
             bucket["decided"] += 1
             if predicted.value == truth:
                 card.agree_decided += 1
                 bucket["agree_decided"] += 1
-            elif truth == "confirmed" and predicted is VerdictLabel.false_positive:
+            elif truth == "confirmed" and predicted in (
+                VerdictLabel.false_positive,
+                VerdictLabel.external_fp,
+            ):
                 card.dangerous_misses.append(r.finding_id)
-            elif truth == "false_positive" and predicted is VerdictLabel.confirmed:
+            elif truth in ("false_positive", "external_fp") and predicted is VerdictLabel.confirmed:
                 card.false_alarms.append(r.finding_id)
 
     return card

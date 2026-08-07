@@ -7,7 +7,6 @@ import json
 import pytest
 from _helpers import _PHP_CLOSURE, _PHP_SNIPPET, _PROVIDER, FakeClient, _cfg, _finding, _verdict_json
 
-from appsec_triage import cli
 from appsec_triage.scanners import selection
 from appsec_triage.config import (
     ProviderConfig,
@@ -235,9 +234,9 @@ def test_deepseek_shaped_dataflow_is_coerced_not_rejected():
     assert verdict.evidence[0].why == "ORM"
 
 
-def test_language_scanner_routing_keeps_semgrep_php_only(tmp_path, monkeypatch):
+def test_language_scanner_routing_adds_php_taint_analysis(tmp_path, monkeypatch):
     """Non-PHP source must never select Semgrep; CodeQL covers its languages."""
-    monkeypatch.setattr(selection, "usable_scanners", lambda: ["semgrep", "psalm", "bandit", "codeql", "gitleaks", "trivy"])
+    monkeypatch.setattr(selection, "usable_scanners", lambda: ["semgrep", "bandit", "codeql", "gitleaks"])
 
     (tmp_path / "main.py").write_text("print('ok')", encoding="utf-8")
     assert "semgrep" not in selection.scanners_for_target(tmp_path)
@@ -246,7 +245,22 @@ def test_language_scanner_routing_keeps_semgrep_php_only(tmp_path, monkeypatch):
     (tmp_path / "index.php").write_text("<?php echo 'ok';", encoding="utf-8")
     selected = selection.scanners_for_target(tmp_path)
     assert "semgrep" in selected
+    assert "codeql" in selected
     assert "psalm" in selected
+
+
+def test_pure_php_routes_to_semgrep_and_psalm_not_codeql(tmp_path, monkeypatch):
+    monkeypatch.setattr(selection, "usable_scanners", lambda: ["semgrep", "psalm", "codeql", "gitleaks"])
+    (tmp_path / "index.php").write_text("<?php echo 'ok';", encoding="utf-8")
+
+    assert selection.scanners_for_target(tmp_path) == ["semgrep", "psalm"]
+
+
+def test_go_requires_codeql_and_govulncheck_even_when_one_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(selection, "usable_scanners", lambda: ["codeql"])
+    (tmp_path / "main.go").write_text("package main", encoding="utf-8")
+
+    assert selection.scanners_for_target(tmp_path) == ["govulncheck", "codeql"]
 
 
 @pytest.mark.parametrize("suffix", [".c", ".cpp", ".rs", ".swift"])

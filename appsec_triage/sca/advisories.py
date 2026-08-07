@@ -69,6 +69,8 @@ class Advisory:
     sources: list[str] = field(default_factory=list)
     severity: str = ""
     problem: str = ""
+    cwe: str = ""
+    fixed_versions: list[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -135,6 +137,28 @@ def _severity_of(entry: dict) -> str:
     return ""
 
 
+def _cwe_of(entry: dict) -> str:
+    candidates = list((entry.get("database_specific") or {}).get("cwe_ids") or [])
+    for affected in entry.get("affected") or []:
+        candidates.extend((affected.get("database_specific") or {}).get("cwe_ids") or [])
+    for value in candidates:
+        match = re.search(r"CWE[-_ ]?(\d+)", str(value), re.IGNORECASE)
+        if match:
+            return f"CWE-{int(match.group(1))}"
+    return ""
+
+
+def _fixed_versions(entry: dict) -> list[str]:
+    versions = {
+        str(event["fixed"])
+        for affected in entry.get("affected") or []
+        for range_ in affected.get("ranges") or []
+        for event in range_.get("events") or []
+        if event.get("fixed")
+    }
+    return sorted(versions)
+
+
 def _rank_refs(urls: list[str]) -> list[str]:
     """A commit is a fix; a pull request bundles; everything else is prose."""
     commits, pulls, patches = [], [], []
@@ -177,6 +201,7 @@ def from_osv(package: str, ecosystem: str, version: str) -> list[Advisory]:
             details=(vuln.get("details") or "")[:8000],
             aliases=list(vuln.get("aliases") or []),
             fix_refs=_rank_refs(refs), sources=["osv"], severity=_severity_of(vuln),
+            cwe=_cwe_of(vuln), fixed_versions=_fixed_versions(vuln),
         ))
     return out
 
@@ -195,6 +220,7 @@ def from_ghsa(advisory_id: str) -> Advisory | None:
         details=(data.get("details") or "")[:8000],
         aliases=list(data.get("aliases") or []),
         fix_refs=_rank_refs(refs), sources=["ghsa"], severity=_severity_of(data),
+        cwe=_cwe_of(data), fixed_versions=_fixed_versions(data),
     )
 
 
@@ -289,6 +315,10 @@ def collect(
             if alias not in merged.aliases:
                 merged.aliases.append(alias)
         merged.severity = merged.severity or entry.severity
+        merged.cwe = merged.cwe or entry.cwe
+        for fixed_version in entry.fixed_versions:
+            if fixed_version not in merged.fixed_versions:
+                merged.fixed_versions.append(fixed_version)
         for ref in entry.fix_refs:
             if ref not in merged.fix_refs:
                 merged.fix_refs.append(ref)

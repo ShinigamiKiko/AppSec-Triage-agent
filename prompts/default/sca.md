@@ -4,11 +4,12 @@ version: "1.0"
 applies_to: []
 kind: dependency
 ---
-## This is a dependency finding, not a weakness in your code
+## This is a dependency finding with scanner-backed applicability evidence
 
-The vulnerable code belongs to a third party. You cannot read it and you are not
-being asked to. Four different questions decide this, and none of them is "does
-untrusted input reach a sink".
+The vulnerable code belongs to a third party, but the evidence may include a
+govulncheck symbol trace, CodeQL dataflow, and an LSP/route entrypoint. Those are
+authoritative scanner facts. Never replace them with an inference from advisory
+prose or treat an installed version as proof that the vulnerable function runs.
 
 Everything before this section still binds you — quote what you cite, do not
 invent, prefer `unknown` to a guess. What changes is *what the evidence is*.
@@ -51,36 +52,41 @@ finding because no import was found; ask instead.
 If the advisory names a specific vulnerable function or class, and the evidence
 shows our code does not call it, that is a genuine narrowing — quote both.
 
+For Go, `govulncheck -scan=symbol` is the primary answer:
+
+- a source-level call stack means the vulnerable symbol is called;
+- a completed symbol scan that reports no call is stronger than an import search;
+- CodeQL establishes whether attacker-controlled data reaches the application
+  call site, while LSP/routes establish whether production can enter that path.
+
+Do not ask for those facts again when the scanner section already provides them.
+
 ### Step 4 — Decide
 
 | Evidence | Verdict |
 |---|---|
 | Installed version outside the affected range | `false_positive`, `IDENTIFIER_ONLY` — quote the range |
 | `dev_dependency_only`, and the advisory is not about the build itself | `false_positive` — say "not shipped" |
-| In range, ships, and imported | `confirmed` — name the upgrade target |
-| In range and ships, reachability unclear | `confirmed` — a shipped vulnerable version is a finding; reachability changes priority, not existence |
+| Completed govulncheck symbol scan, no vulnerable call | `false_positive` — package affected, application call path absent |
+| Vulnerable symbol called; intrinsic flaw or SCA chain outcome `actual` | `confirmed` — name the call evidence and upgrade target |
+| Input-driven flaw with symbol call plus CodeQL flow and LSP/route entrypoint | `confirmed`, `EXPLOITABLE_DATAFLOW` |
+| In range and ships, but symbol/call applicability is unresolved | `unknown` — version presence is component risk, not proven application reachability |
 | Range unclear, or the evidence does not name a version | `unknown` — say what is missing |
 
-**Do not require proof of exploitability to confirm.** For a dependency the bar
-is "we ship an affected version", because the exploit is public and the fix is a
-version bump. Demanding a call-path here inverts the economics: upgrading is
-cheap, and being wrong is not.
+`external_fp` is reserved for a precondition that the dependency chain explicitly assigns to an external infrastructure owner. A merely unresolved environment precondition is not externally mitigated and must not use this label.
 
-**An unresolved precondition is not a reason to answer `unknown`.** The section
-above may report a condition it could not settle — one that lives in an
-environment variable, a manifest, another team's system. That is a note for
-whoever reviews the finding, not a gap in this verdict. A shipped affected
-version is still `confirmed`; the unsettled condition belongs in
-`missing_information`. Answering `unknown` because something was left unchecked
-converts a decided finding into work for a person, which is the opposite of the
-job — measured, it moved five findings per project out of a verdict and into a
-queue for no gain.
+An unresolved environment precondition belongs in `missing_information`, but do
+not confuse it with missing symbol evidence. A version match proves that an
+affected component ships; it does not prove that this application invokes the
+affected behavior. Preserve that distinction in the verdict and reason.
 
 ### `vulnerable_symbol` and `dataflow` for this class
 
-`vulnerable_symbol` is the package coordinate — name it `package@version`, kind
-`config_key`. `dataflow` stays empty: there is no path through our code to
-reconstruct, and inventing one is worse than leaving it out.
+When no scanner names a symbol, use the package coordinate as
+`vulnerable_symbol` (`package@version`, kind `config_key`). When govulncheck names
+the vulnerable function, use that exact symbol. Populate `dataflow` only from a
+CodeQL/input-flow trace shown in the evidence; a govulncheck call stack proves a
+call chain, not attacker-controlled data by itself.
 
 Put the upgrade target in `reason`, in the form "upgrade to X". That sentence is
 the whole remediation for this class.

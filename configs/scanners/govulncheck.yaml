@@ -1,0 +1,12 @@
+# Govulncheck is mandatory for Go targets. CodeQL finds first-party dataflow;
+# govulncheck answers the dependency-specific question: does this program call
+# the vulnerable symbol, rather than merely importing an affected module?
+mode: native
+binary:
+  - govulncheck
+  - /usr/bin/govulncheck
+image: null
+rules: []
+timeout_s: 1800
+docker_network: false
+run_in_target: true

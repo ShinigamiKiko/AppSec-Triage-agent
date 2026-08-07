@@ -22,6 +22,23 @@ def test_queue_budget_is_a_ceiling_not_a_quota():
     assert queue.to_review[0].record.verdict.verdict.value == "unknown"
 
 
+def test_closed_findings_stay_out_of_a_full_budget_queue():
+    from appsec_triage import prioritize
+    from appsec_triage.config import TriageQueueConfig
+
+    records = [
+        _record("confirmed", "CWE-98", "src/live.php"),
+        _record("false_positive", "CWE-98", "src/closed.php"),
+    ]
+
+    queue = prioritize.build(records, TriageQueueConfig(review_budget_pct=100, min_score=0))
+
+    assert len(queue.to_review) == 1
+    assert queue.to_review[0].record.verdict.verdict.value == "confirmed"
+    assert queue.manual_findings == 1
+    assert queue.manual_pct == 50.0
+
+
 def test_clustering_collapses_one_pattern_into_one_decision():
     from appsec_triage import prioritize
     from appsec_triage.config import TriageQueueConfig
@@ -73,6 +90,28 @@ def test_nothing_is_deleted_by_the_budget():
 
     assert len(queue.items) == len(queue.to_review) + len(queue.deferred)
     assert sum(i.cluster_size for i in queue.items) == 20, "every finding is still represented"
+
+
+def test_external_fp_is_ai_closed_and_never_enters_manual_triage():
+    from appsec_triage import prioritize
+    from appsec_triage.config import TriageQueueConfig
+
+    external = _record(
+        "external_fp",
+        "CWE-89",
+        "src/a.php",
+        overrides=["sanity_conflict: would normally be exempt"],
+    )
+    unresolved = _record("unknown", "CWE-89", "src/b.php")
+    queue = prioritize.build(
+        [external, unresolved],
+        TriageQueueConfig(review_budget_pct=100, min_score=0),
+    )
+
+    assert [item.record.finding_id for item in queue.to_review] == [unresolved.finding_id]
+    assert queue.manual_findings == 1
+    assert queue.manual_pct == 50.0
+    assert queue.summary()["external_ai_closed"] == 1
 
 
 # --- stack conventions ---------------------------------------------------------

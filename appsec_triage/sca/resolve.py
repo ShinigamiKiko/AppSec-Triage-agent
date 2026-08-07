@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import registries
 from .advisories import Advisory
+from .source_cache import PackageSourceCache, SourceSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +132,43 @@ SCHEMA = {
     },
 }
 
+_MAX_RESPONSE_EXCERPT = 320
+_MAX_REPAIR_RESPONSE = 4_000
+
+
+def _response_excerpt(text: str, error: Exception) -> str:
+    """Bounded model output around the parse failure for durable diagnostics."""
+    position = min(getattr(error, "pos", 0), len(text))
+    start = max(0, position - _MAX_RESPONSE_EXCERPT // 2)
+    end = min(len(text), start + _MAX_RESPONSE_EXCERPT)
+    prefix = "..." if start else ""
+    suffix = "..." if end < len(text) else ""
+    excerpt = text[start:end].strip().replace("\r", "\\r").replace("\n", "\\n")
+    return f"{prefix}{excerpt}{suffix}"
+
+
+def _parse_json_object(text: str) -> dict:
+    """Parse a JSON object, tolerating only wrappers such as code fences.
+
+    DeepSeek's json_object mode does not enforce a schema and occasionally adds
+    markdown around an otherwise valid object. We may remove that wrapper, but
+    never guess missing commas, quotes, or braces.
+    """
+    stripped = text.strip()
+    try:
+        answer = json.loads(stripped)
+    except json.JSONDecodeError as original:
+        start = stripped.find("{")
+        if start < 0:
+            raise original
+        try:
+            answer, _ = json.JSONDecoder().raw_decode(stripped, start)
+        except json.JSONDecodeError:
+            raise original
+    if not isinstance(answer, dict):
+        raise ValueError(f"expected one JSON object, got {type(answer).__name__}")
+    return answer
+
 
 @dataclass(slots=True)
 class VulnerableSymbol:
@@ -153,6 +191,8 @@ class VulnerableSymbol:
         """How well the name is corroborated, in words a report can print."""
         if not self.function:
             return self.note or "символ не определён"
+        if self.confirmed_in_source:
+            return "вызов подтверждён symbol-level сканером"
         if self.declared_in_installed and self.grounded_in_fix:
             return "подтверждено дважды: фикс правил эту функцию, и она есть в установленной версии"
         if self.declared_in_installed:
@@ -171,6 +211,7 @@ class VulnerableSymbol:
     precondition_tokens: tuple[str, ...] = field(default_factory=tuple)
     precondition_where: str = ""
     precondition_decidable: bool = True
+    resolution_error: str = ""
 
     @property
     def usable(self) -> bool:
@@ -327,10 +368,64 @@ def _similar(name: str, files: dict[str, str], limit: int = 25) -> list[tuple[st
 class SymbolResolver:
     """Advisory in, symbol out. One model call, two when the name is not found."""
 
-    def __init__(self, client, *, roots: list[Path] | None = None) -> None:
+    def __init__(
+        self,
+        client,
+        *,
+        roots: list[Path] | None = None,
+        source_cache: PackageSourceCache | None = None,
+    ) -> None:
         self._client = client
         self._roots = [Path(r) for r in (roots or [])]
         self._sources: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._snapshots: dict[tuple[str, str, str], SourceSnapshot] = {}
+        self._source_cache = source_cache
+
+    @staticmethod
+    def _source_key(ecosystem: str, package: str, version: str) -> tuple[str, str, str]:
+        return ecosystem.lower(), package.lower(), version.lstrip("v")
+
+    def source_snapshot(self, ecosystem: str, package: str, version: str = "") -> SourceSnapshot:
+        """Local installed source first, then one exact-version remote archive."""
+        key = self._source_key(ecosystem, package, version)
+        cached = self._snapshots.get(key)
+        if cached is not None:
+            return SourceSnapshot(
+                ecosystem=cached.ecosystem,
+                package=cached.package,
+                version=cached.version,
+                files=cached.files,
+                source_url=cached.source_url,
+                archive_sha256=cached.archive_sha256,
+                problem=cached.problem,
+                cache_status="cache_hit",
+            )
+
+        for root in self._roots:
+            directory = registries.locate(root, ecosystem, package)
+            files = registries.package_source(ecosystem, package, version, root)
+            if files:
+                snapshot = SourceSnapshot(
+                    ecosystem, package, version, files,
+                    source_url=directory.resolve().as_uri() if directory else str(root.resolve()),
+                    cache_status="local",
+                )
+                self._snapshots[key] = snapshot
+                self._sources[key] = files
+                return snapshot
+
+        if self._source_cache is None:
+            snapshot = SourceSnapshot(
+                ecosystem, package, version,
+                problem="package is not installed and remote source cache is disabled",
+                cache_status="unavailable",
+            )
+        else:
+            snapshot = self._source_cache.snapshot(ecosystem, package, version)
+        self._snapshots[key] = snapshot
+        if snapshot.files:
+            self._sources[key] = snapshot.files
+        return snapshot
 
     def _source_for(self, ecosystem: str, package: str, version: str = "") -> dict[str, str]:
         """The installed package, read once per run and only when it is there.
@@ -340,24 +435,61 @@ class SymbolResolver:
         re-reading the same directory once per CVE is pure waste. An empty
         result is not remembered, so a tree that appears later is still seen.
         """
-        key = (ecosystem.lower(), package.lower(), version)
+        key = self._source_key(ecosystem, package, version)
         cached = self._sources.get(key)
         if cached:
             return cached
-        for root in self._roots:
-            files = registries.package_source(ecosystem, package, version, root)
-            if files:
-                self._sources[key] = files
-                return files
-        return {}
+        return self.source_snapshot(ecosystem, package, version).files
 
-    def _ask(self, user: str) -> dict:
+    @staticmethod
+    def _failed_answer(error: str) -> dict:
+        return {
+            "vulnerable_function": "",
+            "vulnerable_class": "",
+            "vulnerable_file": "",
+            "evidence": "",
+            "why": error,
+        }
+
+    def _ask(self, user: str) -> tuple[dict, str]:
+        raw = ""
         try:
-            return json.loads(self._client.complete(SYSTEM, user, json_schema=SCHEMA).text)
+            raw = self._client.complete(SYSTEM, user, json_schema=SCHEMA).text
+            return _parse_json_object(raw), ""
         except Exception as exc:
-            log.warning("symbol extraction failed: %s", exc)
-            return {"vulnerable_function": "", "vulnerable_class": "",
-                    "vulnerable_file": "", "evidence": "", "why": f"ошибка модели: {exc}"}
+            if not raw:
+                error = f"symbol extraction request failed: {exc}"
+                log.warning(error)
+                return self._failed_answer(error), error
+            first_error = exc
+
+        log.info("symbol extraction JSON repair round: %s", first_error)
+        failure_context = _response_excerpt(raw, first_error)
+        repair_user = (
+            f"{user}\n\n=== JSON CORRECTION REQUIRED ===\n"
+            "Your previous answer was not valid JSON. Return the same answer as exactly one "
+            "valid JSON object. Include every required field, escape backslashes and quotes "
+            "correctly, and emit no markdown or prose outside the object. Do not preserve invalid "
+            "punctuation. JSON does not support `=>`: when a source-code expression is useful as "
+            "a token, quote the entire expression as one JSON string. Every precondition_tokens "
+            "item must be a JSON string.\n\n"
+            f"Parser error: {first_error}\n"
+            f"Text around the error: {failure_context!r}\n\n"
+            "Previous invalid answer:\n"
+            f"{raw[:_MAX_REPAIR_RESPONSE]}"
+        )
+        repaired_raw = ""
+        try:
+            repaired_raw = self._client.complete(SYSTEM, repair_user, json_schema=SCHEMA).text
+            return _parse_json_object(repaired_raw), ""
+        except Exception as repair_exc:
+            error = (
+                f"symbol extraction returned invalid JSON twice: first={first_error}; "
+                f"repair={repair_exc}; first_response={_response_excerpt(raw, first_error)!r}; "
+                f"repair_response={_response_excerpt(repaired_raw, repair_exc)!r}"
+            )
+            log.warning(error)
+            return self._failed_answer(error), error
 
     @staticmethod
     def _name(answer: dict) -> str:
@@ -381,7 +513,7 @@ class SymbolResolver:
             prompt += ["", f"=== FIX DIFF ({diff_url}) ===", diff]
         user = "\n".join(prompt)
 
-        answer = self._ask(user)
+        answer, resolution_error = self._ask(user)
         name = self._name(answer)
         steps = 1
 
@@ -393,7 +525,7 @@ class SymbolResolver:
             problem = ("appears neither in the fix nor in the advisory text"
                        if not grounded else
                        "is quoted from a line the fix did not touch")
-            answer = self._ask(
+            answer, resolution_error = self._ask(
                 user + f"\n\n=== CORRECTION ===\n`{name}` {problem}. A fix changes the "
                 "vulnerable function's own code, so quote a line that starts with `+` "
                 "or `-` from inside it. A function that appears only in unchanged "
@@ -427,6 +559,7 @@ class SymbolResolver:
             str(t).strip() for t in (answer.get("precondition_tokens") or []) if str(t).strip())
         base.precondition_where = (answer.get("precondition_where") or "").strip()[:200]
         base.precondition_decidable = bool(answer.get("precondition_decidable", True))
+        base.resolution_error = resolution_error
 
         if name and existed is False:
             base.note = (f"{name} появляется в фиксе только в добавленных строках — "

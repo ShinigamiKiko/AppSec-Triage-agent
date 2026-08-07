@@ -1,9 +1,7 @@
 """A report has to say what did not run.
 
-A scan where a scanner died still produces a clean-looking report: fewer
-findings, no errors, exit zero. Measured on a real project — Trivy died on one
-compiled artifact and the entire dependency layer vanished, more than half the
-findings, noticed only because someone read the log.
+A scan where a required analysis leg died still produces a clean-looking report:
+fewer findings, no errors, exit zero. The manifest must preserve that gap.
 """
 
 from __future__ import annotations
@@ -25,10 +23,10 @@ def _manifest(tmp_path, scans):
 def test_a_complete_scan_says_so(tmp_path):
     cov = coverage.read(_manifest(tmp_path, [
         {"scanner": "semgrep", "ok": True, "findings": 3},
-        {"scanner": "trivy", "ok": True, "findings": 9},
+        {"scanner": "cdxgen+osv", "ok": True, "findings": 9},
     ]))
     assert cov.complete
-    assert cov.ran == ["semgrep", "trivy"]
+    assert cov.ran == ["semgrep", "cdxgen+osv"]
     assert cov.gaps() == []
 
 
@@ -45,11 +43,18 @@ def test_a_failure_is_reported_as_lost_coverage_not_as_an_exit_code(tmp_path):
 
 
 def test_the_dependency_layer_going_missing_is_stated_plainly(tmp_path):
-    # The case that actually happened: more than half the findings vanished.
     cov = coverage.read(_manifest(tmp_path, [
-        {"scanner": "trivy", "ok": False, "error": "context deadline exceeded"},
+        {"scanner": "cdxgen+osv", "ok": False, "error": "OSV timed out"},
     ]))
-    assert "vulnerable dependencies" in cov.gaps()[0]
+    assert "dependency graph" in cov.gaps()[0]
+
+
+def test_missing_govulncheck_names_lost_symbol_reachability(tmp_path):
+    cov = coverage.read(_manifest(tmp_path, [
+        {"scanner": "govulncheck", "ok": False, "error": "binary missing"},
+    ]))
+
+    assert "vulnerable-symbol reachability" in cov.gaps()[0]
 
 
 def test_no_manifest_means_unknown_not_complete(tmp_path):
@@ -71,7 +76,7 @@ def _run(cov):
 def test_the_banner_appears_above_the_counts(tmp_path):
     """Placement matters: it changes what the numbers below it mean."""
     cov = coverage.read(_manifest(tmp_path, [
-        {"scanner": "trivy", "ok": False, "error": "boom"},
+        {"scanner": "cdxgen+osv", "ok": False, "error": "boom"},
     ]))
     page = html.render(_run(cov))
     assert "This report is incomplete" in page

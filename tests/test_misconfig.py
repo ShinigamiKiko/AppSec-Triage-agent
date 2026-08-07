@@ -1,6 +1,6 @@
 """Configuration checks are facts, not judgements.
 
-Trivy already parsed the Dockerfile. Routing that through a model produced the
+An IaC scanner already parsed the Dockerfile. Routing that through a model produced the
 question "does any request-controlled value reach `FROM node:20-alpine`?" — the
 generic dataflow question asked of something that has no dataflow.
 """
@@ -19,7 +19,7 @@ def _sarif(tmp_path, *, tags, precision):
             {
                 "tool": {
                     "driver": {
-                        "name": "Trivy",
+                        "name": "IaC Scanner",
                         "rules": [
                             {
                                 "id": "DS-0002",
@@ -47,7 +47,7 @@ def _sarif(tmp_path, *, tags, precision):
             }
         ]
     }
-    path = tmp_path / "trivy.sarif.json"
+    path = tmp_path / "misconfig.sarif.json"
     path.write_text(json.dumps(doc), encoding="utf-8")
     return path
 
@@ -88,7 +88,7 @@ def test_it_is_decided_without_calling_the_model(tmp_path):
 
 
 def test_a_dockerfile_check_is_not_read_as_a_vulnerable_package():
-    """Trivy labels these `Artifact: Dockerfile`, and the SCA parser took the
+    """Some SARIF producers label these `Artifact: Dockerfile`, and the SCA parser took the
     bait — ten configuration checks arrived as dependency findings and were
     asked which version of themselves was affected."""
     from appsec_triage.ingest import dependency

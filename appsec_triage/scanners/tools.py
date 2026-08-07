@@ -1,4 +1,4 @@
-"""Concrete scanners: Semgrep · CodeQL · Bandit · Trivy · Gitleaks.
+"""Concrete scanners: Semgrep · CodeQL · Bandit · Gitleaks.
 
 Each one is small; the interesting content is the per-tool quirks, which is
 exactly what a config file cannot express.
@@ -14,7 +14,9 @@ from collections import Counter
 from pathlib import Path
 
 from ..config import REPO_ROOT
-from .base import Availability, ScanResult, Scanner, _first_line
+from ..ingest.govulncheck import decode_stream
+from .base import Availability, ScanResult, Scanner
+from .codeql_targeted import analyze as analyze_targeted_go
 
 _CODEQL_LANGS = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "javascript",
@@ -73,7 +75,7 @@ class SemgrepScanner(Scanner):
         return [
             self.resolve_binary("semgrep"), "scan", *self._rules_args(),
             *(arg for directory in _SEMGREP_EXCLUDES for arg in ("--exclude", directory)),
-            "--sarif", "--quiet", "--no-git-ignore", "--disable-version-check",
+            "--sarif", "--dataflow-traces", "--quiet", "--no-git-ignore", "--disable-version-check",
             "--metrics", "off",
             "--timeout", str(self.cfg.per_file_timeout_s),
             str(target),
@@ -91,7 +93,7 @@ class SemgrepScanner(Scanner):
             *prefix,
             "semgrep", "scan", *self._rules_args(mounted_at="/rules" if local else None),
             *(arg for directory in _SEMGREP_EXCLUDES for arg in ("--exclude", directory)),
-            "--sarif", "--quiet", "--no-git-ignore", "--disable-version-check",
+            "--sarif", "--dataflow-traces", "--quiet", "--no-git-ignore", "--disable-version-check",
             "--metrics", "off",
             "--timeout", str(self.cfg.per_file_timeout_s),
             "/src",
@@ -135,52 +137,6 @@ class BanditScanner(Scanner):
             return 0
 
 
-class TrivyScanner(Scanner):
-    """Trivy filesystem scan: misconfigurations, secrets, vulnerable dependencies.
-
-    Note this is the one tool here that legitimately produces CVEs — its
-    `vuln` scanner reads dependency manifests, which is SCA, not SAST.
-    """
-
-    name = "trivy"
-
-    @property
-    def success_exit_codes(self) -> frozenset[int]:
-        return frozenset({0})
-
-    def _native_version_argv(self) -> list[str] | None:
-        return ["trivy", "--version"]
-
-    def _scanners_arg(self) -> list[str]:
-        return ["--scanners", ",".join(self.cfg.rules or ["vuln", "secret", "misconfig"])]
-
-    def _skip_args(self) -> list[str]:
-        """Directories of build output that are not dependency manifests.
-
-        Not an optimisation. On a real Python repository trivy timed out on a
-        single `__pycache__/*.pyc` and aborted the *entire* scan — the whole SCA
-        leg for that project was lost to one compiled artifact. Nothing of value
-        is given up: none of these directories carries a manifest or a lockfile.
-        """
-        skip = ["__pycache__", "node_modules", ".git", "vendor/bundle", ".venv", "venv"]
-        args: list[str] = []
-        for directory in skip:
-            args += ["--skip-dirs", f"**/{directory}"]
-        return args
-
-    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            "trivy", "fs", "--format", "sarif", "--quiet",
-            *self._scanners_arg(), *self._skip_args(), str(target),
-        ]
-
-    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            *self._docker_prefix(target), "fs", "--format", "sarif", "--quiet",
-            *self._scanners_arg(), *self._skip_args(), "/src",
-        ]
-
-
 class GitleaksScanner(Scanner):
     """Gitleaks: secrets in the working tree and in history."""
 
@@ -211,10 +167,97 @@ class GitleaksScanner(Scanner):
             "--no-banner", "--exit-code", "0",
         ]
 
+    def report_health(self, path: Path) -> str | None:
+        """An empty Gitleaks SARIF is a valid clean scan.
+
+        Gitleaks does not enumerate rules in a clean report, so the generic
+        SARIF health check would incorrectly classify zero secrets as a scanner
+        that ran nothing.
+        """
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"report is not readable JSON: {exc}"
+        if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list):
+            return "report is not SARIF"
+        for run in doc["runs"]:
+            for inv in run.get("invocations") or []:
+                if inv.get("executionSuccessful") is False:
+                    return "SARIF reports executionSuccessful=false"
+        return None
+
     @property
     def writes_stdout(self) -> bool:
         return False
 
+
+class GovulncheckScanner(Scanner):
+    """Go vulnerability reachability at symbol granularity.
+
+    Unlike a module-version audit, govulncheck distinguishes an imported
+    vulnerable package from an actual call to the affected symbol and includes
+    the source-to-symbol call stack in its JSON protocol.
+    """
+
+    name = "govulncheck"
+
+    @property
+    def output_suffix(self) -> str:
+        return ".json"
+
+    @property
+    def success_exit_codes(self) -> frozenset[int]:
+        return frozenset({0})
+
+    def _native_version_argv(self) -> list[str] | None:
+        return [self.resolve_binary("govulncheck"), "-version"]
+
+    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        return [self.resolve_binary("govulncheck"), "-format=json", "-scan=symbol", "./..."]
+
+    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        raise NotImplementedError
+
+    def report_health(self, path: Path) -> str | None:
+        try:
+            objects = decode_stream(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            return f"report is not a readable govulncheck JSON stream: {exc}"
+        config = next((obj.get("config") for obj in objects if isinstance(obj.get("config"), dict)), None)
+        if not config or config.get("scanner_name") != "govulncheck":
+            return "report has no govulncheck configuration record"
+        if config.get("scan_level") != "symbol":
+            return f"scan level is {config.get('scan_level')!r}, expected 'symbol'"
+        if not any(isinstance(obj.get("SBOM"), dict) for obj in objects):
+            return "report has no SBOM record — package loading did not complete"
+        return None
+
+    def count_findings(self, path: Path) -> int:
+        try:
+            objects = decode_stream(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return 0
+        return len(
+            {
+                str(obj["finding"].get("osv"))
+                for obj in objects
+                if isinstance(obj.get("finding"), dict) and obj["finding"].get("osv")
+            }
+        )
+
+    def scan(self, target: Path, out_dir: Path) -> ScanResult:
+        result = super().scan(target, out_dir)
+        if not result.output_path:
+            return result
+        try:
+            objects = decode_stream(result.output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return result
+        config = next((obj.get("config") for obj in objects if isinstance(obj.get("config"), dict)), {})
+        scanner_version = str(config.get("scanner_version") or "unknown")
+        go_version = str(config.get("go_version") or "unknown")
+        result.version = f"govulncheck {scanner_version} / {go_version}"
+        return result
 
 class PsalmScanner(Scanner):
     """Psalm taint analysis — the only real source->sink dataflow for PHP.
@@ -393,6 +436,29 @@ class CodeQLScanner(Scanner):
                 if proc.returncode != 0:
                     tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
                     return f"'{phase}' exited {proc.returncode}: {tail[:300]}"
+
+            govulncheck_report = out_dir / "govulncheck.json"
+            if language == "go" and govulncheck_report.is_file():
+                targeted_part = out_dir / ".codeql-go-targeted.sarif.json"
+                targeted_part.unlink(missing_ok=True)
+                targeted_doc, targeted_error = analyze_targeted_go(
+                    exe,
+                    db_dir,
+                    govulncheck_report,
+                    targeted_part,
+                    timeout_s=self.cfg.timeout_s,
+                )
+                if targeted_error:
+                    return targeted_error
+                if targeted_doc is not None:
+                    try:
+                        base_doc = json.loads(part.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as exc:
+                        return f"general CodeQL SARIF became unreadable before merge: {exc}"
+                    part.write_text(
+                        json.dumps(self._merge_runs([base_doc, targeted_doc]), ensure_ascii=False),
+                        encoding="utf-8",
+                    )
         except subprocess.TimeoutExpired:
             return f"timed out after {self.cfg.timeout_s}s (a compiled language needs a working build)"
         except OSError as exc:
@@ -463,8 +529,8 @@ class CodeQLScanner(Scanner):
 REGISTRY: dict[str, type[Scanner]] = {
     "semgrep": SemgrepScanner,
     "bandit": BanditScanner,
-    "trivy": TrivyScanner,
     "gitleaks": GitleaksScanner,
     "codeql": CodeQLScanner,
+    "govulncheck": GovulncheckScanner,
     "psalm": PsalmScanner,
 }

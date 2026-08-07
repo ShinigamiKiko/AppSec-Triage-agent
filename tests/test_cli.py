@@ -45,3 +45,7 @@ def test_fail_on_gate_counts():
     # review: confirmed + unknown (an abstention still needs a human); closed never counts
     assert _gate_count("review", {"confirmed": 2, "unknown": 3, "false_positive": 9}) == 5
     assert _gate_count("review", {"confirmed": 0, "unknown": 0, "false_positive": 40}) == 0
+
+    counts = {"confirmed": 0, "unknown": 0, "false_positive": 0, "external_fp": 12}
+    assert _gate_count("confirmed", counts) == 0
+    assert _gate_count("review", counts) == 0

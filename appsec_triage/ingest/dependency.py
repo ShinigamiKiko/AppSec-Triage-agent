@@ -6,9 +6,10 @@ fixed version, advisory link — and every one of them emits it as prose in a
 sentence and cannot weigh anything: on a real project all 89 dependency
 findings arrived that way and every one landed in `unknown`.
 
-Three formats are handled because three scanners were in play:
+Several common formats are handled because dependency producers encode the same
+facts differently:
 
-    Trivy    "Package: api-platform/core\\nInstalled Version: v2.6.8\\n..."
+    SARIF    "Package: api-platform/core\\nInstalled Version: v2.6.8\\n..."
     wolfee   "GHSA-… in packagist/security-http@v5.4.22 - fixed=5.4.53"
     Grype    "…" plus proper `properties`, which are preferred when present
 

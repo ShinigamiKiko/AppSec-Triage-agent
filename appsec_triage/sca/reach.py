@@ -90,6 +90,10 @@ def _entrypoint_above(
     root: Path,
 ) -> tuple[str, str]:
     """Walk incoming calls outwards; return (description, problem)."""
+    if routes is not None and routes.usable:
+        direct = routes.enclosing(hit.file, hit.line)
+        if direct is not None:
+            return direct.describe(), ""
     language = lsp.cfg.language_for(hit.file)
     if not language:
         return "", f"нет языкового сервера для {hit.file}"
@@ -157,6 +161,11 @@ def _taint_into(findings: Iterable["Finding"], hits: Iterable["Hit"]) -> tuple[s
     if not saw_any:
         return "", "CodeQL не отработал — потоков данных нет"
     return "", "CodeQL отработал, но потока в эту точку не нашёл"
+
+
+def has_taint_path(findings: Iterable["Finding"], hits: Iterable["Hit"]) -> bool:
+    path, _ = _taint_into(findings, hits)
+    return bool(path)
 
 
 

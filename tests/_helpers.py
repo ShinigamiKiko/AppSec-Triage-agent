@@ -41,6 +41,10 @@ class FakeClient:
 
 
 def _cfg(**post_overrides) -> PipelineConfig:
+    # Most tests exercise schema/grounding machinery with tiny synthetic snippets
+    # that intentionally have no scanner trace or call graph. Strict reachability
+    # has dedicated tests; production defaults to enabled.
+    post_overrides.setdefault("require_sast_reachability", False)
     return PipelineConfig(
         provider="fake",
         heuristics=HeuristicsConfig(enabled=True),

@@ -78,6 +78,16 @@ def test_scanner_argv_never_goes_through_a_shell(tmp_path):
     assert str(nasty.resolve()) in argv, "the path must be one argv element, not spliced into a string"
 
 
+def test_semgrep_requests_dataflow_traces_for_sast_reachability(tmp_path):
+    from appsec_triage.config import ScannerConfig
+    from appsec_triage.scanners.tools import SemgrepScanner
+
+    scanner = SemgrepScanner(ScannerConfig(name="semgrep", mode="native"))
+    argv = scanner._native_scan_argv(tmp_path, tmp_path / "out.sarif")
+
+    assert "--dataflow-traces" in argv
+
+
 def test_report_health_rejects_a_scan_that_ran_no_rules(tmp_path):
     """Zero rules is not a clean codebase — it is a scanner that checked nothing."""
     from appsec_triage.config import ScannerConfig
@@ -174,6 +184,63 @@ def test_clean_report_is_not_an_error(tmp_path):
         '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"gitleaks"}},"results":[]}]}', encoding="utf-8"
     )
     assert ingest.load(path) == []
+
+
+def test_gitleaks_accepts_a_clean_report_without_enumerated_rules(tmp_path):
+    from appsec_triage.config import ScannerConfig
+    from appsec_triage.scanners.tools import GitleaksScanner
+
+    path = tmp_path / "gitleaks.sarif.json"
+    path.write_text(
+        '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"gitleaks"}},"results":[]}]}',
+        encoding="utf-8",
+    )
+
+    scanner = GitleaksScanner(ScannerConfig(name="gitleaks"))
+    assert scanner.report_health(path) is None
+
+
+def test_scanner_registry_contains_required_analysis_tools():
+    from appsec_triage.scanners.tools import REGISTRY
+
+    assert set(REGISTRY) == {"bandit", "codeql", "gitleaks", "govulncheck", "psalm", "semgrep"}
+
+
+def test_govulncheck_requests_symbol_level_json(tmp_path):
+    from appsec_triage.config import ScannerConfig
+    from appsec_triage.scanners.tools import GovulncheckScanner
+
+    scanner = GovulncheckScanner(
+        ScannerConfig(name="govulncheck", mode="native", binary="govulncheck", run_in_target=True)
+    )
+    argv = scanner._native_scan_argv(tmp_path, tmp_path / "govulncheck.json")
+
+    assert argv == ["govulncheck", "-format=json", "-scan=symbol", "./..."]
+
+
+def test_scan_all_runs_govulncheck_before_codeql_for_targeted_analysis(tmp_path, monkeypatch):
+    from appsec_triage.scanners import scan_all
+    from appsec_triage.scanners import build_scanner as real_build_scanner
+    from appsec_triage.scanners.base import ScanResult
+
+    order = []
+
+    class Stub:
+        def __init__(self, name):
+            self.name = name
+
+        def scan(self, target, out_dir):
+            order.append(self.name)
+            return ScanResult(scanner=self.name, ok=True)
+
+    monkeypatch.setattr(
+        "appsec_triage.scanners.build_scanner",
+        lambda name: Stub(name) if name in {"codeql", "govulncheck"} else real_build_scanner(name),
+    )
+
+    scan_all(tmp_path, ["codeql", "govulncheck"], tmp_path / "out")
+
+    assert order == ["govulncheck", "codeql"]
 
 
 # --- regression: verdict contradicting its own rationale -----------------------

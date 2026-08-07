@@ -1,4 +1,4 @@
-"""PHP reachability from the route table.
+"""PHP and Go reachability from framework route declarations.
 
 Measured before this existed: every PHP finding on a real Symfony project came
 back with zero callers. Phpactor advertises no `callHierarchy`, and `references`
@@ -177,3 +177,65 @@ def test_a_short_trace_is_left_whole():
 
     trace = [TraceStep(file_path="a.go", line=1)]
     assert _trim_trace(trace, 12) == (trace, 0)
+
+
+def test_express_route_registers_a_javascript_handler(tmp_path):
+    path = tmp_path / "backend" / "routes" / "activity.route.js"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "const router = require('express').Router();\n"
+        "router.post('/activity', async (req, res) => {\n"
+        "    return res.json(await resolve(req.body.name));\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    index = build_index([tmp_path])
+    route = index.enclosing("backend/routes/activity.route.js", 3)
+
+    assert route is not None
+    assert route.path == "/activity"
+    assert route.http_methods == "POST"
+    assert route.declared_by == "Express route"
+
+
+def test_javascript_relative_import_puts_helper_in_http_perimeter(tmp_path):
+    routes = tmp_path / "backend" / "routes"
+    helpers = tmp_path / "backend" / "lib"
+    routes.mkdir(parents=True)
+    helpers.mkdir(parents=True)
+    (routes / "activity.route.js").write_text(
+        "const helper = require('../lib/activity');\n"
+        "router.post('/activity', handler);\n", encoding="utf-8")
+    (helpers / "activity.js").write_text(
+        "function resolve() { return 1; }\n", encoding="utf-8")
+
+    index = build_index([tmp_path])
+
+    assert index.perimeter("backend/lib/activity.js") is not None
+
+
+def test_go_router_annotation_registers_the_handler_span(tmp_path):
+    path = tmp_path / "internal" / "web" / "resume.go"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "package web\n\n"
+        "// @Router /api/v1/resume/search [post]\n"
+        "func (h *Handlers) ResumeSearch(ctx fiber.Ctx) error {\n"
+        "    request := Criteria{}\n"
+        "    ctx.Bind().Body(&request)\n"
+        "    return validate.Struct(request)\n"
+        "}\n\n"
+        "func helper() {}\n",
+        encoding="utf-8",
+    )
+
+    index = build_index([tmp_path])
+    route = index.enclosing("internal/web/resume.go", 7)
+
+    assert route is not None
+    assert route.method == "ResumeSearch"
+    assert route.class_name == "Handlers"
+    assert route.path == "/api/v1/resume/search"
+    assert route.http_methods == "POST"
+    assert index.enclosing("internal/web/resume.go", 10) is None

@@ -32,6 +32,21 @@ class _FakeClient:
         return SimpleNamespace(text=json.dumps(self._answer))
 
 
+class _MustNotCallModel:
+    def complete(self, *args, **kwargs):
+        raise AssertionError("govulncheck evidence must not be re-inferred by a model")
+
+
+class _ScriptedClient:
+    def __init__(self, *answers: str) -> None:
+        self.answers = list(answers)
+        self.calls = []
+
+    def complete(self, system, user, json_schema=None):
+        self.calls.append((system, user, json_schema))
+        return SimpleNamespace(text=self.answers.pop(0))
+
+
 def _php(tmp_path, name, body):
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,6 +55,109 @@ def _php(tmp_path, name, body):
 
 
 # --- step 3: presence ------------------------------------------------------
+
+
+def test_govulncheck_no_symbol_call_is_a_deterministic_closure(tmp_path):
+    from appsec_triage.models import CodeContext, DependencyInfo, Finding
+    from appsec_triage.sca.chain import DependencyChain
+
+    finding = Finding(
+        finding_id="govulncheck:GO-2099-1:example.com/lib",
+        scanner="govulncheck",
+        rule_id="GO-2099-1",
+        code_context=CodeContext(file_path="go.mod"),
+        dependency=DependencyInfo(
+            package="example.com/lib",
+            ecosystem="go",
+            installed_version="v1.0.0",
+            fixed_versions=["v1.0.1"],
+        ),
+    )
+
+    result = DependencyChain(_MustNotCallModel(), [tmp_path]).run(finding)
+
+    assert result.closes
+    assert result.decision.verdict is CVEVerdict.NO_VULNERABLE_SYMBOL
+    assert "symbol-level" in result.decision.headline
+
+
+def test_govulncheck_call_trace_is_used_without_symbol_extraction(tmp_path):
+    from appsec_triage.models import CodeContext, DependencyInfo, Finding, TraceStep
+    from appsec_triage.sca.chain import DependencyChain
+
+    finding = Finding(
+        finding_id="govulncheck:GO-2099-2:example.com/lib",
+        scanner="govulncheck",
+        rule_id="GO-2099-2",
+        code_context=CodeContext(file_path="cmd/app/main.go", start_line=12),
+        trace=[
+            TraceStep(
+                file_path="cmd/app/main.go",
+                line=12,
+                message="example.com/app.main",
+                role="source",
+            ),
+            TraceStep(
+                file_path="example.com/lib@v1.0.0/parser.go",
+                line=40,
+                message="example.com/lib.Parse",
+                role="sink",
+            ),
+        ],
+        source="example.com/app.main",
+        sink="example.com/lib.Parse",
+        dependency=DependencyInfo(
+            package="example.com/lib",
+            ecosystem="go",
+            installed_version="v1.0.0",
+            fixed_versions=["v1.0.1"],
+        ),
+    )
+
+    result = DependencyChain(_MustNotCallModel(), [tmp_path]).run(finding)
+
+    assert result.decision.verdict is CVEVerdict.ACTUAL
+    assert result.symbol is not None
+    assert result.symbol.function == "Parse"
+    assert result.presence is not None
+    assert str(result.presence.hits[0]) == "cmd/app/main.go:12"
+
+
+def test_govulncheck_uses_targeted_codeql_path_even_without_cwe(tmp_path):
+    from appsec_triage.models import CodeContext, DependencyInfo, Finding, TraceStep
+    from appsec_triage.sca.chain import DependencyChain
+
+    finding = Finding(
+        finding_id="govulncheck:GO-2099-3:example.com/lib",
+        scanner="govulncheck",
+        rule_id="GO-2099-3",
+        code_context=CodeContext(file_path="api/handler.go", start_line=41),
+        trace=[
+            TraceStep(file_path="api/handler.go", line=41, message="app.Handle", role="source"),
+            TraceStep(file_path="lib/parser.go", line=9, message="lib.Parse", role="sink"),
+        ],
+        source="app.Handle",
+        sink="lib.Parse",
+        dependency=DependencyInfo(package="example.com/lib", ecosystem="go", installed_version="v1.0.0"),
+    )
+    codeql = Finding(
+        finding_id="targeted",
+        scanner="codeql",
+        rule_id="go/govulncheck-targeted-taint",
+        code_context=CodeContext(file_path="api/handler.go", start_line=41),
+        trace=[
+            TraceStep(file_path="api/bind.go", line=12, role="source"),
+            TraceStep(file_path="api/handler.go", line=41, role="sink"),
+        ],
+    )
+
+    result = DependencyChain(_MustNotCallModel(), [tmp_path]).run(
+        finding, codeql_findings=[codeql]
+    )
+
+    assert result.reach is not None
+    assert "api/bind.go:12 -> api/handler.go:41" in result.reach.taint_path
+    assert "CodeQL targeted dataflow" in result.render()
 
 def test_method_call_is_found(tmp_path):
     _php(tmp_path, "src/Controller.php", "<?php\n$jar->extractCookies($req, $res);\n")
@@ -398,6 +516,69 @@ def test_a_name_absent_from_the_fix_is_dropped(monkeypatch):
     assert symbol.function == ""
     assert symbol.grounded_in_fix is False
     assert "не встречается" in symbol.note
+
+
+def test_malformed_symbol_json_is_repaired_once(monkeypatch):
+    from appsec_triage.sca import resolve as resolve_mod
+
+    monkeypatch.setattr(resolve_mod, "fix_diff", lambda advisory: ("", ""))
+    client = _ScriptedClient(
+        '{"vulnerable_function":"matchesDomain" "vulnerable_class":"SetCookie"}',
+        json.dumps({
+            "vulnerable_function": "matchesDomain",
+            "vulnerable_class": "SetCookie",
+            "vulnerable_file": "src/Cookie/SetCookie.php",
+            "evidence": "matchesDomain",
+            "why": "cookie domain comparison",
+        }),
+    )
+
+    symbol = SymbolResolver(client).resolve(Advisory(
+        "GHSA-json", package="guzzlehttp/guzzle", ecosystem="composer",
+        details="SetCookie::matchesDomain compares cookie domains",
+    ), "7.4.1")
+
+    assert symbol.function == "matchesDomain"
+    assert symbol.resolution_error == ""
+    assert len(client.calls) == 2
+    assert "JSON CORRECTION REQUIRED" in client.calls[1][1]
+    assert "JSON does not support `=>`" in client.calls[1][1]
+    assert "Parser error:" in client.calls[1][1]
+
+
+def test_symbol_json_wrappers_are_removed_without_a_second_call(monkeypatch):
+    from appsec_triage.sca import resolve as resolve_mod
+
+    monkeypatch.setattr(resolve_mod, "fix_diff", lambda advisory: ("", ""))
+    client = _ScriptedClient(
+        '```json\n{"vulnerable_function":"matchesDomain","vulnerable_class":"SetCookie"}\n```'
+    )
+
+    symbol = SymbolResolver(client).resolve(Advisory(
+        "GHSA-fence", package="guzzlehttp/guzzle", ecosystem="composer",
+        details="SetCookie::matchesDomain compares cookie domains",
+    ), "7.4.1")
+
+    assert symbol.function == "matchesDomain"
+    assert len(client.calls) == 1
+
+
+def test_two_malformed_symbol_answers_remain_visible(monkeypatch):
+    from appsec_triage.sca import resolve as resolve_mod
+
+    monkeypatch.setattr(resolve_mod, "fix_diff", lambda advisory: ("", ""))
+    client = _ScriptedClient('{"broken": first}', '{"still_broken": second}')
+
+    symbol = SymbolResolver(client).resolve(
+        Advisory("GHSA-bad-json", package="p/q", ecosystem="composer", details="prose"), "1.0"
+    )
+
+    assert symbol.function == ""
+    assert "invalid JSON twice" in symbol.resolution_error
+    assert "first_response" in symbol.resolution_error
+    assert "repair_response" in symbol.resolution_error
+    assert symbol.resolution_error.startswith(symbol.note)
+    assert len(client.calls) == 2
 
 
 def test_a_name_present_in_the_fix_is_kept(monkeypatch):

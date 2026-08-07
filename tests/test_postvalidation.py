@@ -10,7 +10,7 @@ from appsec_triage.config import (
     HeuristicsConfig,
 )
 from appsec_triage.ingest import native
-from appsec_triage.models import Severity, VerdictLabel
+from appsec_triage.models import Severity, TraceStep, VerdictLabel
 from appsec_triage.pipeline import TriagePipeline
 from appsec_triage.prompts import registry
 
@@ -289,6 +289,103 @@ def test_scope_excluded_findings_are_recorded_not_dropped():
     assert run.scope_excluded == {"rule:B101 assert_used": 1}
     excluded = next(r for r in run.records if r.decided_by == "scope")
     assert "scope_excluded" in excluded.overrides[0]
+
+
+class _ReachableSymbols:
+    def enrich(self, finding):
+        from appsec_triage.lsp.service import SymbolContext
+
+        return SymbolContext(reachable_from_entrypoint=True, resolved=True)
+
+
+def _external_cfg(tmp_path):
+    deployment = tmp_path / "deployment.yaml"
+    deployment.write_text(
+        """enabled: true
+description: Kubernetes behind a verified WAF.
+compensating_controls:
+  - id: public-waf
+    kind: waf
+    direction: inbound
+    covered_cwes: [CWE-89]
+    covered_routes: ["*"]
+    evidence: WAF policy app-public blocks SQL injection
+    verified: true
+    bypass_possible: false
+""",
+        encoding="utf-8",
+    )
+    cfg = _cfg()
+    cfg.deployment_config = str(deployment)
+    return cfg
+
+
+def _traced_sqli():
+    finding = _finding("$db->query($q);", cwe="CWE-89", path="src/Controller.php")
+    finding.scanner = "codeql"
+    finding.trace = [
+        TraceStep(file_path="src/Controller.php", line=1, message="request q", role="source"),
+        TraceStep(file_path="src/Controller.php", line=1, message="$db->query($q)", role="sink"),
+    ]
+    return finding
+
+
+def _external_verdict():
+    return _verdict_json(
+        verdict="external_fp",
+        evidence_class="EXPLOITABLE_DATAFLOW",
+        cwe="CWE-89",
+        evidence=["WAF policy app-public blocks SQL injection"],
+        external_control={
+            "control_id": "public-waf",
+            "why_effective": "it covers CWE-89 before this entrypoint",
+        },
+        requires_human_review=True,
+    )
+
+
+def test_verified_control_on_an_established_sast_path_is_ai_closed(tmp_path):
+    record = TriagePipeline(
+        FakeClient(_external_verdict()),
+        _PROVIDER,
+        _external_cfg(tmp_path),
+        symbols=_ReachableSymbols(),
+    ).triage_one(_traced_sqli())
+
+    assert record.verdict.verdict is VerdictLabel.external_fp
+    assert record.verdict.requires_human_review is False
+    assert record.verdict.external_control.control_id == "public-waf"
+    assert record.sast_reachability.status == "established"
+    assert [control.control_id for control in record.external_controls] == ["public-waf"]
+
+
+def test_external_control_without_a_source_to_sink_trace_is_unknown(tmp_path):
+    finding = _traced_sqli()
+    finding.trace = []
+    record = TriagePipeline(
+        FakeClient(_external_verdict()),
+        _PROVIDER,
+        _external_cfg(tmp_path),
+        symbols=_ReachableSymbols(),
+    ).triage_one(finding)
+
+    assert record.verdict.verdict is VerdictLabel.unknown
+    assert record.verdict.requires_human_review
+    assert any("external_control_path_unverified" in item for item in record.overrides)
+
+
+def test_model_cannot_invent_an_external_control(tmp_path):
+    verdict = json.loads(_external_verdict())
+    verdict["external_control"]["control_id"] = "ordinary-nginx"
+    record = TriagePipeline(
+        FakeClient(json.dumps(verdict)),
+        _PROVIDER,
+        _external_cfg(tmp_path),
+        symbols=_ReachableSymbols(),
+    ).triage_one(_traced_sqli())
+
+    assert record.verdict.verdict is VerdictLabel.unknown
+    assert any("external_control_unverified" in item for item in record.overrides)
 
 
 # --- source resolver: widen cropped scanner snippets ---------------------------

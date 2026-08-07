@@ -55,6 +55,7 @@ _OVERRIDE = {
 
 @dataclass(slots=True)
 class Node:
+    ref: str
     name: str
     version: str = ""
     dev: bool = False
@@ -67,11 +68,16 @@ class Introduction:
     """One way a package ends up installed."""
 
     path: list[str]
+    refs: list[str] = field(default_factory=list)
 
     @property
     def direct_parent(self) -> str:
         """The package that requires the vulnerable one — the one that calls it."""
         return self.path[-2] if len(self.path) >= 2 else ""
+
+    @property
+    def direct_parent_ref(self) -> str:
+        return self.refs[-2] if len(self.refs) >= 2 else ""
 
     @property
     def root_requirement(self) -> str:
@@ -92,6 +98,7 @@ class Placement:
     introductions: list[Introduction] = field(default_factory=list)
     ecosystem: str = ""
     problem: str = ""
+    target_refs: list[str] = field(default_factory=list)
 
     @property
     def known(self) -> bool:
@@ -142,9 +149,11 @@ class DependencyGraph:
         self._roots = roots
         self._dev_roots = dev_roots
         self._parents: dict[str, set[str]] = {}
-        for node in nodes.values():
+        self._by_name: dict[str, list[str]] = {}
+        for ref, node in nodes.items():
+            self._by_name.setdefault(node.name, []).append(ref)
             for requirement in node.requires:
-                self._parents.setdefault(requirement, set()).add(node.name)
+                self._parents.setdefault(requirement, set()).add(ref)
 
     def __len__(self) -> int:
         return len(self._nodes)
@@ -210,60 +219,64 @@ class DependencyGraph:
         for ref, item in parts.items():
             name = item["name"].lower()
             by_ref[ref] = name
-            nodes[name] = Node(name, item["version"], item["dev"], {}, item["ecosystem"])
+            nodes[ref] = Node(ref, name, item["version"], item["dev"], {}, item["ecosystem"])
         for ref, depends in links.items():
-            owner = by_ref.get(ref)
-            if owner and owner in nodes:
-                nodes[owner].requires = {
-                    by_ref[d]: "" for d in depends if d in by_ref
-                }
+            if ref in nodes:
+                nodes[ref].requires = {d: "" for d in depends if d in nodes}
 
-        roots = {by_ref[d] for d in links.get(root, ()) if d in by_ref}
-        if not roots and root in by_ref:
-            roots = set(nodes[by_ref[root]].requires)
-        dev_roots = {name for name in roots if nodes.get(name) and nodes[name].dev}
+        roots = {d for d in links.get(root, ()) if d in nodes}
+        if not roots and root in nodes:
+            roots = set(nodes[root].requires)
+        dev_roots = {ref for ref in roots if nodes[ref].dev}
         return cls(nodes, roots - dev_roots, dev_roots)
 
-    def version_of(self, package: str) -> str:
-        node = self._nodes.get(package.lower())
-        return node.version if node else ""
+    def node(self, ref: str) -> Node | None:
+        return self._nodes.get(ref)
 
-    def placement(self, package: str, max_paths: int = 4) -> Placement:
+    def nodes_for(self, package: str, version: str = "") -> list[Node]:
+        nodes = [self._nodes[ref] for ref in self._by_name.get(package.lower(), ())]
+        return [node for node in nodes if not version or node.version == version]
+
+    def version_of(self, package: str) -> str:
+        nodes = self.nodes_for(package)
+        versions = {node.version for node in nodes}
+        return next(iter(versions)) if len(versions) == 1 else ""
+
+    def placement(self, package: str, version: str = "") -> Placement:
         """How `package` got here, from every direct requirement that leads to it."""
         key = package.lower()
         if not self._nodes:
             return Placement(package, problem=self.problem or "граф зависимостей не построен")
-        if key not in self._nodes:
+        targets = self.nodes_for(key, version)
+        if not targets:
             return Placement(package, problem=f"{package} нет в SBOM от cdxgen")
 
         placement = Placement(
             package,
-            direct=key in self._roots or key in self._dev_roots,
-            dev_only=self._nodes[key].dev,
-            ecosystem=self._nodes[key].ecosystem,
+            direct=any(node.ref in self._roots or node.ref in self._dev_roots for node in targets),
+            dev_only=all(node.dev for node in targets),
+            ecosystem=targets[0].ecosystem,
+            target_refs=[node.ref for node in targets],
         )
         if not (self._roots or self._dev_roots):
             placement.problem = ("в SBOM нет рёбер от корневого компонента — "
                                  "прямые зависимости не определить")
 
         starts = self._roots | self._dev_roots
-        seen = {key}
-        frontier: list[list[str]] = [[key]]
-        for _ in range(12):
-            if len(placement.introductions) >= max_paths or not frontier:
-                break
-            nxt: list[list[str]] = []
-            for trail in frontier:
-                for parent in sorted(self._parents.get(trail[0], ())):
-                    if parent in seen:
-                        continue
-                    path = [parent, *trail]
-                    if parent in starts:
-                        placement.introductions.append(Introduction(path))
-                        if len(placement.introductions) >= max_paths:
-                            break
-                    else:
-                        nxt.append(path)
-                    seen.add(parent)
-            frontier = nxt
+
+        def walk(ref: str, reverse_path: list[str]) -> None:
+            for parent in sorted(self._parents.get(ref, ())):
+                if parent in reverse_path:
+                    continue
+                path = [*reverse_path, parent]
+                if parent in starts:
+                    refs = list(reversed(path))
+                    placement.introductions.append(Introduction(
+                        [self._nodes[item].name for item in refs], refs))
+                else:
+                    walk(parent, path)
+
+        for target in targets:
+            if target.ref not in starts:
+                walk(target.ref, [target.ref])
         return placement

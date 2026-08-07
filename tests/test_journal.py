@@ -7,7 +7,7 @@ reproducible for free — 183 finished verdicts and twenty minutes went with it.
 
 from __future__ import annotations
 
-from appsec_triage.models import CodeContext, Finding, TriageRecord, Verdict, VerdictLabel, EvidenceClass
+from appsec_triage.models import EvidenceClass, SCASummary, TriageRecord, Verdict, VerdictLabel
 from appsec_triage.report import audit
 
 
@@ -72,3 +72,45 @@ def test_journalled_records_survive_a_round_trip(tmp_path):
     assert back.finding_id == original.finding_id
     assert back.verdict.verdict is VerdictLabel.confirmed
     assert back.verdict.reason == "r"
+
+
+def test_external_fp_survives_jsonl_and_summary_as_ai_closed(tmp_path):
+    import json
+
+    from appsec_triage.pipeline import TriageRun
+
+    record = _record("external")
+    record.verdict = Verdict(
+        verdict=VerdictLabel.external_fp,
+        evidence_class=EvidenceClass.exploitable_dataflow,
+        confidence=0.85,
+        reason="mitigated by an external control",
+    )
+    run = TriageRun(records=[record], provider="fake", model="fake", prompt_pack="default")
+
+    jsonl = audit.write_jsonl(run, tmp_path / "verdicts.jsonl")
+    back = audit.read_jsonl(jsonl)[0]
+    assert back.verdict.verdict is VerdictLabel.external_fp
+    assert back.verdict.requires_human_review is False
+
+    summary_path = audit.write_summary(run, tmp_path / "summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["external_mitigated"] == 1
+    assert summary["auto_closed"] == 1
+    assert summary["requires_human_review"] == 0
+
+
+def test_summary_counts_sca_symbol_resolution_errors_separately(tmp_path):
+    import json
+
+    from appsec_triage.pipeline import TriageRun
+
+    record = _record("sca-error")
+    record.sca = SCASummary(resolution_error="model returned invalid JSON twice")
+    run = TriageRun(records=[record], provider="fake", model="fake", prompt_pack="default")
+
+    summary_path = audit.write_summary(run, tmp_path / "summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert summary["errors"] == 0
+    assert summary["sca_resolution_errors"] == 1

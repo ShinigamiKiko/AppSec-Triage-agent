@@ -121,6 +121,7 @@ class PostValidationConfig:
     confirmed_confidence_floor: float = 0.75
     escalate_severities: list[str] = field(default_factory=lambda: ["critical", "high"])
     closure_requires_named_defence_above: int = 0
+    require_sast_reachability: bool = True
 
 
 @dataclass(slots=True)

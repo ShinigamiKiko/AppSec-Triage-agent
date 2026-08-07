@@ -80,6 +80,9 @@ def build(record: TriageRecord) -> ReviewBrief:
     brief = ReviewBrief()
     verdict = record.verdict
 
+    if verdict.verdict is VerdictLabel.external_fp:
+        return brief
+
     if verdict.dataflow:
         grounded = [s for s in verdict.dataflow if s.grounded]
         if grounded:
@@ -100,7 +103,7 @@ def build(record: TriageRecord) -> ReviewBrief:
 
     heavy = consequence_weight(record.cwe) >= 22
 
-    if record.kind == "dependency" and record.verdict.verdict is not VerdictLabel.false_positive:
+    if record.kind == "dependency" and not record.verdict.verdict.is_closed:
         brief.questions.append(
             Question(
                 text=(
@@ -134,7 +137,7 @@ def build(record: TriageRecord) -> ReviewBrief:
         )
         break
 
-    if _is_secret_family(record.cwe) and record.verdict.verdict is not VerdictLabel.false_positive:
+    if _is_secret_family(record.cwe) and not record.verdict.verdict.is_closed:
         brief.questions.append(
             Question(
                 text=(
@@ -158,7 +161,7 @@ def build(record: TriageRecord) -> ReviewBrief:
     if (
         not verdict.dataflow
         and record.kind == "weakness"
-        and record.verdict.verdict is not VerdictLabel.false_positive
+        and not record.verdict.verdict.is_closed
     ):
         target = verdict.vulnerable_symbol.name if verdict.vulnerable_symbol else "the flagged value"
         brief.questions.append(

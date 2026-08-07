@@ -1,10 +1,7 @@
 """Dependency findings without a scanner: cdxgen names the packages, OSV the flaws.
 
-Until now the finding list came from Trivy. That works on a workstation and not
-in a sealed image: drop the scanner and the SCA half has nothing to triage, even
-though everything it needs — the SBOM and the advisory databases — is already
-wired in. A container that can build the graph but cannot start the pipeline is
-a container that does not work.
+The finding list comes directly from the SBOM and advisory databases. SCA has one
+authoritative path: cdxgen builds the graph and OSV supplies affected advisories.
 
 The same rule as everywhere else holds here: a database that fails to answer is
 recorded as a failure, never as "this package is clean".
@@ -28,11 +25,12 @@ class Discovery:
     def __init__(self) -> None:
         self.findings: list[Finding] = []
         self.packages_checked = 0
+        self.packages_succeeded = 0
         self.problems: list[str] = []
 
     @property
     def usable(self) -> bool:
-        return bool(self.findings) or self.packages_checked > 0
+        return self.packages_succeeded > 0
 
 
 def discover(root: Path | str, *, sbom_path: Path | None = None,
@@ -71,12 +69,14 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
             # is the whole point of raising here rather than returning [].
             out.problems.append(f"{name}@{version}: {exc}")
             continue
+        out.packages_succeeded += 1
 
         for entry in found:
             out.findings.append(Finding(
                 finding_id=f"{entry.advisory_id}-{name}",
                 scanner="cdxgen+osv",
                 rule_id=entry.advisory_id,
+                cwe=entry.cwe or None,
                 title=(entry.summary or entry.advisory_id)[:200],
                 severity=Severity.medium,
                 code_context=CodeContext(file_path=_manifest_for(item["ecosystem"])),
@@ -84,6 +84,8 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
                     package=name,
                     ecosystem=item["ecosystem"],
                     installed_version=version,
+                    fixed_versions=entry.fixed_versions,
+                    advisory_aliases=entry.aliases,
                     advisory_url=f"https://osv.dev/vulnerability/{entry.advisory_id}",
                     dev_only=item["dev"] or None,
                 ),

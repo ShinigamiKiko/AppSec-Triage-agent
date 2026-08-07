@@ -14,7 +14,6 @@ is the parent not calling it either.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from appsec_triage.sca.bridge import find_bridge
@@ -69,6 +68,45 @@ def test_every_path_that_introduces_a_package_is_kept():
          {"ref": "b", "dependsOn": ["s"]}],
     )
     assert sorted(graph.placement("shared/lib").parents) == ["a/one", "b/two"]
+
+
+def test_more_than_four_cdxgen_paths_are_not_truncated():
+    parents = [
+        {"bom-ref": f"p{i}", "purl": f"pkg:composer/acme/parent-{i}@1.0.0"}
+        for i in range(6)
+    ]
+    graph = _graph(
+        [*parents, {"bom-ref": "s", "purl": "pkg:composer/shared/lib@1.0.0"}],
+        [{"ref": "root", "dependsOn": [f"p{i}" for i in range(6)]},
+         *[{"ref": f"p{i}", "dependsOn": ["s"]} for i in range(6)]],
+    )
+
+    placement = graph.placement("shared/lib", "1.0.0")
+
+    assert len(placement.introductions) == 6
+    assert {path.path[0] for path in placement.introductions} == {
+        f"acme/parent-{i}" for i in range(6)
+    }
+
+
+def test_same_package_versions_remain_distinct_cdxgen_nodes():
+    graph = _graph(
+        [{"bom-ref": "a", "purl": "pkg:composer/acme/a@1.0.0"},
+         {"bom-ref": "b", "purl": "pkg:composer/acme/b@1.0.0"},
+         {"bom-ref": "old", "purl": "pkg:composer/shared/lib@1.0.0"},
+         {"bom-ref": "new", "purl": "pkg:composer/shared/lib@2.0.0"}],
+        [{"ref": "root", "dependsOn": ["a", "b"]},
+         {"ref": "a", "dependsOn": ["old"]},
+         {"ref": "b", "dependsOn": ["new"]}],
+    )
+
+    old = graph.placement("shared/lib", "1.0.0")
+    new = graph.placement("shared/lib", "2.0.0")
+
+    assert old.target_refs == ["old"]
+    assert old.parents == ["acme/a"]
+    assert new.target_refs == ["new"]
+    assert new.parents == ["acme/b"]
 
 
 def test_an_sbom_without_root_edges_cannot_call_anything_direct():
@@ -312,3 +350,129 @@ def test_a_direct_dependency_is_searched_for_by_its_own_symbol(tmp_path, monkeyp
 class _Dep:
     def __init__(self, ecosystem: str) -> None:
         self.ecosystem = ecosystem
+
+
+def test_recursive_bridge_follows_every_cdxgen_parent(tmp_path, monkeypatch):
+    from appsec_triage.sca.resolve import VulnerableSymbol
+    from appsec_triage.sca.source_cache import SourceSnapshot
+
+    graph = _graph(
+        [{"bom-ref": "a", "purl": "pkg:composer/acme/a@1.0.0"},
+         {"bom-ref": "b", "purl": "pkg:composer/acme/b@2.0.0"},
+         {"bom-ref": "c", "purl": "pkg:composer/acme/c@3.0.0"}],
+        [{"ref": "root", "dependsOn": ["a"]},
+         {"ref": "a", "dependsOn": ["b"]},
+         {"ref": "b", "dependsOn": ["c"]}],
+    )
+    chain = _chain(tmp_path, monkeypatch, {}, graph)
+    sources = {
+        "acme/b": {"src/B.php": (
+            "<?php\nclass B\n{\n    public function bridgeB()\n"
+            "    {\n        return vulnerable();\n    }\n}\n")},
+        "acme/a": {"src/A.php": (
+            "<?php\nclass A\n{\n    public function bridgeA()\n"
+            "    {\n        return bridgeB();\n    }\n}\n")},
+    }
+
+    def snapshot(ecosystem, package, version=""):
+        return SourceSnapshot(
+            ecosystem, package, version, sources.get(package, {}),
+            source_url=f"https://example.test/{package}/{version}.zip",
+            cache_status="cache_hit",
+            problem="missing" if package not in sources else "",
+        )
+
+    monkeypatch.setattr(chain._resolver, "source_snapshot", snapshot)
+    symbol = VulnerableSymbol("CVE-x", "acme/c", function="vulnerable")
+
+    paths, _snapshots = chain._recursive_bridges(symbol, graph.placement("acme/c", "3.0.0"))
+
+    assert len(paths) == 1
+    assert paths[0].status == "open"
+    assert paths[0].targets == [("bridgeA", "A")]
+    assert [hop.package for hop in paths[0].hops] == ["acme/b", "acme/a"]
+
+
+def test_recursive_bridge_closes_when_parent_does_not_call_symbol(tmp_path, monkeypatch):
+    from appsec_triage.sca.resolve import VulnerableSymbol
+    from appsec_triage.sca.source_cache import SourceSnapshot
+
+    graph = _graph(*_TRANSITIVE)
+    chain = _chain(tmp_path, monkeypatch, {}, graph)
+    monkeypatch.setattr(
+        chain._resolver,
+        "source_snapshot",
+        lambda ecosystem, package, version="": SourceSnapshot(
+            ecosystem, package, version,
+            {"src/Mailer.php": "<?php class Mailer { public function send() {} }"},
+            source_url="https://example.test/mailer.zip", cache_status="downloaded"),
+    )
+
+    paths, _ = chain._recursive_bridges(
+        VulnerableSymbol("CVE-x", "egulias/email-validator", function="isValid"),
+        graph.placement("egulias/email-validator", "2.1.25"),
+    )
+
+    assert paths[0].status == "closed"
+    assert "нигде не вызывает" in paths[0].detail
+
+
+def test_unavailable_parent_source_keeps_recursive_bridge_unknown(tmp_path, monkeypatch):
+    from appsec_triage.sca.resolve import VulnerableSymbol
+    from appsec_triage.sca.source_cache import SourceSnapshot
+
+    graph = _graph(*_TRANSITIVE)
+    chain = _chain(tmp_path, monkeypatch, {}, graph)
+    monkeypatch.setattr(
+        chain._resolver,
+        "source_snapshot",
+        lambda ecosystem, package, version="": SourceSnapshot(
+            ecosystem, package, version, problem="HTTP 404", cache_status="unavailable"),
+    )
+
+    paths, _ = chain._recursive_bridges(
+        VulnerableSymbol("CVE-x", "egulias/email-validator", function="isValid"),
+        graph.placement("egulias/email-validator", "2.1.25"),
+    )
+
+    assert paths[0].status == "unknown"
+    assert paths[0].hops[0].status == "unknown"
+
+
+def test_run_closes_only_after_every_cdxgen_path_is_broken(tmp_path, monkeypatch):
+    from appsec_triage.models import CodeContext, DependencyInfo, Finding
+    from appsec_triage.sca.advisories import Advisory
+    from appsec_triage.sca.resolve import VulnerableSymbol
+    from appsec_triage.sca.source_cache import SourceSnapshot
+    from appsec_triage.sca.verdict import CVEVerdict
+
+    graph = _graph(*_TRANSITIVE)
+    chain = _chain(tmp_path, monkeypatch, {}, graph)
+    finding = Finding(
+        finding_id="cve-x", scanner="cdxgen+osv", rule_id="CVE-2099-1",
+        code_context=CodeContext(file_path="composer.lock"),
+        dependency=DependencyInfo(
+            package="egulias/email-validator", ecosystem="composer",
+            installed_version="2.1.25"),
+    )
+    symbol = VulnerableSymbol("CVE-2099-1", "egulias/email-validator", function="isValid")
+    monkeypatch.setattr(
+        chain, "_advisory_and_symbol",
+        lambda finding: (Advisory("CVE-2099-1", package="egulias/email-validator"), symbol, []),
+    )
+
+    def snapshot(ecosystem, package, version=""):
+        files = ({"src/Mailer.php": "<?php\nclass Mailer { public function send() {} }"}
+                 if package == "symfony/mailer" else
+                 {"src/Validator.php": "<?php function isValid() {}"})
+        return SourceSnapshot(
+            ecosystem, package, version, files,
+            source_url=f"https://example.test/{package}.zip", cache_status="cache_hit")
+
+    monkeypatch.setattr(chain._resolver, "source_snapshot", snapshot)
+
+    result = chain.run(finding)
+
+    assert result.closes is True
+    assert result.decision.verdict is CVEVerdict.NO_DEPENDENCY_PATH
+    assert result.bridge_paths[0].status == "closed"

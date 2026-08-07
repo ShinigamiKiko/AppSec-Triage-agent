@@ -7,11 +7,10 @@ makes the anti-hallucination quote check in post-validation meaningful.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..config import PipelineConfig
-from ..models import EvidencePackage, Finding, HeuristicSignal
+from ..models import EvidencePackage, Finding, HeuristicSignal, RiskContext, SASTReachability
 from ..redact import redact_secrets
 from .heuristics import HeuristicResult
 from .source import SourceResolver
@@ -62,6 +61,8 @@ def build(
     deps_index: "DependencyIndex | None" = None,
     deps_roots: list | None = None,
     routes: "RouteIndex | None" = None,
+    deployment=None,
+    risk_context=None,
 ) -> EvidencePackage:
     snippet = (finding.code_context.snippet or "").strip()
     truncated = finding.code_context.truncated
@@ -114,6 +115,8 @@ def build(
 
     symbol_lines: list[str] = []
     reachability: str | None = None
+    production_entrypoint = False
+    route_path: str | None = None
     signals = list(heur.signals)
     if symbols is not None:
         symbol_lines = [f"definition of {d.symbol or 'value'}: {d}" for d in symbols.definitions]
@@ -133,6 +136,7 @@ def build(
             )
 
         if symbols.reachable_from_entrypoint:
+            production_entrypoint = True
             reachability = "reachable from an HTTP entry point"
             signals.append(
                 HeuristicSignal(
@@ -157,6 +161,12 @@ def build(
             reachability = "callers found, none of them an entry point one hop away"
 
     if routes is not None and routes.usable:
+        enclosing_route = routes.enclosing(
+            finding.code_context.file_path, finding.code_context.start_line or 0
+        )
+        if enclosing_route is not None:
+            production_entrypoint = True
+            route_path = enclosing_route.path
         reachability, route_signal = _route_reachability(routes, finding, reachability)
         if route_signal is not None:
             signals.append(route_signal)
@@ -164,6 +174,27 @@ def build(
     dependency = finding.dependency
     if dependency is not None:
         dependency = _enrich_dependency(dependency, deps_index, deps_roots, signals)
+
+    trace_roles = {step.role for step in finding.trace}
+    source_to_sink = {"source", "sink"}.issubset(trace_roles)
+    if source_to_sink and production_entrypoint:
+        reachability_status = "established"
+        reachability_detail = "scanner trace establishes source-to-sink and LSP/routes establish a production entrypoint"
+    elif source_to_sink or production_entrypoint:
+        reachability_status = "partial"
+        reachability_detail = "only one half of source-to-sink and production-entrypoint reachability is established"
+    else:
+        reachability_status = "unknown"
+        reachability_detail = "neither a complete scanner trace nor a production entrypoint was established"
+    sast_reachability = SASTReachability(
+        status=reachability_status,
+        trace_scanner=finding.scanner if finding.trace else None,
+        source_to_sink=source_to_sink,
+        production_entrypoint=production_entrypoint,
+        route=route_path,
+        detail=reachability_detail,
+    )
+    external_controls = deployment.matching_controls(finding, route_path) if deployment else []
 
     return EvidencePackage(
         finding_id=finding.finding_id,
@@ -188,6 +219,8 @@ def build(
         dependency=dependency,
         symbol_context=symbol_lines,
         reachability=reachability,
+        sast_reachability=sast_reachability,
+        external_controls=external_controls,
         lsp_required_missing=lsp_required_missing,
         lsp_resolved_clean=bool(
             symbols is not None
@@ -195,6 +228,7 @@ def build(
             and not symbols.taint_sources
         ),
         history=(history.lookup(finding, heur) if history else []),
+        risk_context=risk_context or RiskContext(),
     )
 
 
@@ -333,7 +367,45 @@ def render_for_prompt(pkg: EvidencePackage) -> str:
             "dataflow finding on such an assumption.",
         ]
     if pkg.reachability:
-        lines += ["", f"=== REACHABILITY ===", pkg.reachability]
+        lines += ["", "=== REACHABILITY ===", pkg.reachability]
+    if pkg.sast_reachability:
+        reach = pkg.sast_reachability
+        lines += [
+            "",
+            "=== SAST REACHABILITY GATE ===",
+            f"status: {reach.status}",
+            f"source-to-sink trace: {'yes' if reach.source_to_sink else 'no'}"
+            + (f" ({reach.trace_scanner})" if reach.trace_scanner else ""),
+            f"production entrypoint: {'yes' if reach.production_entrypoint else 'no'}",
+            f"route: {reach.route or 'not established'}",
+            reach.detail,
+        ]
+    if pkg.external_controls:
+        lines += ["", "=== VERIFIED EXTERNAL COMPENSATING CONTROLS ==="]
+        for control in pkg.external_controls:
+            lines += [
+                f"- control_id: {control.control_id}",
+                f"  kind: {control.kind}; direction: {control.direction}",
+                f"  coverage: {control.coverage}",
+                f"  evidence: {control.evidence}",
+                f"  bypass precluded: {'yes' if control.bypass_precluded else 'no'}",
+            ]
+    risk = pkg.risk_context
+    lines += [
+        "",
+        "=== RUNTIME RISK CONTEXT (priority/exposure only; never closes a vulnerability) ===",
+        f"internet exposed: {_tri_state_text(risk.internet_exposed)}",
+        f"authentication required: {_tri_state_text(risk.auth_required)}",
+        f"business critical: {_tri_state_text(risk.business_critical)}",
+        "platform baseline: kubernetes; restricted egress; shared nginx ingress/external load balancer; "
+        "backend is not directly exposed",
+        "Internet exposure means reachability through the shared load balancer, not direct pod exposure. "
+        "Authentication means a caller must authenticate before reaching the service.",
+        "The shared load balancer routes traffic and is not a WAF or sanitizer. Use these facts only "
+        "for exploitability, impact, and priority.",
+    ]
+    if risk.warnings:
+        lines += [f"risk context warning: {warning}" for warning in risk.warnings]
     if pkg.dependency:
         dep = pkg.dependency
         lines += [
@@ -355,3 +427,9 @@ def render_for_prompt(pkg: EvidencePackage) -> str:
     if pkg.history:
         lines += ["", "=== PRIOR HUMAN DECISIONS ON SIMILAR FINDINGS ===", *(f"- {h}" for h in pkg.history)]
     return "\n".join(lines)
+
+
+def _tri_state_text(value: bool | None) -> str:
+    if value is None:
+        return "unknown"
+    return "true" if value else "false"

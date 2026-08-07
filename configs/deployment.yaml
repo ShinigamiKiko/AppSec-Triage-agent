@@ -1,6 +1,7 @@
 # Где это приложение работает. Влияет на приоритет и на несколько проверок,
-# которые платформа берёт на себя, — но НИКОГДА не даёт права закрыть находку
-# про поток данных. Инъекция остаётся инъекцией и за ингрессом.
+# которые платформа берёт на себя. Сам факт ingress/куба НИКОГДА не закрывает
+# поток данных. Отдельный verified compensating control ниже может дать
+# `external_fp`, только если он покрывает конкретный CWE/route и не обходится.
 #
 # Заполняется по факту, а не по намерению: неверное «мы не смотрим в интернет»
 # тише и дороже, чем лишняя позиция в очереди. Пустой файл — нормальное
@@ -38,3 +39,25 @@ platform_handles:
   - rule: "DS-0026"          # No HEALTHCHECK defined
     requires: liveness_probes_by_platform
     why: "живость контейнера проверяет kubelet через livenessProbe, HEALTHCHECK в образе не используется"
+
+# Внешние security controls. Не добавляйте сюда обычный LB/Ingress: маршрутизация
+# не является защитой. `verified: true` означает, что policy проверена по
+# манифесту/конфигу, `bypass_possible: false` — что pod/service нельзя вызвать
+# в обход контроля. Пустое или неполное покрытие не может дать external_fp.
+compensating_controls: []
+  # - id: public-waf
+  #   kind: waf
+  #   direction: inbound
+  #   covered_cwes: [CWE-79, CWE-89]
+  #   covered_routes: ["/api/*"]  # ["*"] only for a verified global policy
+  #   evidence: "WAF policy app-public blocks managed SQLi/XSS rules on /api/*"
+  #   verified: true
+  #   bypass_possible: false
+  # - id: ldap-egress-policy
+  #   kind: network_policy
+  #   direction: outbound
+  #   covered_cwes: [CWE-918]
+  #   covered_paths: ["src/ldap/**"]
+  #   evidence: "NetworkPolicy permits LDAP egress only through the validating proxy"
+  #   verified: true
+  #   bypass_possible: false

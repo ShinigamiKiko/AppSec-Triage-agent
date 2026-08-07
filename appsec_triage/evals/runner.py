@@ -25,6 +25,7 @@ from ..ingest import native
 from ..llm.factory import build_client
 from ..lsp.service import LSPService
 from ..pipeline import TriagePipeline
+from ..models import VerdictLabel
 from ..report import audit
 from .materialize import materialize
 from .metrics import compare, score
@@ -42,7 +43,11 @@ def load_labels(corpus: Path) -> dict[str, str]:
         obj = json.loads(line)
         fid = str(obj.get("finding_id") or obj.get("id") or f"{corpus.stem}:{i}")
         if label := obj.get("label"):
-            labels[fid] = str(label).strip().lower()
+            value = str(label).strip().lower()
+            try:
+                labels[fid] = VerdictLabel(value).value
+            except ValueError as exc:
+                raise ValueError(f"{corpus}:{i + 1}: invalid label {value!r}") from exc
     return labels
 
 

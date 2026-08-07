@@ -13,7 +13,9 @@ whole chain to establish.
 from __future__ import annotations
 
 from appsec_triage.models import (
+    DataflowStep,
     EvidenceClass,
+    ExternalControlReference,
     SCASummary,
     TriageRecord,
     Verdict,
@@ -70,6 +72,18 @@ def test_an_external_condition_gets_its_own_column_with_what_to_check():
     assert "php.ini" in page
 
 
+def test_sca_symbol_resolution_error_is_visible_in_the_finding_card():
+    record = _record(sca=SCASummary(
+        package="guzzlehttp/guzzle",
+        resolution_error="invalid JSON twice near CookieJar::extractCookies",
+    ))
+
+    page = render(_run(record))
+
+    assert "SCA symbol resolution error" in page
+    assert "invalid JSON twice near CookieJar::extractCookies" in page
+
+
 def test_an_infrastructure_finding_names_the_owner():
     record = _record(sca=SCASummary(
         package="symfony/ldap", outcome="infrastructure",
@@ -98,6 +112,29 @@ def test_the_answer_column_is_yes_no_or_not_established():
     assert ">не установлено<" in page
 
 
+def test_external_fp_is_shown_as_ai_closed_with_its_control():
+    external = _record(
+        verdict=Verdict(
+            verdict=VerdictLabel.external_fp,
+            evidence_class=EvidenceClass.exploitable_dataflow,
+            confidence=0.85,
+            cwe="CWE-89",
+            reason="the path exists but the WAF covers it",
+            external_control=ExternalControlReference(
+                control_id="public-waf",
+                why_effective="verified policy covers this route",
+            ),
+            requires_human_review=False,
+        )
+    )
+    page = render(_run(external))
+
+    assert "митигировано извне" in page
+    assert "External mitigated" in page
+    assert "public-waf" in page
+    assert "Что нужно от тебя" not in page
+
+
 def test_confirmed_findings_come_first():
     """The table is a queue: what needs a person is at the top."""
     page = render(_run(
@@ -118,3 +155,40 @@ def test_a_first_party_finding_still_fills_the_row():
 
     assert "CWE-89" in page
     assert "src/Repository/User.php:88" in page
+
+
+def test_a_first_party_dataflow_uses_the_schema_location():
+    record = _record(
+        kind="weakness",
+        sca=None,
+        verdict=Verdict(
+            verdict=VerdictLabel.confirmed,
+            evidence_class=EvidenceClass.exploitable_dataflow,
+            confidence=0.9,
+            cwe="CWE-89",
+            reason="request data reaches the query",
+            dataflow=[
+                DataflowStep(
+                    order=1,
+                    role="sink",
+                    location="src/Repository/User.php:88",
+                    code="$connection->executeQuery($sql);",
+                )
+            ],
+        ),
+    )
+
+    page = render(_run(record))
+
+    assert "src/Repository/User.php:88 sink" in page
+
+
+def test_report_has_a_separate_four_state_priority_column():
+    from appsec_triage.models import Priority
+
+    record = _record(priority=Priority.critical, priority_score=91)
+    page = render(_run(record))
+
+    assert "<th>Priority</th>" in page
+    assert "priority-critical" in page
+    assert ">Critical<" in page

@@ -21,7 +21,7 @@ from appsec_triage.prompts import registry
 def _finding(dep: DependencyInfo) -> Finding:
     return Finding(
         finding_id="f1",
-        scanner="trivy",
+        scanner="cdxgen+osv",
         rule_id="CVE-2024-0001",
         code_context=CodeContext(file_path="composer.lock"),
         dependency=dep,

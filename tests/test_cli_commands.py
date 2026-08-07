@@ -12,6 +12,7 @@ is the wiring, and the wiring is what the parser holds.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -97,3 +98,78 @@ def test_a_missing_input_file_exits_two_not_one(tmp_path):
     """Exit 1 is the CI gate tripping; 2 is the tool failing to start. A caller
     that cannot tell them apart will block merges on a broken container."""
     assert run(["triage", str(tmp_path / "nope.json")]) == 2
+
+
+def test_run_adds_cdxgen_osv_findings_and_coverage(tmp_path, monkeypatch):
+    from appsec_triage.models import CodeContext, DependencyInfo, Finding
+    from appsec_triage.sca import discover as discover_mod
+
+    target = tmp_path / "target"
+    target.mkdir()
+    out = tmp_path / "out"
+
+    def fake_scan(args):
+        scan_dir = args.out
+        scan_dir.mkdir(parents=True)
+        (scan_dir / "scan-manifest.json").write_text(
+            json.dumps({"target": str(target), "scans": [{"scanner": "semgrep", "ok": True, "findings": 0}]}),
+            encoding="utf-8",
+        )
+        return 0
+
+    finding = Finding(
+        finding_id="GHSA-x-demo/pkg",
+        scanner="cdxgen+osv",
+        rule_id="GHSA-x",
+        code_context=CodeContext(file_path="composer.json"),
+        dependency=DependencyInfo(package="demo/pkg", ecosystem="composer", installed_version="1.0.0"),
+    )
+    discovery = SimpleNamespace(
+        findings=[finding], packages_checked=1, packages_succeeded=1, problems=[], usable=True
+    )
+    monkeypatch.setattr(cli, "cmd_scan", fake_scan)
+    monkeypatch.setattr(discover_mod, "discover", lambda _: discovery)
+    monkeypatch.setattr(cli, "_run_triage", lambda *args, **kwargs: 0)
+
+    args = SimpleNamespace(target=str(target), out=str(out), scanner=None)
+    assert cli.cmd_run(args) == 0
+
+    dependencies = json.loads((out / "scans" / "dependencies.json").read_text(encoding="utf-8"))
+    assert dependencies[0]["scanner"] == "cdxgen+osv"
+    manifest = json.loads((out / "scans" / "scan-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["scans"][-1]["scanner"] == "cdxgen+osv"
+    assert manifest["scans"][-1]["ok"] is True
+
+
+def test_full_go_run_cannot_omit_govulncheck(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "main.go").write_text("package main", encoding="utf-8")
+    monkeypatch.setattr(cli, "scanners_for_target", lambda _: ["codeql", "govulncheck"])
+    monkeypatch.setattr(cli, "cmd_scan", lambda _: pytest.fail("scan must not start with incomplete Go tooling"))
+
+    args = SimpleNamespace(target=str(target), out=str(tmp_path / "out"), scanner=["codeql"])
+
+    assert cli.cmd_run(args) == 2
+    assert "govulncheck" in capsys.readouterr().err
+
+
+def test_full_go_run_cannot_disable_gopls(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "main.go").write_text("package main", encoding="utf-8")
+    monkeypatch.setattr(cli, "scanners_for_target", lambda _: ["codeql", "govulncheck"])
+    monkeypatch.setattr(cli, "cmd_scan", lambda _: pytest.fail("scan must not start without gopls"))
+
+    args = SimpleNamespace(
+        target=str(target),
+        out=str(tmp_path / "out"),
+        scanner=None,
+        no_lsp=True,
+        lsp_config=None,
+    )
+
+    assert cli.cmd_run(args) == 2
+    assert "requires gopls" in capsys.readouterr().err

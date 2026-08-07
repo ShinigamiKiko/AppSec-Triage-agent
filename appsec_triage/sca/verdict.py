@@ -33,6 +33,8 @@ class CVEVerdict(str, Enum):
     MENTIONED_ONLY = "mentioned"
     NOT_APPLICABLE = "not_applicable"
     NO_DIRECT_CALL = "no_direct_call"
+    NO_VULNERABLE_SYMBOL = "no_vulnerable_symbol"
+    NO_DEPENDENCY_PATH = "no_dependency_path"
     UNDECIDED = "undecided"
 
 
@@ -54,7 +56,9 @@ class CVEDecision:
         """
         return self.verdict in (CVEVerdict.NOT_APPLICABLE, CVEVerdict.NOT_SHIPPED,
                                 CVEVerdict.UNUSED, CVEVerdict.CONDITION_ABSENT,
-                                CVEVerdict.INFRASTRUCTURE)
+                                 CVEVerdict.INFRASTRUCTURE,
+                                 CVEVerdict.NO_VULNERABLE_SYMBOL,
+                                 CVEVerdict.NO_DEPENDENCY_PATH)
 
     @property
     def reassigned(self) -> bool:
