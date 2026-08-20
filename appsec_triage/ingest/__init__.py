@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 from ..models import Finding
-from . import bandit, govulncheck, native, sarif
+from . import bandit, native, sarif
 
 log = logging.getLogger(__name__)
 
@@ -20,12 +20,9 @@ class IngestError(RuntimeError):
 def detect_format(path: Path) -> str:
     if path.suffix.lower() in (".jsonl", ".ndjson"):
         return "native"
-    text = path.read_text(encoding="utf-8")
     try:
-        head = json.loads(text)
+        head = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        if govulncheck.looks_like_govulncheck(text):
-            return "govulncheck"
         raise IngestError(f"{path}: not valid JSON ({exc})") from exc
     if isinstance(head, dict) and isinstance(head.get("runs"), list):
         return "sarif"
@@ -34,12 +31,7 @@ def detect_format(path: Path) -> str:
     return "native"
 
 
-_PARSERS = {
-    "sarif": sarif.parse,
-    "bandit": bandit.parse,
-    "govulncheck": govulncheck.parse,
-    "native": native.parse,
-}
+_PARSERS = {"sarif": sarif.parse, "bandit": bandit.parse, "native": native.parse}
 
 
 def load(path: Path) -> list[Finding]:
@@ -88,14 +80,7 @@ def _richness(f: Finding) -> tuple:
     is the one with `codeFlows`, because the trace is the thing the model cannot
     reconstruct on its own and the whole verdict on a dataflow class hangs on it.
     """
-    return (
-        len(f.trace),
-        bool(f.source),
-        bool(f.sink),
-        len(f.sanitizers),
-        f.scanner.lower() == "govulncheck",
-        len(f.code_context.snippet or ""),
-    )
+    return (len(f.trace), bool(f.source), bool(f.sink), len(f.sanitizers), len(f.code_context.snippet or ""))
 
 
 def _is_secret_family(cwe: str | None) -> bool:
@@ -116,69 +101,19 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
             exact[key] = f
 
     groups: dict[tuple, list[Finding]] = {}
-    dependency_components: dict[tuple[str, str | None], list[tuple[set[str], list[Finding]]]] = {}
     for f in exact.values():
-        if f.dependency is not None:
-            dependency_key = (f.dependency.package, f.dependency.installed_version)
-            identifiers = {
-                str(value).upper()
-                for value in (f.rule_id, *f.dependency.advisory_aliases)
-                if value
-            }
-            components = dependency_components.setdefault(dependency_key, [])
-            matching = [index for index, (known, _) in enumerate(components) if known & identifiers]
-            if not matching:
-                components.append((identifiers, [f]))
-                continue
-            first = matching[0]
-            components[first][0].update(identifiers)
-            components[first][1].append(f)
-            for index in reversed(matching[1:]):
-                components[first][0].update(components[index][0])
-                components[first][1].extend(components[index][1])
-                components.pop(index)
-            continue
-        else:
-            cwe_key = "secret-family" if _is_secret_family(f.cwe) else f.cwe
-            group_key = (cwe_key, f.code_context.file_path, f.code_context.start_line)
-        groups.setdefault(group_key, []).append(f)
-
-    for dependency_key, components in dependency_components.items():
-        for index, (_, members) in enumerate(components):
-            groups[("dependency", *dependency_key, index)] = members
+        cwe_key = "secret-family" if _is_secret_family(f.cwe) else f.cwe
+        groups.setdefault((cwe_key, f.code_context.file_path, f.code_context.start_line), []).append(f)
 
     merged: list[Finding] = []
     for members in groups.values():
         primary = max(members, key=_richness)
         others = sorted({m.scanner for m in members} - {primary.scanner})
-        updates = {}
-        if primary.dependency is not None:
-            dependencies = [m.dependency for m in members if m.dependency is not None]
-            updates["dependency"] = primary.dependency.model_copy(
-                update={
-                    "fixed_versions": sorted({v for dep in dependencies for v in dep.fixed_versions}),
-                    "advisory_aliases": sorted(
-                        {
-                            value
-                            for member in members
-                            for value in (
-                                member.rule_id,
-                                *(member.dependency.advisory_aliases if member.dependency else []),
-                            )
-                            if value and value != primary.rule_id
-                        }
-                    ),
-                }
-            )
-            updates["cwe"] = primary.cwe or next((m.cwe for m in members if m.cwe), None)
-        if others:
-            updates["corroborated_by"] = others
-        merged.append(primary.model_copy(update=updates) if updates else primary)
+        merged.append(primary.model_copy(update={"corroborated_by": others}) if others else primary)
 
         for m in members:
             if (
-                primary.dependency is None
-                and m is not primary
+                m is not primary
                 and m.scanner == primary.scanner
                 and m.rule_id != primary.rule_id
                 and not _is_secret_family(m.cwe)
@@ -187,4 +122,4 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return merged
 
 
-__all__ = ["load", "detect_format", "IngestError", "sarif", "bandit", "govulncheck", "native"]
+__all__ = ["load", "detect_format", "IngestError", "sarif", "bandit", "native"]

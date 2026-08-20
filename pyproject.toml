@@ -1,8 +1,10 @@
 [project]
 name = "appsec-triage"
 version = "0.1.0"
-description = "LLM triage for SAST findings with pluggable providers (Ollama / OpenAI / DeepSeek)"
+description = "LLM triage for SAST and SCA findings: closes what a fact closes, and says why"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
@@ -10,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.5"]
+dev = ["ruff>=0.5"]
 
 [project.scripts]
 appsec-triage = "appsec_triage.cli:main"
@@ -25,6 +27,3 @@ include = ["appsec_triage*"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

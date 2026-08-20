@@ -172,6 +172,22 @@ def declarations(path: str, text: str) -> list[Declaration]:
     return parser(text) if parser else []
 
 
+def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
+    """The declaration containing `offset`, from an already-parsed file.
+
+    Split out so a caller with many offsets in one file parses it once: parsing
+    is a full-text regex pass, and `enclosing` per match is quadratic on a file
+    with many call sites.
+    """
+    best = None
+    for declaration in parsed:
+        if declaration.offset < offset:
+            best = declaration
+        else:
+            break
+    return best
+
+
 def enclosing(path: str, text: str, offset: int) -> Declaration | None:
     """The declaration containing `offset` — the nearest one before it.
 
@@ -180,13 +196,7 @@ def enclosing(path: str, text: str, offset: int) -> Declaration | None:
     alternative is four parsers, and the cost is a widened search rather than a
     wrong verdict.
     """
-    best = None
-    for declaration in declarations(path, text):
-        if declaration.offset < offset:
-            best = declaration
-        else:
-            break
-    return best
+    return enclosing_in(declarations(path, text), offset)
 
 
 def call_pattern(function: str, language: str | None = None) -> re.Pattern[str]:

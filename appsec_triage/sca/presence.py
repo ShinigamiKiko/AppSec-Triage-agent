@@ -24,12 +24,15 @@ for the caller to interpret, never as "not vulnerable".
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_INTERNAL_SEGMENT = re.compile(r"(?:^|/)internal(?:/|$)")
 
 _SKIP_DIRS = {
     ".git", "vendor", "node_modules", "venv", ".venv", "target", "build",
@@ -83,6 +86,34 @@ def package_namespaces(ecosystem: str, package: str) -> list[str]:
     return [name, name.rsplit("/", 1)[-1]]
 
 
+def _first_file_matching(
+    root: Path, ecosystem: str, patterns: "list[re.Pattern[str]]"
+) -> "tuple[Path | None, int] | None":
+    """First first-party file matching any pattern, as (relative path, index).
+
+    `None` means the question could not be asked — no files of this language —
+    which is a different answer from "asked and found nothing", reported as
+    `(None, -1)`. Shared by the two "is it used" scans, which differ only in the
+    pattern they carry and the sentence they write about the result.
+    """
+    suffixes = _ECOSYSTEM_SUFFIXES.get((ecosystem or "").strip().lower(), _SUFFIXES)
+    files, _ = _source_files(root, suffixes)
+    if not files:
+        return None
+
+    for path in files:
+        try:
+            if path.stat().st_size > _MAX_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for index, pattern in enumerate(patterns):
+            if pattern.search(text):
+                return path.relative_to(root), index
+    return None, -1
+
+
 def package_is_used(root: Path | str, ecosystem: str, package: str) -> tuple[bool | None, str]:
     """Is this package referenced anywhere in first-party code at all?
 
@@ -97,24 +128,55 @@ def package_is_used(root: Path | str, ecosystem: str, package: str) -> tuple[boo
     if not names:
         return None, "имя пакета не разобрано"
 
-    root = Path(root)
-    suffixes = _ECOSYSTEM_SUFFIXES.get((ecosystem or "").strip().lower(), _SUFFIXES)
-    files, _ = _source_files(root, suffixes)
-    if not files:
-        return None, "в проекте нет файлов на языке пакета"
-
     patterns = [re.compile(rf"(?<![\w\\]){re.escape(n)}(?![\w])", re.I) for n in names]
-    for path in files:
-        try:
-            if path.stat().st_size > _MAX_BYTES:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for name, pattern in zip(names, patterns):
-            if pattern.search(text):
-                return True, f"{name} встречается в {path.relative_to(root)}"
-    return False, f"ни одно из имён ({', '.join(names)}) не встречается в коде проекта"
+    hit = _first_file_matching(Path(root), ecosystem, patterns)
+    if hit is None:
+        return None, "в проекте нет файлов на языке пакета"
+    path, index = hit
+    if path is None:
+        return False, f"ни одно из имён ({', '.join(names)}) не встречается в коде проекта"
+    return True, f"{names[index]} встречается в {path}"
+
+
+def import_path_used(
+    root: Path | str, ecosystem: str, paths: "list[str] | tuple[str, ...]"
+) -> tuple[bool | None, str]:
+    """Is any of these exact import paths brought in by first-party code?
+
+    Finer than `package_is_used`, and the difference is the whole verdict for a
+    package-level advisory. A module can be present through one sub-package while
+    the vulnerable one is never imported: `golang.org/x/crypto` is used via
+    `bcrypt`, but `golang.org/x/crypto/openpgp` is a different import path and may
+    be absent. Matching the module name would call that used; matching the path
+    does not.
+
+    A path matches itself or a deeper path under it (`openpgp/packet`), never a
+    sibling (`bcrypt`), because the boundary after the path is a quote or a slash.
+    """
+    wanted = [p for p in paths if p and not _INTERNAL_SEGMENT.search(p)]
+    if not wanted:
+        if any(paths):
+            # Go forbids importing a path with an `internal/` segment from
+            # outside its subtree, so first-party code cannot name it however
+            # much it uses the code: pgx's SQL-injection flaw lives in
+            # `pgx/v5/internal/sanitize`, reached through the public API the
+            # project does import. Absence proves nothing here, and reporting it
+            # as absence closed a finding govulncheck could see being called.
+            return None, ("уязвимый код лежит во внутреннем пакете "
+                          f"({', '.join(p for p in paths if p)}) — снаружи он "
+                          "не импортируется по правилам языка, "
+                          "отсутствие импорта ничего не доказывает")
+        return None, "путь пакета неизвестен"
+
+    alternation = "|".join(re.escape(p) for p in sorted(set(wanted), key=len, reverse=True))
+    pattern = re.compile(rf"""["'](?:{alternation})(?:/[^"']*)?["']""")
+    hit = _first_file_matching(Path(root), ecosystem, [pattern])
+    if hit is None:
+        return None, "в проекте нет файлов на языке пакета"
+    path, _ = hit
+    if path is None:
+        return False, f"ни один из путей ({', '.join(wanted)}) не импортируется в коде проекта"
+    return True, f"импортируется в {path}"
 
 
 class SymbolPresence(str, Enum):
@@ -288,18 +350,38 @@ def _package_is_imported(package: str, text: str) -> bool:
     return bool(pattern.search(text))
 
 
+_FILE_LISTS: dict[tuple[str, frozenset], tuple[list[Path], bool]] = {}
+
+
 def _source_files(root: Path, suffixes: set[str]) -> tuple[list[Path], bool]:
+    """First-party files of these types, listed once per run.
+
+    Pruned during the walk rather than filtered after it: `rglob` descends into
+    `vendor/` and `node_modules/` before the skip test rejects what it found, and
+    those trees are usually far larger than the first-party code they sit beside.
+
+    Memoised per process — the same listing is asked for on every searched
+    symbol and by both "is it used" scans, and the tree cannot change mid-run.
+    Nothing is kept across runs; this is a pipeline, not a cache.
+    """
+    key = (str(root), frozenset(suffixes))
+    if key in _FILE_LISTS:
+        return _FILE_LISTS[key]
+
     files: list[Path] = []
     truncated = False
-    for path in root.rglob("*"):
-        if len(files) >= _MAX_FILES:
-            truncated = True
+    for parent, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
+        for name in filenames:
+            if len(files) >= _MAX_FILES:
+                truncated = True
+                break
+            if Path(name).suffix.lower() in suffixes:
+                files.append(Path(parent) / name)
+        if truncated:
             break
-        if not path.is_file() or path.suffix.lower() not in suffixes:
-            continue
-        if _SKIP_DIRS.intersection(path.parts):
-            continue
-        files.append(path)
+
+    _FILE_LISTS[key] = (files, truncated)
     return files, truncated
 
 

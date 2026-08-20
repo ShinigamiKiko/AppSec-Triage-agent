@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..models import TriageRecord
     from ..pipeline import TriageRun
 
 
@@ -55,25 +54,15 @@ def read_jsonl(path: Path) -> list["TriageRecord"]:
 
 
 def write_summary(run: "TriageRun", path: Path) -> Path:
-    from ..models import Priority
-
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     counts = run.counts()
     by_cwe: dict[str, dict[str, int]] = {}
     for r in run.records:
-        bucket = by_cwe.setdefault(
-            r.cwe or "unclassified",
-            {"confirmed": 0, "false_positive": 0, "external_fp": 0, "unknown": 0},
-        )
+        bucket = by_cwe.setdefault(r.cwe or "unclassified", {"confirmed": 0, "false_positive": 0, "unknown": 0})
         bucket[r.verdict.verdict.value] += 1
 
     latencies = sorted(r.latency_ms for r in run.records if r.latency_ms)
-    priorities = {
-        priority.value: sum(1 for record in run.records if record.priority is priority)
-        for priority in Priority
-    }
-    risk = run.risk_context or (run.records[0].risk_context if run.records else None)
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         **(run.coverage.as_dict() if run.coverage is not None else {"coverage_complete": None}),
@@ -86,21 +75,11 @@ def write_summary(run: "TriageRun", path: Path) -> Path:
         "reuse": run.reuse,
         "reused_verdicts": sum(1 for r in run.records if r.reused),
         "verdicts": counts,
-        "priorities": priorities,
-        "risk_context": risk.model_dump(mode="json") if risk is not None else None,
         "by_cwe": by_cwe,
         "overridden_by_post_validation": sum(1 for r in run.records if r.overrides),
         "errors": sum(1 for r in run.records if r.error),
-        "sca_resolution_errors": sum(
-            1 for r in run.records if r.sca is not None and r.sca.resolution_error
-        ),
-        "sca": run.sca_stats or {},
-        "source_download_failures": (run.sca_stats or {}).get("source_download_failures", 0),
-        "unresolved_bridges": (run.sca_stats or {}).get("unresolved_bridges", 0),
-        "successful_closures": (run.sca_stats or {}).get("successful_closures", 0),
         "requires_human_review": sum(1 for r in run.records if r.verdict.requires_human_review),
-        "auto_closed": counts["false_positive"] + counts["external_fp"],
-        "external_mitigated": counts["external_fp"],
+        "auto_closed": counts["false_positive"],
         "noise_reduction_pct": round(100 * counts["false_positive"] / len(run.records), 1) if run.records else 0.0,
         "decided_by": {
             k: sum(1 for r in run.records if r.decided_by == k)
@@ -111,7 +90,11 @@ def write_summary(run: "TriageRun", path: Path) -> Path:
             "p95": latencies[int(len(latencies) * 0.95)] if latencies else None,
             "max": latencies[-1] if latencies else None,
         },
+        # Both, because they answer different questions: what the run cost, and
+        # how much of that a per-finding record can account for.
         "total_cost_usd": run.total_cost_usd,
+        "verdict_cost_usd": run.verdict_cost_usd,
+        "model_calls": run.model_calls,
     }
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return path

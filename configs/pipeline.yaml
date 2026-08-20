@@ -91,9 +91,6 @@ heuristics:
 
 post_validation:
   enabled: true
-  # Для input-driven SAST решение требует обе половины: scanner trace source→sink
-  # и production entrypoint от LSP/routes. Без одной из них verdict → unknown.
-  require_sast_reachability: true
   require_evidence_quotes: true
   quote_match_threshold: 0.85  # ниже — начнут проскакивать перефразы
   confidence_floor: 0.7

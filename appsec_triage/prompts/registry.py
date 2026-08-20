@@ -132,6 +132,30 @@ def render_system(
     return "\n\n---\n\n".join(parts), prompt
 
 
+@lru_cache(maxsize=32)
+def step(name: str) -> str:
+    """The system prompt for one dependency-triage step, by file name.
+
+    The SAST prompts are chosen by CWE; these are not — each belongs to one step
+    of the dependency chain and there is nothing to match on. They live in files
+    all the same, so the wording can be read and changed without opening the
+    code that uses it, and a diff to a prompt does not look like a diff to logic.
+
+    Missing is fatal rather than empty: a step whose prompt vanished would still
+    call the model, with no instructions, and take the answer seriously.
+    """
+    path = PROMPTS_ROOT / "sca" / f"{name}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PromptError(f"{path}: промпт шага не прочитан ({exc})") from exc
+    match = _FRONT_MATTER.match(text)
+    body = text[match.end():] if match else text
+    if not body.strip():
+        raise PromptError(f"{path}: промпт пуст")
+    return body.strip()
+
+
 def coverage(pack: str = "default") -> dict[str, str]:
     """CWE -> prompt id, for the report and for spotting gaps."""
     out: dict[str, str] = {}

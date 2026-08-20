@@ -10,12 +10,11 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from .config import PipelineConfig, ProviderConfig
-from . import prioritize as priority_mod
 from . import reuse as reuse_mod
-from . import risk as risk_ctx
 from . import scope as scope_filter
 from . import verify as verify_pass
 from . import deployment as deployment_ctx
@@ -29,9 +28,7 @@ from .llm.base import LLMClient, LLMError
 from .models import (
     EvidenceClass,
     EvidenceQuote,
-    ExternalControlReference,
     Finding,
-    RiskContext,
     TriageRecord,
     Verdict,
     VerdictLabel,
@@ -43,8 +40,6 @@ from .validate.schema import VERDICT_SCHEMA, SchemaError, parse_verdict
 
 log = logging.getLogger(__name__)
 
-_SUPPORTING_CODEQL_RULES = {"go/govulncheck-targeted-taint"}
-
 
 @dataclass(slots=True)
 class TriageRun:
@@ -55,23 +50,34 @@ class TriageRun:
     scope_excluded: dict[str, int] = None  # type: ignore[assignment]
     reuse: dict | None = None
     coverage: object | None = None
-    risk_context: RiskContext | None = None
-    sca_stats: dict[str, int] | None = None
+    spend_usd: float | None = None
+    model_calls: int = 0
 
     def __post_init__(self) -> None:
         if self.scope_excluded is None:
             self.scope_excluded = {}
-        if self.sca_stats is None:
-            self.sca_stats = {}
 
     @property
     def triaged_count(self) -> int:
         """Findings that actually reached the model, excluding scope drops."""
-        return sum(1 for r in self.records if r.model is not None and not r.reused)
+        return sum(1 for r in self.records if r.decided_by != "scope")
+
+    @property
+    def verdict_cost_usd(self) -> float:
+        """What the verdict calls cost — one per finding that reached the model."""
+        return round(sum(r.cost_usd or 0.0 for r in self.records), 4)
 
     @property
     def total_cost_usd(self) -> float:
-        return round(sum(r.cost_usd or 0.0 for r in self.records), 4)
+        """Everything the run spent, including the calls no record carries.
+
+        The dependency chain asks the model several times before a verdict is
+        even considered, and a finding it settles never produces a verdict call
+        at all — so summing the records reported those runs as nearly free. The
+        client counts every answered call, so it is the honest total; the sum
+        over records stays as the fallback for a run with no client.
+        """
+        return round(self.spend_usd, 4) if self.spend_usd else self.verdict_cost_usd
 
     def counts(self) -> dict[str, int]:
         out = {label.value: 0 for label in VerdictLabel}
@@ -96,7 +102,6 @@ class TriagePipeline:
         self.history = history
         self.source = source
         self.symbols = symbols
-        self.risk_context = risk_ctx.load()
         self.stacks = stack_detect.detect(list(source.roots)) if source else []
         self.deps_roots = list(source.roots) if source else []
         self.deps_index = deps.build_index(self.deps_roots) if self.deps_roots else None
@@ -112,10 +117,49 @@ class TriagePipeline:
         if getattr(cfg, "resolve_vulnerable_symbols", False):
             from .sca.chain import DependencyChain
 
+            reachability = None
+            report_path = getattr(cfg, "govulncheck_report", None)
+            if report_path:
+                from .sca import govulncheck
+                from .sca.govulncheck import GovulncheckUnavailable
+
+                reachability = govulncheck.load(report_path)
+                # Asked for and not delivered is a failed run, not a quieter
+                # one. Measured on a real project: govulncheck stopped on an
+                # incomplete `vendor/` and wrote a report with a header and no
+                # findings, the triage read it as "no opinions", and every
+                # verdict fell back to weaker evidence with nothing in the
+                # output saying the strongest source had not run.
+                if reachability.problem or not reachability.usable:
+                    raise GovulncheckUnavailable(
+                        reachability.problem
+                        or f"отчёт govulncheck пуст ({report_path}): ни одной "
+                           "записи. Обычно это упавшая сборка — govulncheck "
+                           "требует, чтобы модуль собирался. Проверьте вывод "
+                           "самой команды; при неполном vendor/ помогает "
+                           "GOFLAGS=-mod=mod."
+                    )
+                log.info("call-graph reachability for %d advisories",
+                         len(reachability.verdicts))
+
+            # Databases the SAST phase built in this same run. They answer the
+            # dataflow question for dependency call sites, and they exist only
+            # because the scan no longer deletes them.
+            databases: dict[str, Path] = {}
+            scan_dir = getattr(cfg, "scan_out_dir", None)
+            if scan_dir:
+                from .scanners.tools import CodeQLScanner
+
+                databases = CodeQLScanner.databases(scan_dir)
+                if databases:
+                    log.info("codeql databases for dependency dataflow: %s",
+                             ", ".join(sorted(databases)))
+
             self.dep_chain = DependencyChain(
                 client, self.deps_roots, lsp=symbols, routes=self.routes,
                 nvd_api_key=getattr(cfg, "nvd_api_key", None),
                 deployment=deployment_ctx.load(getattr(cfg, "deployment_config", None)),
+                reachability=reachability, codeql_databases=databases,
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
@@ -127,29 +171,15 @@ class TriagePipeline:
             log.info("deployment context in play: %s", ", ".join(sorted(self.deployment.facts)))
         if self.stacks:
             log.info("stack conventions in play: %s", ", ".join(s.id for s in self.stacks))
-        log.info(
-            "runtime risk context: internet=%s auth=%s business_critical=%s; platform=kubernetes",
-            self.risk_context.internet_exposed,
-            self.risk_context.auth_required,
-            self.risk_context.business_critical,
-        )
-        for warning in self.risk_context.warnings:
-            log.warning("risk context: %s", warning)
-
-    def _finalize(self, record: TriageRecord, finding: Finding) -> TriageRecord:
-        record = record.model_copy(update={"scanner_severity": finding.severity})
-        return priority_mod.assign_priority(record, finding, self.risk_context)
 
     def _not_distributed_record(self, finding: Finding, result, sca=None) -> TriageRecord:
-        """Close a dependency finding on a fact established by the SCA chain.
+        """Closed because the vulnerable code is not in the installed package.
 
         The only dependency outcome decided without the model. It rests on the
         contents of the published archive — four PhpSpreadsheet XSS advisories
         are in `samples/`, and composer installs no `samples/` directory — which
         is a fact about a file listing, not an inference about behaviour.
         """
-        external = bool(result.decision.reassigned)
-        owner = (sca.owner if sca else "") or "external system owner"
         return TriageRecord(
             finding_id=finding.finding_id,
             cwe=finding.cwe,
@@ -159,30 +189,21 @@ class TriagePipeline:
             start_line=finding.code_context.start_line,
             fingerprint=reuse_mod.fingerprint(finding),
             verdict=Verdict(
-                verdict=VerdictLabel.external_fp if external else VerdictLabel.false_positive,
+                verdict=VerdictLabel.false_positive,
                 evidence_class=EvidenceClass.identifier_only,
                 confidence=0.85,
                 confidence_band="high",
                 confidence_rationale=(
-                    f"Closed for this service because the SCA chain assigned the condition to {owner}."
-                    if external
-                    else "Closed on a positive SCA fact such as package placement, usage, condition, or archive contents."
+                    "Closed on the contents of the published package, not on inference: "
+                    "the path the advisory names is absent from the installed artifact."
                 ),
                 cwe=finding.cwe,
                 reason=" ".join([result.decision.headline, *result.decision.reasons[:2]]),
-                external_control=(
-                    ExternalControlReference(
-                        control_id="sca-infrastructure-owner",
-                        why_effective=f"The vulnerable precondition belongs to {owner}, not this service.",
-                    )
-                    if external
-                    else None
-                ),
                 requires_human_review=False,
             ),
-            decided_by="llm" if external else "heuristics",
+            decided_by="heuristics",
             provider=self.provider_cfg.name,
-            model=self.provider_cfg.model if external else None,
+            model=None,
             sca=sca,
         )
 
@@ -201,7 +222,7 @@ class TriagePipeline:
             start_line=finding.code_context.start_line,
             fingerprint=reuse_mod.fingerprint(finding),
             verdict=Verdict(
-                verdict=VerdictLabel.external_fp,
+                verdict=VerdictLabel.false_positive,
                 evidence_class=EvidenceClass.identifier_only,
                 confidence=0.85,
                 confidence_band="high",
@@ -211,10 +232,6 @@ class TriagePipeline:
                 ),
                 cwe=finding.cwe,
                 reason=f"The platform handles this: {entry.why}.",
-                external_control=ExternalControlReference(
-                    control_id=f"platform:{entry.rule}",
-                    why_effective=entry.why,
-                ),
                 requires_human_review=False,
             ),
             decided_by="heuristics",
@@ -313,13 +330,13 @@ class TriagePipeline:
     def triage_one(self, finding: Finding) -> TriageRecord:
         if finding.misconfiguration:
             if entry := self.deployment.handled_by_platform(finding.rule_id):
-                return self._finalize(self._platform_handled_record(finding, entry), finding)
-            return self._finalize(self._misconfiguration_record(finding), finding)
+                return self._platform_handled_record(finding, entry)
+            return self._misconfiguration_record(finding)
 
         if self.cfg.secrets_without_model and _is_secret_family(finding.cwe):
             record = self._secret_record(finding)
             if record is not None:
-                return self._finalize(record, finding)
+                return record
 
         heur = heuristics.evaluate(finding, self.cfg.heuristics) if self.cfg.heuristics.enabled else _no_heuristics()
         symbols = self.symbols.enrich(finding) if self.symbols else None
@@ -333,8 +350,6 @@ class TriagePipeline:
             deps_index=self.deps_index,
             deps_roots=self.deps_roots,
             routes=self.routes,
-            deployment=self.deployment,
-            risk_context=self.risk_context,
         )
 
         if heur.hard_fp:
@@ -348,7 +363,7 @@ class TriagePipeline:
                 missing_information=[],
                 requires_human_review=False,
             )
-            return self._finalize(TriageRecord(
+            return TriageRecord(
                 finding_id=finding.finding_id,
                 cwe=finding.cwe,
                 file_path=finding.code_context.file_path,
@@ -359,14 +374,13 @@ class TriagePipeline:
                 decided_by="heuristics",
                 provider=self.provider_cfg.name,
                 model=None,
-            ), finding)
+            )
 
         kind = "dependency" if finding.dependency else None
         system, prompt = registry.render_system(finding.cwe, self.cfg.prompt_pack, self.stack_section, kind)
         user = builder.render_for_prompt(pkg)
 
         sca_summary = None
-        sca_closed = False
         if self.dep_chain is not None and finding.dependency:
             try:
                 chain = self.dep_chain.run(finding, codeql_findings=self._codeql_findings)
@@ -375,10 +389,7 @@ class TriagePipeline:
             else:
                 sca_summary = chain.summary(finding.dependency)
                 if chain.closes:
-                    sca_closed = True
-                    return self._finalize(
-                        self._not_distributed_record(finding, chain, sca_summary), finding
-                    )
+                    return self._not_distributed_record(finding, chain, sca_summary)
                 user = f"{user}\n\n{chain.render()}"
 
         base = dict(
@@ -390,9 +401,6 @@ class TriagePipeline:
             start_line=finding.code_context.start_line,
             symbol_context=pkg.symbol_context,
             reachability=pkg.reachability,
-            sast_reachability=pkg.sast_reachability,
-            external_controls=pkg.external_controls,
-            risk_context=self.risk_context,
             fingerprint=reuse_mod.fingerprint(finding),
             provider=self.provider_cfg.name,
             model=self.provider_cfg.model,
@@ -424,12 +432,12 @@ class TriagePipeline:
             log.warning("finding %s: %s", finding.finding_id, exc)
             if self.cfg.fail_fast:
                 raise
-            return self._finalize(TriageRecord(
+            return TriageRecord(
                 **base,
                 verdict=_error_verdict(finding, str(exc)),
                 decided_by="error",
                 error=str(exc),
-            ), finding)
+            )
 
         outcome = postvalidation.validate(raw_verdict, pkg, finding, self.cfg.post_validation)
         verdict, overrides, decided_by = outcome.verdict, list(outcome.overrides), (
@@ -455,35 +463,7 @@ class TriagePipeline:
         if repaired:
             overrides = overrides + ["schema_repaired: provider response needed a correction round"]
 
-        if finding.dependency is not None and verdict.verdict.is_closed and not sca_closed:
-            verdict = verdict.model_copy(update={
-                "verdict": VerdictLabel.unknown,
-                "evidence_class": EvidenceClass.insufficient_context,
-                "confidence": min(verdict.confidence, 0.3),
-                "confidence_band": "low",
-                "confidence_rationale": (
-                    "A dependency finding can close only when every cdxgen path is factually broken."
-                ),
-                "reason": (
-                    "Dependency closure was rejected because the SCA chain did not prove that "
-                    "every cdxgen dependency path is absent."
-                ),
-                "missing_information": [
-                    *verdict.missing_information,
-                    "complete source and bridge evidence for every cdxgen dependency path",
-                ],
-                "blocking_question": (
-                    "Can every cdxgen dependency path be resolved through exact-version parent source?"
-                ),
-                "external_control": None,
-                "requires_human_review": True,
-            })
-            overrides.append(
-                "sca_closure_gate: not every cdxgen dependency path was proven closed"
-            )
-            decided_by = "post_validation"
-
-        return self._finalize(TriageRecord(
+        return TriageRecord(
             **base,
             challenge_note=challenge_note,
             verdict=verdict,
@@ -495,7 +475,7 @@ class TriagePipeline:
             completion_tokens=resp.completion_tokens,
             cost_usd=self.client.estimate_cost(resp.prompt_tokens, resp.completion_tokens),
             attempts=resp.attempts,
-        ), finding)
+        )
 
 
     def run(self, findings: Iterable[Finding], *, progress=None, on_record=None) -> TriageRun:
@@ -517,17 +497,7 @@ class TriagePipeline:
         scoped = scope_filter.apply(all_findings, self.cfg.scope)
         if scoped.excluded:
             log.info("scope filter excluded %d finding(s): %s", len(scoped.excluded), scoped.counts)
-        items: Sequence[Finding] = [
-            finding
-            for finding in scoped.kept
-            if finding.rule_id not in _SUPPORTING_CODEQL_RULES
-        ]
-        prepare = getattr(self.dep_chain, "prepare", None)
-        if callable(prepare):
-            try:
-                prepare(finding for finding in items if finding.dependency is not None)
-            except Exception:  # noqa: BLE001 - preparation failure degrades individual findings
-                log.exception("dependency batch preparation failed; continuing per finding")
+        items: Sequence[Finding] = scoped.kept
         workers = max(1, min(self.cfg.max_workers, self.provider_cfg.concurrency))
         records: list[TriageRecord | None] = [None] * len(items)
 
@@ -539,9 +509,7 @@ class TriagePipeline:
                     records[index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - the batch must survive one finding
                     log.exception("triage failed for %s", items[index].finding_id)
-                    records[index] = self._finalize(
-                        _error_record(items[index], self.provider_cfg, exc), items[index]
-                    )
+                    records[index] = _error_record(items[index], self.provider_cfg, exc)
                 if on_record:
                     try:
                         on_record(records[index])
@@ -550,21 +518,14 @@ class TriagePipeline:
                 if progress:
                     progress(done, len(items))
 
-        by_id = {finding.finding_id: finding for finding in all_findings}
-        excluded = [
-            self._finalize(record, by_id[record.finding_id])
-            for record in scoped.excluded
-            if record.finding_id in by_id
-        ]
         return TriageRun(
-            records=[r for r in records if r is not None] + excluded,
+            records=[r for r in records if r is not None] + scoped.excluded,
             provider=self.provider_cfg.name,
             model=self.provider_cfg.model,
             prompt_pack=self.cfg.prompt_pack,
             scope_excluded=scoped.counts,
-            risk_context=self.risk_context,
-            sca_stats=(self.dep_chain.stats_snapshot() if self.dep_chain is not None
-                       and hasattr(self.dep_chain, "stats_snapshot") else {}),
+            spend_usd=float(getattr(self.client, "spend_usd", 0.0) or 0.0),
+            model_calls=int(getattr(self.client, "calls", 0) or 0),
         )
 
 

@@ -92,7 +92,6 @@ def _to_unknown(v: Verdict, evidence_class: EvidenceClass | None = None) -> Verd
             "verdict": VerdictLabel.unknown,
             "evidence_class": evidence_class or v.evidence_class,
             "requires_human_review": True,
-            "external_control": None,
         }
     )
 
@@ -104,11 +103,6 @@ def validate(
     cfg: PostValidationConfig,
 ) -> ValidationOutcome:
     if not cfg.enabled:
-        if verdict.verdict is VerdictLabel.external_fp:
-            return ValidationOutcome(
-                _to_unknown(verdict, EvidenceClass.insufficient_context),
-                ["external_validation_disabled: external_fp cannot bypass compensating-control validation"],
-            )
         return ValidationOutcome(verdict, [])
 
     overrides: list[str] = []
@@ -185,31 +179,6 @@ def validate(
             update={"missing_information": ["model abstained without naming what it lacked"]}
         )
 
-    if result.verdict is VerdictLabel.external_fp:
-        control_id = result.external_control.control_id if result.external_control else None
-        eligible = {control.control_id for control in pkg.external_controls if control.bypass_precluded}
-        reachability_established = bool(
-            pkg.sast_reachability and pkg.sast_reachability.status == "established"
-        )
-        if not control_id or control_id not in eligible:
-            overrides.append(
-                "external_control_unverified: external_fp requires a matching verified compensating "
-                "control from the evidence package"
-            )
-            result = _to_unknown(result, EvidenceClass.insufficient_context)
-        elif not reachability_established:
-            overrides.append(
-                "external_control_path_unverified: external_fp requires both a source-to-sink trace "
-                "and a production entrypoint so the control can be placed on the actual attack path"
-            )
-            result = _to_unknown(result, EvidenceClass.insufficient_context)
-        else:
-            result = result.model_copy(
-                update={"requires_human_review": False, "blocking_question": None}
-            )
-    elif result.external_control is not None:
-        result = result.model_copy(update={"external_control": None})
-
     prose = f"{result.reason} {result.confidence_rationale}"
     if result.verdict is VerdictLabel.confirmed and (m := _ARGUES_FALSE_POSITIVE.search(prose)):
         overrides.append(
@@ -275,41 +244,6 @@ def validate(
             )
             result = _to_unknown(result, EvidenceClass.insufficient_context)
 
-    if (
-        cfg.require_sast_reachability
-        and finding.dependency is None
-        and (finding.cwe or "").upper() in _dataflow_cwes()
-        and result.verdict in (VerdictLabel.confirmed, VerdictLabel.false_positive)
-    ):
-        reach = pkg.sast_reachability
-        if reach is None or reach.status != "established":
-            overrides.append(
-                "sast_reachability_unproven: an input-driven first-party verdict requires both a "
-                "scanner source-to-sink trace and a production entrypoint established by LSP/routes"
-            )
-            result = _to_unknown(result, EvidenceClass.insufficient_context)
-        elif (
-            result.verdict is VerdictLabel.confirmed
-            and result.evidence_class is not EvidenceClass.exploitable_dataflow
-        ):
-            overrides.append(
-                "sast_dataflow_class_mismatch: confirmed input-driven findings must identify an "
-                "EXPLOITABLE_DATAFLOW on the established path"
-            )
-            result = _to_unknown(result, EvidenceClass.insufficient_context)
-        elif (
-            result.verdict is VerdictLabel.false_positive
-            and (
-                result.evidence_class is not EvidenceClass.sanitized_dataflow
-                or not _has_grounded_sanitizer(result, finding)
-            )
-        ):
-            overrides.append(
-                "sast_defence_unverified: closing an established input-driven path requires a "
-                "grounded SANITIZED_DATAFLOW defence"
-            )
-            result = _to_unknown(result, EvidenceClass.insufficient_context)
-
     cal = calibrate(result, pkg, finding, overrides)
     result = result.model_copy(
         update={
@@ -337,9 +271,6 @@ def validate(
     if result.verdict is VerdictLabel.unknown and not result.requires_human_review:
         overrides.append("escalated: unknown always requires human review")
         result = result.model_copy(update={"requires_human_review": True})
-
-    if result.verdict is VerdictLabel.external_fp:
-        result = result.model_copy(update={"requires_human_review": False, "blocking_question": None})
 
     dep = pkg.dependency
     if (
@@ -389,21 +320,6 @@ def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: Pos
         return False
     version = (dep.installed_version or "").lower().lstrip("v")
     return not version or version in lowered or "@" not in lowered
-
-
-def _dataflow_cwes() -> set[str]:
-    from ..context.builder import DATAFLOW_CWES
-
-    return DATAFLOW_CWES
-
-
-def _has_grounded_sanitizer(verdict: Verdict, finding: Finding) -> bool:
-    if any(
-        step.role.value == "sanitizer" and step.grounded and not step.tainted
-        for step in verdict.dataflow
-    ):
-        return True
-    return bool(finding.sanitizers) and bool(verdict.evidence)
 
 
 def _merge_rationale(model_text: str, self_reported: float | None, cal) -> str:
@@ -457,29 +373,6 @@ def _question_from_override(overrides: list[str], original: Verdict) -> str:
             "The language server is mandatory for this file type but resolved nothing, so the origin of "
             "the flagged values is unverified. Fix the server (`appsec-triage doctor`) and re-run, or "
             "trace by hand where the values on the flagged line come from."
-        ),
-        "external_control_unverified": (
-            "The model named an external mitigation that is not in the verified deployment controls. "
-            "Verify the control configuration and bypass paths, or treat the finding as real."
-        ),
-        "external_control_path_unverified": (
-            "The external control may exist, but the source-to-sink path or production entrypoint is unproven. "
-            "Re-run CodeQL/LSP and verify that the control is on this exact path."
-        ),
-        "external_validation_disabled": (
-            "External mitigation cannot be accepted while post-validation is disabled. Enable it and re-run."
-        ),
-        "sast_reachability_unproven": (
-            "The finding is input-driven, but CodeQL/Psalm/Semgrep did not provide a complete source-to-sink "
-            "trace together with an LSP/route entrypoint. Fix scanner/LSP coverage and re-run."
-        ),
-        "sast_dataflow_class_mismatch": (
-            "The model confirmed an input-driven issue without classifying the established path as exploitable. "
-            "Review the trace and sink semantics."
-        ),
-        "sast_defence_unverified": (
-            "The model closed an established input-driven path without a grounded sanitizer on that path. "
-            "Find the effective defence or treat the finding as real."
         ),
     }
     return templates.get(kind, f"Automated checks overrode a `{said}` verdict ({kind}). Review by hand.")

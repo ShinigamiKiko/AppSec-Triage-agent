@@ -1,4 +1,4 @@
-"""Which application code is an HTTP entry point — read from routing, not the LSP.
+"""Which PHP code is an HTTP entry point — read from the routing, not the LSP.
 
 The gap this closes was measured, not guessed. On a real Symfony project every
 PHP finding came back with zero callers: Phpactor advertises no
@@ -46,22 +46,6 @@ _METHOD_DEF = re.compile(
 _CLASS_DEF = re.compile(r"^\s*(?:final\s+|abstract\s+)?class\s+(\w+)")
 
 _YAML_CONTROLLER = re.compile(r"controller\s*:\s*['\"]?([\w\\]+)::(\w+)")
-_GO_ROUTER = re.compile(r"@Router\s+(\S+)\s+\[([A-Za-z]+)\]", re.IGNORECASE)
-_GO_FUNC_DEF = re.compile(
-    r"^\s*func\s*(?:\(\s*\w+\s+\*?([\w.]+)\s*\)\s*)?(\w+)\s*\("
-)
-_JS_ROUTE = re.compile(
-    r"\b(?:router|app)\.(get|post|put|patch|delete|options|head|all|use)"
-    r"\s*\(\s*['\"]([^'\"]+)['\"]",
-    re.IGNORECASE,
-)
-_JS_FUNCTION = re.compile(
-    r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|"
-    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^\n]*\)\s*=>"
-)
-_JS_IMPORT = re.compile(
-    r"(?:require\s*\(\s*|from\s+|import\s*\(\s*)['\"](\.?\.?/[^'\"]+)['\"]"
-)
 
 _MAX_FILES = 6000
 _MAX_HOPS = 3
@@ -188,92 +172,6 @@ def _method_spans(lines: list[str]) -> list[tuple[int, int, str]]:
     return spans
 
 
-def _go_function_spans(lines: list[str]) -> list[tuple[int, int, str, str | None]]:
-    starts = [
-        (number, match.group(2), match.group(1))
-        for number, line in enumerate(lines, 1)
-        if (match := _GO_FUNC_DEF.match(line))
-    ]
-    return [
-        (
-            start,
-            starts[index + 1][0] - 1 if index + 1 < len(starts) else len(lines),
-            name,
-            receiver,
-        )
-        for index, (start, name, receiver) in enumerate(starts)
-    ]
-
-
-def _parse_go(path: Path, index: RouteIndex) -> None:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return
-    spans = _go_function_spans(lines)
-    for number, line in enumerate(lines, 1):
-        match = _GO_ROUTER.search(line)
-        if not match:
-            continue
-        function = next((span for span in spans if span[0] > number), None)
-        if function is None:
-            continue
-        start, end, method, receiver = function
-        index.routes.append(
-            Route(
-                file_path=str(path),
-                class_name=receiver,
-                method=method,
-                line=start,
-                end_line=end,
-                path=match.group(1),
-                http_methods=match.group(2).upper(),
-                declared_by="Go @Router annotation",
-            )
-        )
-
-
-def _js_function_spans(lines: list[str]) -> list[tuple[int, int, str]]:
-    starts = []
-    for number, line in enumerate(lines, 1):
-        match = _JS_FUNCTION.match(line)
-        if match:
-            starts.append((number, match.group(1) or match.group(2) or "anonymous"))
-    return [
-        (start, starts[index + 1][0] - 1 if index + 1 < len(starts) else len(lines), name)
-        for index, (start, name) in enumerate(starts)
-    ]
-
-
-def _parse_js(path: Path, index: RouteIndex) -> set[str]:
-    """Index Express registrations and return relative imported module stems."""
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return set()
-    route_lines = [number for number, line in enumerate(lines, 1) if _JS_ROUTE.search(line)]
-    for index_number, number in enumerate(route_lines):
-        match = _JS_ROUTE.search(lines[number - 1])
-        if not match:
-            continue
-        end = route_lines[index_number + 1] - 1 if index_number + 1 < len(route_lines) else len(lines)
-        start = number
-        # Function spans are intentionally broad for JavaScript; a named helper
-        # declared above a top-level router call must not be reported as the route.
-        method = f"{match.group(1).lower()} {match.group(2)}"
-        index.routes.append(Route(
-            file_path=str(path), class_name=None, method=method,
-            line=start, end_line=end, path=match.group(2),
-            http_methods=match.group(1).upper(), declared_by="Express route",
-        ))
-    return {
-        Path(value).stem
-        for line in lines
-        for match in _JS_IMPORT.finditer(line)
-        for value in [match.group(1)]
-    }
-
-
 def _args_after(lines: list[str], start: int, limit: int = 8) -> str:
     """The annotation's arguments, which routinely run over several lines."""
     return " ".join(lines[start - 1 : start - 1 + limit])
@@ -398,30 +296,19 @@ def build_index(roots: list[Path]) -> RouteIndex:
         root = Path(root)
         if not root.is_dir():
             continue
-        source_paths = [*root.rglob("*.php"), *root.rglob("*.go"),
-                        *root.rglob("*.js"), *root.rglob("*.jsx"),
-                        *root.rglob("*.ts"), *root.rglob("*.tsx")]
-        for path in source_paths:
+        for path in root.rglob("*.php"):
             if index.files_scanned >= _MAX_FILES:
                 log.warning("route index hit the %d-file budget; reachability may be incomplete", _MAX_FILES)
                 break
             if _SKIP_DIRS & set(path.parts):
                 continue
             index.files_scanned += 1
-            if path.suffix.lower() == ".php":
-                _parse_php(path, index)
-            elif path.suffix.lower() == ".go":
-                _parse_go(path, index)
-            else:
-                imported = _parse_js(path, index)
-                if imported:
-                    references[path.stem] = imported
+            _parse_php(path, index)
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            references.setdefault(path.stem, set()).update(
-                set(_REFERENCED.findall(text)) - {path.stem})
+            references[path.stem] = set(_REFERENCED.findall(text)) - {path.stem}
         _parse_yaml_routes(root, index)
     if index.routes:
         _build_perimeter(references, index)

@@ -7,11 +7,12 @@ pile last. No external assets so it can be attached to a ticket or emailed.
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import review
-from ..models import Priority, TriageRecord, VerdictLabel
+from ..models import TriageRecord, VerdictLabel
 from ..pipeline import TriageRun
 
 _TABLE_CSS = """
@@ -21,12 +22,10 @@ table.findings th{text-align:left;padding:8px 10px;border-bottom:2px solid #d0d7
 table.findings td{padding:8px 10px;border-bottom:1px solid #eaeef2;vertical-align:top}
 table.findings tr.yes{background:#fff5f5}
 table.findings tr.no{background:#f6fff8}
-table.findings tr.external{background:#f0f7ff}
 td.answer{font-weight:600;white-space:nowrap}
 td.answer.yes{color:#b32020}
 td.answer.no{color:#1a7f37}
 td.answer.maybe{color:#9a6700}
-td.answer.external{color:#0969da}
 table.findings .kind{color:#57606a;font-size:11px}
 table.findings .trace,table.findings .why{color:#3d444d;font-size:12px}
 table.findings .ext-cell{font-size:12px}
@@ -42,24 +41,13 @@ _COV_CSS = """
 .cov ul{margin:8px 0 8px 20px}
 """
 
-_ORDER = {
-    VerdictLabel.confirmed: 0,
-    VerdictLabel.unknown: 1,
-    VerdictLabel.external_fp: 2,
-    VerdictLabel.false_positive: 3,
-}
-_PRIORITY_ORDER = {
-    Priority.critical: 0,
-    Priority.high: 1,
-    Priority.medium: 2,
-    Priority.low: 3,
-}
+_ORDER = {VerdictLabel.confirmed: 0, VerdictLabel.unknown: 1, VerdictLabel.false_positive: 2}
 
 _CSS = """
 :root{--bg:#fff;--fg:#16181d;--muted:#666e7a;--line:#e3e6ea;--card:#fff;
---confirmed:#c0392b;--unknown:#b7791f;--external:#0969da;--fp:#2f855a;--accent:#2b6cb0}
+--confirmed:#c0392b;--unknown:#b7791f;--fp:#2f855a;--accent:#2b6cb0}
 @media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--muted:#98a1ae;
---line:#2a2f37;--card:#1b1e24;--confirmed:#ff6b5e;--unknown:#e2b33c;--external:#6aa9f0;--fp:#5fcf8e;--accent:#6aa9f0}}
+--line:#2a2f37;--card:#1b1e24;--confirmed:#ff6b5e;--unknown:#e2b33c;--fp:#5fcf8e;--accent:#6aa9f0}}
 *{box-sizing:border-box}
 body{margin:0;padding:2rem 1.25rem;background:var(--bg);color:var(--fg);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -75,10 +63,7 @@ summary{cursor:pointer;padding:.7rem .9rem;display:flex;gap:.6rem;align-items:ce
 summary::-webkit-details-marker{display:none}
 .badge{font-size:.7rem;font-weight:700;letter-spacing:.05em;padding:.15rem .5rem;border-radius:999px;
 border:1px solid currentColor;text-transform:uppercase;white-space:nowrap}
-.confirmed{color:var(--confirmed)}.unknown{color:var(--unknown)}.external_fp{color:var(--external)}.false_positive{color:var(--fp)}
-.priority{font-size:.7rem;font-weight:700;padding:.15rem .45rem;border-radius:4px;white-space:nowrap}
-.priority-critical{background:#8b0000;color:#fff}.priority-high{background:#b45309;color:#fff}
-.priority-medium{background:#facc15;color:#3b2f00}.priority-low{background:#d1fae5;color:#166534}
+.confirmed{color:var(--confirmed)}.unknown{color:var(--unknown)}.false_positive{color:var(--fp)}
 .path{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem;color:var(--muted);
 overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 .cwe{font-size:.78rem;font-weight:600;color:var(--accent)}
@@ -128,12 +113,6 @@ def _e(value: object) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
-def _tri_state(value: bool | None) -> str:
-    if value is None:
-        return "unknown"
-    return "true" if value else "false"
-
-
 _ROLE_ICON = {"source": "◉", "propagation": "→", "sanitizer": "🛡", "sink": "⌖"}
 
 
@@ -162,7 +141,6 @@ def _dataflow_html(v) -> str:
 _ANSWER = {
     "confirmed": ("да", "yes"),
     "unknown": ("не установлено", "maybe"),
-    "external_fp": ("митигировано извне", "external"),
     "false_positive": ("нет", "no"),
 }
 
@@ -187,12 +165,17 @@ def _where(r: TriageRecord) -> str:
 
 def _trace(r: TriageRecord) -> str:
     """What was actually followed, not what might exist."""
+    # The audit line first, when there is one: it says how the closure was
+    # checked, and a reviewer reading a closed row wants that before the trace.
+    audit = r.sca.audit if r.sca else ""
     if r.sca and r.sca.trace:
-        return _e(r.sca.trace)
+        return f"{_e(audit)}<br>{_e(r.sca.trace)}" if audit else _e(r.sca.trace)
+    if audit:
+        return _e(audit)
     steps = getattr(r.verdict, "dataflow", None) or []
     if steps:
         return "<br>".join(
-            _e(f"{s.location or 'location not reported'} {s.role.value}") for s in steps[:4])
+            _e(f"{s.location or 'unknown'} {s.role}") for s in steps[:4])
     if r.symbol_context:
         return "<br>".join(_e(s) for s in r.symbol_context[:3])
     return "—"
@@ -205,12 +188,6 @@ def _external_cell(r: TriageRecord) -> str:
     looked and found nothing" but "the answer is not here". A reviewer who sees
     it should know where to go, not merely that the tool gave up.
     """
-    if r.verdict.external_control:
-        control = r.verdict.external_control
-        return (
-            f'<span class="ext">{_e(control.control_id)}</span><br>'
-            f'{_e(control.why_effective)}'
-        )
     if not r.sca:
         return "—"
     if r.sca.owner:
@@ -221,22 +198,11 @@ def _external_cell(r: TriageRecord) -> str:
     return "—"
 
 
-def _priority_html(record: TriageRecord) -> str:
-    name = record.priority.value
-    return f'<span class="priority priority-{name.lower()}">{_e(name)}</span>'
-
-
 def _summary_table(run: TriageRun) -> str:
     """One row per finding, in the order a queue should be worked."""
-    rank = {"confirmed": 0, "unknown": 1, "external_fp": 2, "false_positive": 3}
-    ordered = sorted(
-        run.records,
-        key=lambda r: (
-            _PRIORITY_ORDER[r.priority],
-            rank.get(r.verdict.verdict.value, 3),
-            r.file_path or "",
-        ),
-    )
+    rank = {"confirmed": 0, "unknown": 1, "false_positive": 2}
+    ordered = sorted(run.records, key=lambda r: (rank.get(r.verdict.verdict.value, 3),
+                                                 r.file_path or ""))
     rows = []
     for r in ordered:
         answer, css = _ANSWER.get(r.verdict.verdict.value, ("—", "maybe"))
@@ -252,7 +218,6 @@ def _summary_table(run: TriageRun) -> str:
         rows.append(
             f"<tr class='{css}'>"
             f"<td>{what}<br><span class='kind'>{kind}</span></td>"
-            f"<td>{_priority_html(r)}</td>"
             f"<td class='answer {css}'>{answer}</td>"
             f"<td>{_where(r)}</td>"
             f"<td class='trace'>{_trace(r)}</td>"
@@ -262,7 +227,7 @@ def _summary_table(run: TriageRun) -> str:
         )
     return (
         '<h2>Находки</h2><table class="findings"><thead><tr>'
-        "<th>Что</th><th>Priority</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
+        "<th>Что</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
         "<th>Вне кода</th><th>Почему</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
     )
@@ -275,7 +240,6 @@ def _record_html(r: TriageRecord) -> str:
     parts = [
         f'<details><summary>'
         f'<span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
-        f'{_priority_html(r)}'
         f'<span class="cwe">{_e(r.cwe or "—")}</span>'
         f"{sym_summary}"
         f'<span class="path" title="{_e(r.file_path)}">{_e(r.file_path)}</span>'
@@ -325,25 +289,6 @@ def _record_html(r: TriageRecord) -> str:
             f"<h4>Certainty: {_e(v.confidence_band or '—')} ({v.confidence:.2f})</h4>"
             f"<p>{_e(v.confidence_rationale)}</p>"
         )
-    if v.external_control:
-        parts.append(
-            f"<h4>External compensating control</h4>"
-            f'<p><code class="sym">{_e(v.external_control.control_id)}</code><br>'
-            f"{_e(v.external_control.why_effective)}</p>"
-        )
-    if r.sast_reachability:
-        gate = r.sast_reachability
-        parts.append(
-            f"<h4>SAST reachability gate: {_e(gate.status)}</h4>"
-            f"<p>{_e(gate.detail)}"
-            + (f"<br>route: <code>{_e(gate.route)}</code>" if gate.route else "")
-            + "</p>"
-        )
-    if r.priority_reasons:
-        reasons = "".join(f"<li>{_e(reason)}</li>" for reason in r.priority_reasons)
-        parts.append(
-            f"<h4>Priority: {_e(r.priority.value)} ({r.priority_score}/100)</h4><ul>{reasons}</ul>"
-        )
     if v.verdict.value == "unknown" and v.blocking_question:
         parts.append(
             f'<h4>What would settle this</h4><p class="blocking">{_e(v.blocking_question)}</p>'
@@ -360,27 +305,6 @@ def _record_html(r: TriageRecord) -> str:
         parts.append(f"<h4>Post-validation overrides (model said: {original})</h4>{blocks}")
     if r.error:
         parts.append(f"<h4>Error</h4><pre>{_e(r.error)}</pre>")
-    if r.sca and r.sca.resolution_error:
-        parts.append(
-            f"<h4>SCA symbol resolution error</h4><pre>{_e(r.sca.resolution_error)}</pre>"
-        )
-    if r.sca and (r.sca.dependency_paths or r.sca.source_url or r.sca.bridge_hops):
-        paths = "\n".join(f"app -> {path}" for path in r.sca.dependency_paths)
-        source = ""
-        if r.sca.source_url:
-            source = (
-                f"<p><code>{_e(r.sca.package)}@{_e(r.sca.source_version)}</code><br>"
-                f"{_e(r.sca.source_url)}<br>cache: {_e(r.sca.source_cache_status)}"
-                + (f"<br>sha256: <code>{_e(r.sca.source_sha256)}</code>" if r.sca.source_sha256 else "")
-                + "</p>"
-            )
-        hops = "\n".join(r.sca.bridge_hops)
-        parts.append(
-            f"<h4>Dependency paths: {_e(r.sca.bridge_status or 'unresolved')}</h4>"
-            + (f"<pre>{_e(paths)}</pre>" if paths else "")
-            + source
-            + (f"<pre>{_e(hops)}</pre>" if hops else "")
-        )
 
     meta = [
         f"class: {_e(v.evidence_class.value)}",
@@ -436,15 +360,10 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
         ("Model triaged", run.triaged_count, ""),
         ("Confirmed", counts["confirmed"], "confirmed"),
         ("Unknown", counts["unknown"], "unknown"),
-        ("External mitigated", counts["external_fp"], "external_fp"),
-        ("Auto-closed", counts["false_positive"] + counts["external_fp"], "false_positive"),
+        ("Auto-closed", counts["false_positive"], "false_positive"),
         ("Needs a human", review, ""),
         ("Noise removed", f'{100 * counts["false_positive"] / total:.0f}%', ""),
         ("Out of scope", scoped_out, ""),
-    ]
-    cards += [
-        (priority.value, sum(1 for record in run.records if record.priority is priority), "")
-        for priority in Priority
     ]
     cards_html = "".join(
         f'<div class="card"><div class="n {cls}">{_e(n)}</div><div class="l">{_e(label)}</div></div>'
@@ -453,38 +372,18 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
 
     by_cwe: dict[str, dict[str, int]] = {}
     for r in run.records:
-        b = by_cwe.setdefault(
-            r.cwe or "unclassified",
-            {"confirmed": 0, "unknown": 0, "external_fp": 0, "false_positive": 0},
-        )
+        b = by_cwe.setdefault(r.cwe or "unclassified", {"confirmed": 0, "unknown": 0, "false_positive": 0})
         b[r.verdict.verdict.value] += 1
     rows = "".join(
         f"<tr><td>{_e(cwe)}</td><td>{b['confirmed']}</td><td>{b['unknown']}</td>"
-        f"<td>{b['external_fp']}</td><td>{b['false_positive']}</td><td>{sum(b.values())}</td></tr>"
+        f"<td>{b['false_positive']}</td><td>{sum(b.values())}</td></tr>"
         for cwe, b in sorted(by_cwe.items(), key=lambda kv: -sum(kv[1].values()))
     )
 
-    ordered = sorted(
-        run.records,
-        key=lambda r: (
-            _PRIORITY_ORDER[r.priority],
-            _ORDER[r.verdict.verdict],
-            -r.verdict.confidence,
-        ),
-    )
+    ordered = sorted(run.records, key=lambda r: (_ORDER[r.verdict.verdict], -r.verdict.confidence))
     findings_html = "".join(_record_html(r) for r in ordered)
 
     coverage_html = _coverage_html(run)
-    risk = run.risk_context or (run.records[0].risk_context if run.records else None)
-    risk_html = ""
-    if risk is not None:
-        risk_html = (
-            '<p class="note"><strong>Runtime risk context:</strong> '
-            f"internet={_e(_tri_state(risk.internet_exposed))} · "
-            f"auth-required={_e(_tri_state(risk.auth_required))} · "
-            f"business-critical={_e(_tri_state(risk.business_critical))} · "
-            "Kubernetes / restricted egress / shared Nginx LB.</p>"
-        )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -497,10 +396,9 @@ model <strong>{_e(run.model)}</strong> · prompts <strong>{_e(run.prompt_pack)}<
 {overridden} verdict(s) corrected by post-validation ·
 cost ${run.total_cost_usd:.4f}</p>
 {coverage_html}
-{risk_html}
 <div class="cards">{cards_html}</div>
 <h2>By CWE</h2>
-<table><thead><tr><th>CWE</th><th>Confirmed</th><th>Unknown</th><th>External</th><th>Closed</th><th>Total</th></tr></thead>
+<table><thead><tr><th>CWE</th><th>Confirmed</th><th>Unknown</th><th>Closed</th><th>Total</th></tr></thead>
 <tbody>{rows}</tbody></table>
 {_summary_table(run)}
 <h2>Findings — highest priority first</h2>

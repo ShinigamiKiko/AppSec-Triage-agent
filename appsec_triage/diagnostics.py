@@ -63,7 +63,6 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     _doctor_sca()
     _doctor_php()
-    _doctor_go()
     _doctor_lsp()
     return 0 if ok else 1
 
@@ -116,18 +115,6 @@ def _doctor_php() -> None:
     except (ConfigError, KeyError) as exc:
         print(f"  psalm (taint): unavailable — {exc}")
     print("  note: Psalm needs `composer install`/`dump-autoload` in the target (work on a copy).")
-
-
-def _doctor_go() -> None:
-    """Go's three mandatory analysis legs must be visible as one contract."""
-    print("go toolchain (all required: gopls + CodeQL + govulncheck symbol scan):")
-    for name in ("codeql", "govulncheck"):
-        try:
-            print(f"  {name}: {scanners.build_scanner(name).available()}")
-        except (ConfigError, KeyError) as exc:
-            print(f"  {name}: unavailable — {exc}")
-    gopls = shutil.which("gopls")
-    print(f"  gopls (LSP): {'ok (' + gopls + ')' if gopls else 'MISSING — Go triage cannot resolve callers'}")
 
 
 def _doctor_lsp() -> None:

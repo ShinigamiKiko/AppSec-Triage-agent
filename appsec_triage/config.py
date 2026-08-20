@@ -88,6 +88,10 @@ class ProviderConfig:
     concurrency: int = 4
 
     pricing: dict[str, float] = field(default_factory=dict)
+    # A ceiling for one run, not a target. The optional steps check it before
+    # spending, so a project that would otherwise cost unbounded model calls
+    # stops and says so instead of billing on.
+    budget_usd: float = 1.0
     keep_raw_response: bool = False
 
     options: dict[str, Any] = field(default_factory=dict)
@@ -121,7 +125,6 @@ class PostValidationConfig:
     confirmed_confidence_floor: float = 0.75
     escalate_severities: list[str] = field(default_factory=lambda: ["critical", "high"])
     closure_requires_named_defence_above: int = 0
-    require_sast_reachability: bool = True
 
 
 @dataclass(slots=True)
@@ -241,6 +244,14 @@ class PipelineConfig:
     deployment_config: str | None = None
     resolve_vulnerable_symbols: bool = False
     nvd_api_key: str | None = None
+    # `govulncheck -format json` output from a neighbouring pipeline job. Optional:
+    # it is the only source that answers reachability from a real call graph, and
+    # without it the chain falls back to its own approximations.
+    govulncheck_report: str | None = None
+    # Where the SAST phase wrote its scanner output, including the CodeQL
+    # databases it no longer deletes. Both phases run in one container against
+    # one source tree, so the database describes exactly the code being triaged.
+    scan_out_dir: str | None = None
 
 
 def load_provider_config(name: str, *, config_dir: Path | None = None) -> ProviderConfig:

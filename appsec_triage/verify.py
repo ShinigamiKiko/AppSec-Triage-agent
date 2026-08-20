@@ -96,7 +96,7 @@ def should_challenge(record: TriageRecord, cfg: VerificationConfig) -> bool:
         return True
     if (
         cfg.challenge_closures_above_consequence
-        and record.verdict.verdict in (VerdictLabel.false_positive, VerdictLabel.external_fp)
+        and record.verdict.verdict is VerdictLabel.false_positive
         and consequence_weight(record.cwe) >= cfg.challenge_closures_above_consequence
     ):
         return True

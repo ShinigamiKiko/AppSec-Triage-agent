@@ -32,11 +32,10 @@ VERDICT_SCHEMA: dict[str, Any] = {
         "reason",
         "missing_information",
         "blocking_question",
-        "external_control",
         "requires_human_review",
     ],
     "properties": {
-        "verdict": {"type": "string", "enum": ["confirmed", "false_positive", "external_fp", "unknown"]},
+        "verdict": {"type": "string", "enum": ["confirmed", "false_positive", "unknown"]},
         "evidence_class": {
             "type": "string",
             "enum": [
@@ -138,19 +137,6 @@ VERDICT_SCHEMA: dict[str, Any] = {
                 "settle it, phrased so a human knows exactly which file or function to open. "
                 "Must be specific to the code you were shown. Null for any other verdict."
             ),
-        },
-        "external_control": {
-            "type": ["object", "null"],
-            "description": (
-                "Required only for `external_fp`: identify the exact verified compensating control "
-                "listed in the input. Null for all other verdicts."
-            ),
-            "additionalProperties": False,
-            "required": ["control_id", "why_effective"],
-            "properties": {
-                "control_id": {"type": "string"},
-                "why_effective": {"type": "string"},
-            },
         },
         "requires_human_review": {"type": "boolean"},
     },
@@ -265,14 +251,6 @@ def _build(data: object) -> Verdict:
         sym["kind"] = kind if kind in valid else "api_call"
         if not sym.get("name"):
             data["vulnerable_symbol"] = None
-    if isinstance(data.get("external_control"), dict):
-        control = data["external_control"]
-        control_keys = set(VERDICT_SCHEMA["properties"]["external_control"]["properties"])
-        for key in list(control):
-            if key not in control_keys:
-                del control[key]
-        if not control.get("control_id"):
-            data["external_control"] = None
     if isinstance(data.get("evidence"), list):
         data["evidence"] = [
             {"quote": e["quote"], "why": str(e.get("why") or e.get("explanation") or "")}

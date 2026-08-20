@@ -31,10 +31,6 @@ def probe_all() -> dict[str, Availability]:
 
 
 def scan_all(target: Path, scanners: list[str], out_dir: Path, on_start=None) -> list[ScanResult]:
-    scanners = list(scanners)
-    if "govulncheck" in scanners and "codeql" in scanners:
-        scanners.remove("govulncheck")
-        scanners.insert(scanners.index("codeql"), "govulncheck")
     results: list[ScanResult] = []
     for name in scanners:
         if on_start:

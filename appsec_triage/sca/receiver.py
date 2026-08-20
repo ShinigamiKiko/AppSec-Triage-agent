@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from . import container as container_mod
 from .presence import Hit, PresenceResult, SymbolPresence
+from ..prompts import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..lsp.service import LSPService
@@ -42,6 +43,16 @@ class Resolution:
     asked: int = 0
     answered: int = 0
     detail: str = ""
+    settled: bool = False
+    """This answer decides the question; nothing further should be consulted."""
+    disproved: bool = False
+    """The server resolved every call site, and none lands in the flawed package.
+
+    A positive fact, not an absence: the receiver's type is known and it is a
+    different type. `json.NewDecoder(...).Decode(x)` matches an advisory about
+    `pgx.Bind.Decode` by name alone, and only a resolver can say the receiver is
+    `encoding/json`'s decoder — which settles the finding rather than doubting it.
+    """
 
 
 def _definition_class(location: dict, path_map: dict[str, str] | None = None) -> tuple[str, str]:
@@ -107,25 +118,7 @@ def _by_configuration(
     return None
 
 
-SYSTEM = """You decide one thing: does this call land on the class named below?
-
-You are shown a call site, the file it lives in, and any service configuration
-that mentions the class or the property. Real applications hide the concrete
-class behind interfaces, containers, factories and magic accessors — that is
-exactly why a type resolver could not answer, and why you are being asked.
-
-Answer `yes` only when something in the material shows it. A property declared
-as an interface that the configuration binds to this class is a yes. A property
-declared as an unrelated class is a no. Anything else is `unknown`, and unknown
-is a perfectly good answer — a wrong `yes` invents a vulnerability, a wrong `no`
-hides one.
-
-`evidence` must be one line copied character-for-character from the material
-above. Not paraphrased, not reconstructed. An answer whose quote does not appear
-verbatim is discarded, so quote something real or answer `unknown`.
-
-Return one JSON object:
-{"verdict": "yes|no|unknown", "evidence": "...", "why": "..."}"""
+SYSTEM = registry.step("receiver")
 
 _SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -236,6 +229,7 @@ def resolve(
     package: str = "",
     wiring=None,
     client=None,
+    package_dir: Path | None = None,
 ) -> Resolution:
     """Turn `CALL_UNCONFIRMED` into a decision where something can settle it."""
     if result.presence is not SymbolPresence.CALL_UNCONFIRMED:
@@ -247,22 +241,64 @@ def resolve(
     if settled is not None:
         return settled
 
-    settled = _by_model(result, Path(root), klass, package, wiring, client)
-    if settled is not None:
-        return settled
+    # The language server before the model, not after. Both answer the same
+    # question — which class the receiver has — but the server reads the code and
+    # the model guesses, and a guess that runs first makes the answer change from
+    # run to run: measured on a Go project, the same finding came back `actual`
+    # in one run and `no_direct_call` in the next because the model, not gopls,
+    # was deciding. Deterministic evidence leads; the model only fills the gap
+    # the server leaves.
+    answer = _by_lsp(result, lsp, Path(root), klass, package, package_dir)
+    if answer.settled:
+        return answer
 
+    # The server could not say; `answer` carries why, and stays the fallback so
+    # that reason reaches the report when the model cannot say either.
+    return _by_model(result, Path(root), klass, package, wiring, client) or answer
+
+
+def _inside(where: str, directory: Path | None) -> bool:
+    """Is this definition inside the flawed package's own installed tree?"""
+    if directory is None or not where:
+        return False
+    try:
+        Path(where).resolve().relative_to(Path(directory).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _by_lsp(
+    result: PresenceResult, lsp: "LSPService | None", root: Path, klass: str,
+    package: str, package_dir: Path | None = None,
+) -> Resolution:
+    """Resolve the receiver by asking the language server for the definition.
+
+    Where the definition *lands* is the test, not what the file is called. A
+    method name is shared across libraries — `Decode`, `Append`, `Receive` — so
+    the only question that separates them is whether the resolved definition sits
+    inside the flawed package's own tree. Measured: five call sites matching an
+    advisory about `pgx.Bind.Decode` all resolved into `encoding/json`, which the
+    file-stem comparison could only call "another class", and which the location
+    test calls what it is — a different library.
+
+    Always returns a `Resolution`; `settled` says whether it decides the question
+    or is merely the record of why the server could not answer.
+    """
     if lsp is None:
         return Resolution(result, detail="языковой сервер не подключён")
 
-    root = Path(root)
     matched: list[Hit] = []
     elsewhere: list[str] = []
+    considered = 0
+    resolved_away = 0
     asked = answered = 0
 
     for hit in result.hits[:_MAX_HITS]:
         language = lsp.cfg.language_for(hit.file)
         if not language:
             continue
+        considered += 1
         client = lsp._client(language)  # noqa: SLF001 - the single accessor
         if client is None:
             return Resolution(result, asked,
@@ -271,7 +307,13 @@ def resolve(
         path = root / hit.file
         try:
             client.open_document(path, language)
-            locations = client.definition(path, hit.line - 1, max(hit.column, 0)) or []
+            # `definition` takes a 1-indexed line and converts it itself, the
+            # same as every other caller. Subtracting here as well asked the
+            # server about the line *above* the call, where the column usually
+            # lands on nothing — measured as "asked 8 times, zero definitions",
+            # which reads as a server that cannot resolve rather than a question
+            # about the wrong place.
+            locations = client.definition(path, hit.line, max(hit.column, 0)) or []
         except Exception as exc:  # noqa: BLE001 - one dead request, not the run
             log.debug("definition failed at %s:%s: %s", hit.file, hit.line, exc)
             continue
@@ -281,23 +323,50 @@ def resolve(
             continue
         answered += 1
         path_map = lsp._path_map_for(language)  # noqa: SLF001
+        landed_away = False
         for location in locations:
             name, where = _definition_class(location, path_map)
             if not name:
                 continue
             if Path(where).resolve() == (root / hit.file).resolve():
+                # The server handed back the call site itself. Measured on
+                # symfony/demo: that is the shape of "could not resolve", not
+                # evidence about the type, so it must not count toward a closure.
                 continue
-            if name.lower() == klass.lower():
+            # A definition inside the flawed package proves the receiver's type;
+            # the class-name comparison stays as a fallback for the ecosystems
+            # where the file is named after the class it declares.
+            if _inside(where, package_dir) or name.lower() == klass.lower():
                 matched.append(hit)
+                landed_away = False
                 break
+            landed_away = True
             elsewhere.append(f"{hit} -> {name} ({Path(where).name})")
+        if landed_away:
+            resolved_away += 1
 
     if matched:
         return Resolution(
             PresenceResult(SymbolPresence.CALLED, result.symbol, matched,
                            result.files_scanned, result.truncated,
                            detail=f"языковой сервер подтвердил класс {klass} в месте вызова"),
-            asked, answered, detail=f"разрешено определений: {answered} из {asked}")
+            asked, answered, settled=True,
+            detail=f"разрешено определений: {answered} из {asked}")
+
+    # Disproved only when nothing was left unanswered: every call site the server
+    # was asked about resolved, and every one landed outside the flawed package.
+    # A single unresolved site keeps the finding open — a partial answer cannot
+    # rule out that the one site we could not read is the real call.
+    complete = considered and asked == considered and answered == considered
+    if elsewhere and complete and resolved_away == considered and package_dir is not None:
+        return Resolution(
+            PresenceResult(SymbolPresence.ABSENT, result.symbol, [],
+                           result.files_scanned, result.truncated,
+                           detail=(f"языковой сервер разрешил все {considered} совпадени(й): "
+                                   f"получатель принадлежит другому типу, не {package} "
+                                   f"({'; '.join(elsewhere[:2])})")),
+            asked, answered, settled=True, disproved=True,
+            detail=f"все {considered} мест(а) разрешены вне {package}")
 
     if elsewhere:
         return Resolution(
@@ -306,7 +375,8 @@ def resolve(
                            detail=(f"{result.detail}; языковой сервер привёл в другие классы "
                                    f"({'; '.join(elsewhere[:2])}) — это довод против, "
                                    f"но не доказательство")),
-            asked, answered, detail="определения ведут в другие классы")
+            asked, answered, settled=True,
+            detail="определения ведут в другие классы")
 
     if not asked:
         reason = "языковой сервер не отвечал по этим файлам"

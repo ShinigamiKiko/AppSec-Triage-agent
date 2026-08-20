@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 from .config import TriageQueueConfig
 from .consequence import CWE_WEIGHT as _CWE_WEIGHT, DEFAULT_WEIGHT as _DEFAULT_CWE_WEIGHT
-from .models import Finding, Priority, RiskContext, Severity, TriageRecord, VerdictLabel
+from .models import Finding, TriageRecord, VerdictLabel
 
 _SEVERITY_WEIGHT = {"critical": 12, "high": 9, "medium": 5, "low": 2, "info": 0, "unknown": 4}
 
@@ -54,7 +54,6 @@ class QueueItem:
 
     record: TriageRecord
     score: int
-    priority: Priority
     reasons: list[str] = field(default_factory=list)
     cluster: list[TriageRecord] = field(default_factory=list)
     deferred: bool = False
@@ -72,7 +71,6 @@ class QueueItem:
         return {
             "finding_id": self.record.finding_id,
             "score": self.score,
-            "priority": self.priority.value,
             "deferred": self.deferred,
             "exempt_from_budget": self.exempt,
             "cluster_size": self.cluster_size,
@@ -108,12 +106,9 @@ def score(record: TriageRecord, finding: Finding | None = None) -> tuple[int, li
     reasons: list[str] = []
     verdict = record.verdict
 
-    base = {
-        VerdictLabel.confirmed: 45,
-        VerdictLabel.unknown: 28,
-        VerdictLabel.false_positive: 3,
-        VerdictLabel.external_fp: 0,
-    }[verdict.verdict]
+    base = {VerdictLabel.confirmed: 45, VerdictLabel.unknown: 28, VerdictLabel.false_positive: 3}[
+        verdict.verdict
+    ]
     total = base
     reasons.append(f"verdict `{verdict.verdict.value}` (+{base})")
 
@@ -121,18 +116,15 @@ def score(record: TriageRecord, finding: Finding | None = None) -> tuple[int, li
     total += cwe_w
     reasons.append(f"{record.cwe or 'unclassified'} consequence weight (+{cwe_w})")
 
-    severity = finding.severity if finding is not None else record.scanner_severity
-    if finding is not None or severity is not Severity.unknown:
-        sev_w = _SEVERITY_WEIGHT.get(severity.value, 4)
+    if finding is not None:
+        sev_w = _SEVERITY_WEIGHT.get(finding.severity.value, 4)
         total += sev_w
-        reasons.append(f"scanner severity {severity.value} (+{sev_w})")
+        reasons.append(f"scanner severity {finding.severity.value} (+{sev_w})")
 
-    path = (
-        finding.code_context.file_path if finding is not None else record.file_path
-    ).replace("\\", "/").lower()
-    if re.search(r"(^|/)(tests?|spec|docs?|examples?|fixtures?|vendor|node_modules)/", path):
-        total -= 12
-        reasons.append("non-production path (-12)")
+        path = finding.code_context.file_path.replace("\\", "/").lower()
+        if re.search(r"(^|/)(tests?|spec|docs?|examples?|fixtures?|vendor|node_modules)/", path):
+            total -= 12
+            reasons.append("non-production path (-12)")
 
     for sig_name in _ALWAYS_REVIEW_SIGNALS:
         if any(sig_name in o for o in record.overrides):
@@ -164,78 +156,7 @@ def score(record: TriageRecord, finding: Finding | None = None) -> tuple[int, li
             total += bonus
             reasons.append(f"impact {verdict.impact} (+{bonus})")
 
-    if not verdict.verdict.is_closed:
-        total = _apply_risk_context(total, reasons, record.risk_context, record.cwe)
-
     return max(0, min(100, total)), reasons
-
-
-def _apply_risk_context(total: int, reasons: list[str], risk: RiskContext, cwe: str | None) -> int:
-    if risk.internet_exposed is True:
-        total += 15
-        reasons.append("service is internet exposed (+15)")
-    elif risk.internet_exposed is False:
-        total -= 10
-        reasons.append("service is not internet exposed (-10)")
-    else:
-        reasons.append("internet exposure unknown (+0)")
-
-    if risk.auth_required is False:
-        total += 10
-        reasons.append("authentication is not required (+10)")
-    elif risk.auth_required is True:
-        total -= 5
-        reasons.append("authentication is required (-5)")
-    else:
-        reasons.append("authentication requirement unknown (+0)")
-
-    if risk.business_critical is True:
-        total += 15
-        reasons.append("service is business critical (+15; minimum High)")
-    elif risk.business_critical is False:
-        total -= 3
-        reasons.append("service is not business critical (-3)")
-    else:
-        reasons.append("business criticality unknown (+0)")
-
-    if risk.egress_restricted and (cwe or "").upper() == "CWE-918":
-        total -= 6
-        reasons.append("Kubernetes egress is restricted; SSRF blast radius is reduced, not removed (-6)")
-    if risk.shared_ingress:
-        reasons.append("shared nginx ingress/load balancer is routing only (+0)")
-    return total
-
-
-def priority_for(score_value: int, record: TriageRecord) -> Priority:
-    if record.verdict.verdict.is_closed:
-        return Priority.low
-    if score_value >= 75:
-        priority = Priority.critical
-    elif score_value >= 55:
-        priority = Priority.high
-    elif score_value >= 30:
-        priority = Priority.medium
-    else:
-        priority = Priority.low
-    if record.risk_context.business_critical is True and priority in (Priority.medium, Priority.low):
-        return Priority.high
-    return priority
-
-
-def assign_priority(
-    record: TriageRecord,
-    finding: Finding | None = None,
-    risk_context: RiskContext | None = None,
-) -> TriageRecord:
-    if risk_context is not None:
-        record = record.model_copy(update={"risk_context": risk_context})
-    value, reasons = score(record, finding)
-    priority = priority_for(value, record)
-    if record.risk_context.business_critical is True and priority is Priority.high and value < 55:
-        reasons.append("business-critical floor raised priority to High")
-    return record.model_copy(
-        update={"priority": priority, "priority_score": value, "priority_reasons": reasons}
-    )
 
 
 def is_exempt(record: TriageRecord) -> bool:
@@ -252,7 +173,6 @@ class Queue:
     items: list[QueueItem]
     total_findings: int
     budget_pct: float
-    external_closed: int = 0
     overflowed: bool = False
 
     @property
@@ -280,12 +200,8 @@ class Queue:
         finding with no named remediation still needs someone to work out what
         to do about it. These are the ones that cost thinking time.
         """
-        return [
-            i for i in self.to_review
-            if not i.record.verdict.verdict.is_closed
-            and (i.record.verdict.verdict is not VerdictLabel.confirmed
-                 or i.record.verdict.requires_human_review)
-        ]
+        return [i for i in self.to_review if i.record.verdict.verdict is not VerdictLabel.confirmed
+                or i.record.verdict.requires_human_review]
 
     @property
     def to_do(self) -> list["QueueItem"]:
@@ -310,7 +226,6 @@ class Queue:
             "budget_overflowed": self.overflowed,
             "deferred_items": len(self.deferred),
             "clusters_collapsed": sum(i.cluster_size - 1 for i in self.items),
-            "external_ai_closed": self.external_closed,
         }
 
 
@@ -322,15 +237,9 @@ def build(
     findings = findings or {}
 
     live = [r for r in records if r.decided_by != "scope"]
-    candidates = [
-        r
-        for r in live
-        if not r.verdict.verdict.is_closed
-        or (r.verdict.verdict is VerdictLabel.false_positive and is_exempt(r))
-    ]
 
     groups: dict[tuple, list[TriageRecord]] = {}
-    for record in candidates:
+    for record in live:
         key = cluster_key(record, findings.get(record.finding_id)) if cfg.cluster else (record.finding_id,)
         groups.setdefault(key, []).append(record)
 
@@ -348,7 +257,6 @@ def build(
             QueueItem(
                 record=representative,
                 score=best_score,
-                priority=priority_for(best_score, representative),
                 reasons=reasons,
                 cluster=rest,
                 exempt=any(is_exempt(r) for r in members),
@@ -378,8 +286,5 @@ def build(
         items=items,
         total_findings=len(live),
         budget_pct=cfg.review_budget_pct,
-        external_closed=sum(
-            1 for record in live if record.verdict.verdict is VerdictLabel.external_fp
-        ),
         overflowed=exempt_spend > allowed,
     )

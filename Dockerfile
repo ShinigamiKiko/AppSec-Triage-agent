@@ -27,8 +27,8 @@ ARG CODEQL_BUNDLE_TAG=codeql-bundle-v2.25.6
 # Go >= 1.26, and with GOTOOLCHAIN=local the build fails outright instead of
 # quietly pulling a newer toolchain. Bump this when gopls raises its floor.
 ARG GO_VERSION=1.26.5
-ARG GOVULNCHECK_VERSION=v1.6.0
 ARG GITLEAKS_VERSION=8.21.2
+ARG TRIVY_VERSION=0.70.0
 ARG SEMGREP_VERSION=1.168.0
 ARG BANDIT_VERSION=1.9.4
 ARG PYLSP_VERSION=1.15.0
@@ -74,12 +74,9 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
     && go version
 
 # --- language servers ---------------------------------------------------------
-# gopls (Go) and govulncheck symbol reachability — installed into /root/go/bin.
+# gopls (Go) — installed into /root/go/bin (on PATH).
 ARG GOPLS_VERSION=v0.23.0
-RUN go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" \
-    && go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" \
-    && gopls version \
-    && govulncheck -version
+RUN go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" && gopls version
 
 # typescript-language-server (+ the tsserver it wraps) for .ts/.tsx/.js/.jsx.
 RUN npm install -g typescript typescript-language-server \
@@ -115,6 +112,14 @@ RUN curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEA
         -o /tmp/gitleaks.tgz \
     && tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks && rm /tmp/gitleaks.tgz \
     && gitleaks version
+
+# trivy (SCA/misconfig) — official installer, pinned.
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+        | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}" \
+    && trivy --version
+# NOTE: trivy downloads its vulnerability DB on first run. In an air-gapped CI,
+# pre-warm it in a build layer (`trivy fs --download-db-only /`) or mount a cache
+# volume — otherwise the first job needs egress to ghcr.io.
 
 # CodeQL bundle (CLI + standard query packs). Large layer.
 RUN curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODEQL_BUNDLE_TAG}/codeql-bundle-linux64.tar.gz" \

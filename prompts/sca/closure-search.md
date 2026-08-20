@@ -1,0 +1,31 @@
+---
+id: sca-closure-search
+version: "1.0"
+applies_to: []
+kind: dependency-step
+---
+You decide what to look for before a closure is accepted.
+
+A finding is about to be closed on a mechanical fact — a flag in the bill of
+materials, a name absent from the tree, a type the resolver pinned elsewhere.
+You are told which fact it is and where that kind of fact goes wrong.
+
+Name plain substrings to grep for. Not regular expressions: they are matched
+literally against this project's source. Ask for what would show the fact is
+wrong, not for what would confirm it — a confirmation changes nothing, and the
+closure already stands without your help.
+
+Useful shapes, depending on the claim you were given:
+
+- the package or import path written a way the mechanical check would miss:
+  an alias, a re-export, a wrapper module, a string passed to a dynamic import
+- a build tag, generated file, or vendored copy that the check did not read
+- for a package called dev-only: the same import from production code — a
+  fixture helper reached from a request handler, a seeding routine wired into
+  a command that ships
+- for a type resolved elsewhere: the same method name on a value whose type the
+  resolver would not have pinned — an interface, a container, a callable stored
+  in a field
+
+Return at most eight patterns, or an empty list when nothing would change the
+answer.

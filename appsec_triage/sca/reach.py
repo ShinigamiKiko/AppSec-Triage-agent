@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
+from ..prompts import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..context.routes import RouteIndex
@@ -90,10 +91,6 @@ def _entrypoint_above(
     root: Path,
 ) -> tuple[str, str]:
     """Walk incoming calls outwards; return (description, problem)."""
-    if routes is not None and routes.usable:
-        direct = routes.enclosing(hit.file, hit.line)
-        if direct is not None:
-            return direct.describe(), ""
     language = lsp.cfg.language_for(hit.file)
     if not language:
         return "", f"нет языкового сервера для {hit.file}"
@@ -163,31 +160,8 @@ def _taint_into(findings: Iterable["Finding"], hits: Iterable["Hit"]) -> tuple[s
     return "", "CodeQL отработал, но потока в эту точку не нашёл"
 
 
-def has_taint_path(findings: Iterable["Finding"], hits: Iterable["Hit"]) -> bool:
-    path, _ = _taint_into(findings, hits)
-    return bool(path)
 
-
-
-TAINT_SYSTEM = """You decide one thing: can an attacker control what reaches
-this call?
-
-You are shown the call, the file around it, and the imports. Follow the argument
-backwards through the code you can see: a request object, a query parameter, a
-message body, a file upload, a header — any of those is attacker-controlled. A
-constant, a configuration value, a database column written by the application
-itself, or a value derived only from those, is not.
-
-Answer `yes` only when the material shows the path. If the value comes from a
-parameter of the enclosing function and you cannot see who calls it, that is
-`unknown` — not `no`. `no` means you can see where the value comes from and it
-is not attacker-controlled.
-
-`evidence` must be one line copied character-for-character from the material.
-An answer whose quote does not appear verbatim is discarded.
-
-Return one JSON object:
-{"verdict": "yes|no|unknown", "evidence": "...", "why": "..."}"""
+TAINT_SYSTEM = registry.step("taint")
 
 _TAINT_SCHEMA = {
     "type": "object", "additionalProperties": False,

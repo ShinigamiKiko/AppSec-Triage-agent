@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 _WS = re.compile(r"\s+")
 
-REDO_CLASSES = ("unknown", "error", "overridden", "confirmed", "false_positive", "external_fp", "all", "none")
+REDO_CLASSES = ("unknown", "error", "overridden", "confirmed", "false_positive", "all", "none")
 
 DEFAULT_REDO = ("unknown", "error", "overridden")
 

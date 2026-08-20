@@ -6,15 +6,17 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 
-from . import ingest, prioritize, review as review_mod, reuse as reuse_mod, risk as risk_ctx, scanners
+from . import ingest, prioritize, review as review_mod, reuse as reuse_mod, scanners
 from .config import (
     ConfigError,
     load_lsp_config,
     list_providers,
+    list_scanners,
     load_pipeline_config,
     load_provider_config,
 )
@@ -27,7 +29,8 @@ from .prompts import registry
 from . import coverage as coverage_report
 from .diagnostics import cmd_doctor
 from .report import audit, html
-from .scanners.selection import scanners_for_target
+from .scanners import tools as scanner_tools
+from .scanners.selection import scanners_for_target, usable_scanners
 
 
 _PROGRESS_STATE: dict[str, float] = {}
@@ -55,12 +58,18 @@ def _progress(done: int, total: int) -> None:
         print(f"\n  {done}/{total} done · {elapsed / 60:.0f} min elapsed{tail}", file=sys.stderr, flush=True)
 
 
+# Dependency outcomes where a call was actually established, as opposed to
+# merely not ruled out. Everything else a model leaves `confirmed` is a finding
+# nothing could close, which is a queue for a person, not a proven vulnerability.
+_PROVEN_OUTCOMES = {"actual", "present"}
+
+
 def _gate_count(fail_on: str, counts: dict[str, int]) -> int | None:
     """How many findings trip the `--fail-on` CI gate, or None when the gate is off.
 
     `confirmed` counts confirmed vulns; `review` also counts `unknown`, since an
     abstention is precisely a finding a human still has to resolve. Closed
-    (`false_positive` and AI-closed `external_fp`) verdicts never gate.
+    (false_positive) verdicts never gate — that is the noise the tool removed.
     A return of 0 means the gate is on but clean.
     """
     if fail_on == "none":
@@ -82,6 +91,10 @@ def _run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source
         cfg.max_workers = args.workers
     if getattr(args, "resolve_symbols", False):
         cfg.resolve_vulnerable_symbols = True
+    if getattr(args, "govulncheck", None):
+        cfg.govulncheck_report = str(args.govulncheck)
+    if getattr(args, "scan_dir", None):
+        cfg.scan_out_dir = str(args.scan_dir)
     if os.environ.get("NVD_API_KEY"):
         cfg.nvd_api_key = os.environ["NVD_API_KEY"]
 
@@ -91,7 +104,6 @@ def _run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source
     findings = ingest.load(findings_path)
     if getattr(args, "limit", None):
         findings = findings[: args.limit]
-    all_findings_by_id = {finding.finding_id: finding for finding in findings}
 
     print(f"→ {len(findings)} finding(s) · provider {provider_cfg.name} ({provider_cfg.model})", file=sys.stderr)
     if cfg.redact_secrets:
@@ -186,17 +198,21 @@ def _run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source
             file=sys.stderr,
         )
 
+    from .sca.govulncheck import GovulncheckUnavailable
+
     client = build_client(provider_cfg)
     try:
         with audit.Journal(journal_path, cfg.prompt_pack) as journal:
-            pipeline = TriagePipeline(client, provider_cfg, cfg, source=source, symbols=symbols)
-            risk = pipeline.risk_context
-            print(
-                "→ risk context: "
-                f"internet={risk.internet_exposed} · auth={risk.auth_required} · "
-                f"business-critical={risk.business_critical} · kubernetes/shared-nginx/restricted-egress",
-                file=sys.stderr,
-            )
+            try:
+                pipeline = TriagePipeline(client, provider_cfg, cfg,
+                                          source=source, symbols=symbols)
+            except GovulncheckUnavailable as exc:
+                # A run that was told to rest on a call graph and has none is
+                # not a quieter run, it is a different one — and nothing in its
+                # report would say so.
+                print(f"error: граф вызовов запрошен, но недоступен — {exc}",
+                      file=sys.stderr)
+                return 2
             run = pipeline.run(
                 findings, progress=_progress, on_record=journal.append
             )
@@ -204,15 +220,6 @@ def _run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source
             if reuse_plan:
                 run.records.extend(reuse_plan.reused)
                 run.reuse = reuse_plan.summary()
-            run.records = [
-                prioritize.assign_priority(
-                    record,
-                    all_findings_by_id.get(record.finding_id),
-                    pipeline.risk_context,
-                )
-                for record in run.records
-            ]
-            run.risk_context = pipeline.risk_context
     finally:
         client.close()
         if symbols:
@@ -233,21 +240,45 @@ def _run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source
     audit.write_summary(run, out / f"summary-{stem}.json")
     report = html.write(run, out / f"report-{stem}.html", title=f"SAST LLM Triage — {provider_cfg.name}")
 
+    from .models import VerdictLabel
+
     counts = run.counts()
-    priorities = {
-        name: sum(1 for record in run.records if record.priority.value == name)
-        for name in ("Critical", "High", "Medium", "Low")
-    }
+    # `confirmed` alone is misleading on dependency findings: it holds both the
+    # ones where a call was actually established and the ones nothing could
+    # close, and those are different work for a reviewer. Measured on a real
+    # project — 40 "confirmed" of which 0 had a proven call — so the split is
+    # printed rather than the total.
+    proven = sum(1 for r in run.records
+                 if r.verdict.verdict is VerdictLabel.confirmed
+                 and (r.sca is None or r.sca.outcome in _PROVEN_OUTCOMES))
+    unproven = counts["confirmed"] - proven
     print(
-        f"\n  confirmed {counts['confirmed']} · unknown {counts['unknown']} · closed {counts['false_positive']}"
-        f" · external {counts['external_fp']}"
-        f" · priority C/H/M/L {priorities['Critical']}/{priorities['High']}/"
-        f"{priorities['Medium']}/{priorities['Low']}"
+        f"\n  доказано {proven} · не закрыто {unproven} · закрыто {counts['false_positive']}"
+        f" · на человека {counts['unknown'] + unproven}"
         f" · corrected {sum(1 for r in run.records if r.overrides)}"
         f" · errors {sum(1 for r in run.records if r.error)}"
-        f" · ${run.total_cost_usd:.4f}",
+        f" · ${run.total_cost_usd:.4f}"
+        + (f" ({run.model_calls} запросов)" if run.model_calls else ""),
         file=sys.stderr,
     )
+    # The dependency chain is asked per finding and its failures are caught per
+    # finding, so that one bad lookup does not cost the run. The failure mode
+    # that hides in is total: a chain that raises on *every* finding leaves a
+    # plausible report in which no dependency was analysed at all, and the run
+    # still ends with `errors 0`. Measured — a field added to a slots dataclass
+    # without a type annotation raised on construction for all nineteen findings.
+    dependency_records = [r for r in run.records if r.kind == "dependency"]
+    if cfg.resolve_vulnerable_symbols and dependency_records:
+        analysed = sum(1 for r in dependency_records if r.sca is not None)
+        if not analysed:
+            print(
+                f"  ! цепочка проверки зависимостей не отработала ни по одной из "
+                f"{len(dependency_records)} находок — вердикты по зависимостям "
+                f"недостоверны (см. лог)",
+                file=sys.stderr,
+            )
+            return 1
+
     lsp_gated = sum(
         1 for r in run.records if any(o.startswith("lsp_required_no_answer") for o in r.overrides)
     )
@@ -356,11 +387,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
     records = audit.read_jsonl(Path(args.verdicts))
 
     findings = {f.finding_id: f for f in ingest.load(Path(args.findings))} if args.findings else {}
-    current_risk = risk_ctx.load()
-    records = [
-        prioritize.assign_priority(record, findings.get(record.finding_id), current_risk)
-        for record in records
-    ]
 
     queue = prioritize.build(records, cfg.queue, findings)
     s = queue.summary()
@@ -387,8 +413,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         more = f"  (+{item.cluster_size - 1} more)" if item.cluster_size > 1 else ""
         flag = "  [always-review]" if item.exempt else ""
         print(
-            f"{i:>3}. [{item.score:>3}] {item.priority.value:<8} "
-            f"{item.record.verdict.verdict.value:<14} "
+            f"{i:>3}. [{item.score:>3}] {item.record.verdict.verdict.value:<14} "
             f"{str(item.record.cwe or '-'):<9} {item.record.file_path[-50:]}{more}{flag}"
         )
         brief = review_mod.build(item.record)
@@ -435,40 +460,12 @@ def cmd_scanners(_: argparse.Namespace) -> int:
     return 0
 
 
-def _write_sca_findings(result, out_path: Path) -> None:
-    payload = [json.loads(f.model_dump_json(exclude_none=True)) for f in result.findings]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _append_sca_manifest(scan_dir: Path, target: Path, result, out_path: Path) -> None:
-    """Add the cdxgen+OSV leg to the same coverage manifest as SAST."""
-    manifest = scan_dir / "scan-manifest.json"
-    try:
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = {"target": str(target), "scans": []}
-    complete = result.usable and not result.problems
-    data.setdefault("scans", []).append({
-        "scanner": "cdxgen+osv",
-        "ok": complete,
-        "output_path": str(out_path),
-        "findings": len(result.findings),
-        "packages_checked": result.packages_checked,
-        "packages_succeeded": result.packages_succeeded,
-        "error": None if complete else "; ".join(result.problems[:3]) or "no advisory query succeeded",
-    })
-    data["total_findings"] = sum(
-        int(entry.get("findings") or 0) for entry in data.get("scans") or [] if entry.get("ok")
-    )
-    manifest.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 def cmd_sbom(args: argparse.Namespace) -> int:
     """Dependency findings straight from cdxgen and the advisory databases.
 
-    cdxgen and the advisory databases are the only SCA source. The output is the
-    same shape `triage` consumes.
+    Exists because the SCA half used to depend on Trivy for its finding list: no
+    scanner, nothing to triage — in an image that already carries cdxgen and can
+    reach OSV. The output is the same shape `triage` consumes.
     """
     from .sca import discover as discover_mod
 
@@ -477,17 +474,19 @@ def cmd_sbom(args: argparse.Namespace) -> int:
     result = discover_mod.discover(
         target, sbom_path=Path(args.sbom) if args.sbom else None,
         limit=args.limit or 0)
-    _write_sca_findings(result, out_path)
+
+    payload = [json.loads(f.model_dump_json(exclude_none=True)) for f in result.findings]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"→ пакетов опрошено: {result.packages_checked}", file=sys.stderr)
-    print(f"→ успешных ответов: {result.packages_succeeded}", file=sys.stderr)
     print(f"→ находок: {len(result.findings)} -> {out_path}", file=sys.stderr)
     for problem in result.problems[:10]:
         print(f"  ! {problem}", file=sys.stderr)
     if result.problems:
         print(f"  ! всего проблем: {len(result.problems)} — "
               "эти пакеты не проверены, а не признаны чистыми", file=sys.stderr)
-    return 0 if result.usable and not result.problems else 2
+    return 0 if result.usable else 2
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -512,74 +511,58 @@ def cmd_scan(args: argparse.Namespace) -> int:
     for r in results:
         if r.ok and r.output_path:
             print(r.output_path)
-    return 0 if results and all(r.ok for r in results) else 1
+    return 0 if any(r.ok for r in results) else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Scan, then triage what came out — the whole job in one command."""
+    """Scan, then triage what came out — the whole job in one command.
+
+    The order matters and is the reason this is one command rather than three.
+    The scanners run first and leave their CodeQL databases behind; the
+    dependency discovery runs next and its findings join the scanner findings;
+    the triage then answers reachability against the database built moments
+    earlier, from the same source tree. Split across jobs, each phase would have
+    to rebuild what the previous one already had.
+    """
     target = Path(args.target).resolve()
-    out = Path(args.out)
+    out = Path(args.out).resolve()
     scan_dir = out / "scans"
 
-    required = scanners_for_target(target)
-    if args.scanner:
-        missing = [name for name in required if name not in args.scanner]
-        if missing:
-            print(
-                "error: a full run cannot omit language-required scanners: "
-                f"{', '.join(missing)}. Use `scan -s ...` only for isolated diagnostics.",
-                file=sys.stderr,
-            )
-            return 2
-
-    if "govulncheck" in required:
-        if getattr(args, "no_lsp", False):
-            print(
-                "error: a full Go run requires gopls; --no-lsp is only available for degraded "
-                "standalone triage",
-                file=sys.stderr,
-            )
-            return 2
-        lsp_cfg = load_lsp_config(getattr(args, "lsp_config", None))
-        if not lsp_cfg.enabled or "go" not in lsp_cfg.required_languages:
-            print("error: a full Go run requires Go to be mandatory in lsp.yaml", file=sys.stderr)
-            return 2
-        symbols = LSPService(lsp_cfg, [target])
-        try:
-            if err := symbols.ensure_ready("go"):
-                print(f"error: mandatory Go language server is not usable: {err}", file=sys.stderr)
-                return 2
-        finally:
-            symbols.close()
+    # `appsec-triage run . -o appsec-out` is the ordinary CI shape, and it puts
+    # the output inside the tree being scanned. Nothing warns about that on its
+    # own: the scanners would extract the CodeQL database this run wrote, read
+    # their own SARIF as source, and grow on every rerun.
+    if out.is_relative_to(target):
+        relative = out.relative_to(target)
+        scanner_tools.exclude_directory(relative.parts[0])
+        print(f"→ каталог вывода {relative.parts[0]}/ внутри цели — исключён из скана",
+              file=sys.stderr)
 
     if cmd_scan(argparse.Namespace(target=target, out=scan_dir, scanner=args.scanner)) != 0:
         return 1
 
-    from .sca import discover as discover_mod
-
-    dependency_report = scan_dir / "dependencies.json"
-    sca = discover_mod.discover(target)
-    _write_sca_findings(sca, dependency_report)
-    _append_sca_manifest(scan_dir, target, sca, dependency_report)
-    print(
-        f"→ SCA cdxgen+OSV: {len(sca.findings)} finding(s), "
-        f"{sca.packages_succeeded}/{sca.packages_checked} package queries succeeded",
-        file=sys.stderr,
-    )
-    if not sca.usable:
-        print("error: SCA produced no trustworthy advisory coverage", file=sys.stderr)
-        return 2
-
-    reports = [p for p in scan_dir.iterdir() if p.suffix in (".json", ".sarif") and p.name != "scan-manifest.json"]
+    reports = [p for p in scan_dir.iterdir()
+               if p.suffix in (".json", ".sarif") and p.name != "scan-manifest.json"]
     if not reports:
         print("error: scanners produced no readable report", file=sys.stderr)
         return 1
 
-    triage_status = _run_triage(args, scan_dir, out, [target])
-    if triage_status == 0 and sca.problems:
-        print("error: triage completed, but SCA coverage was incomplete", file=sys.stderr)
-        return 2
-    return triage_status
+    # Vulnerable dependencies, from the lockfiles rather than from a scanner.
+    # Written into the same directory so the triage picks them up with
+    # everything else; a failure here costs the dependency half, not the run.
+    if not getattr(args, "no_deps", False):
+        deps_file = scan_dir / "dependencies.json"
+        if cmd_sbom(argparse.Namespace(
+                target=target, out=deps_file, sbom=getattr(args, "sbom", None),
+                limit=0)) != 0:
+            print("  ! зависимости не разобраны — триаж пойдёт только по находкам сканеров",
+                  file=sys.stderr)
+
+    # The databases the scan just built answer the dataflow question during
+    # triage. Passed explicitly rather than rediscovered, so the two phases
+    # cannot disagree about where they are.
+    args.scan_dir = scan_dir
+    return _run_triage(args, scan_dir, out, [target])
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -659,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument(
         "--redo",
         metavar="CLASSES",
-        help="comma-separated: unknown,error,overridden,confirmed,false_positive,external_fp,all,none "
+        help="comma-separated: unknown,error,overridden,confirmed,false_positive,all,none "
              "(default: unknown,error,overridden — the unresolved and the unreliable)",
     )
     t.add_argument(
@@ -671,6 +654,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("--lsp-config", dest="lsp_config", type=Path,
                    help="override the LSP config (default: configs/lsp.yaml)")
+    t.add_argument(
+        "--scan-dir", dest="scan_dir", type=Path,
+        help="output directory of the SAST phase; its CodeQL databases answer "
+             "whether user input reaches a dependency call site",
+    )
+    t.add_argument(
+        "--govulncheck", dest="govulncheck", type=Path,
+        help="`govulncheck -format json` output from a neighbouring job; answers "
+             "Go reachability from a real call graph instead of from names",
+    )
     t.add_argument(
         "--no-lsp",
         action="store_true",
@@ -727,6 +720,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "to avoid the typescript-language-server on mixed-language repos")
     r.add_argument("--workers", type=int)
     r.add_argument("--limit", type=int)
+    r.add_argument("--sbom", type=Path,
+                   help="reuse an existing CycloneDX file instead of running cdxgen")
+    r.add_argument("--no-deps", action="store_true",
+                   help="skip dependency discovery; triage only what the scanners found")
+    r.add_argument(
+        "--govulncheck", dest="govulncheck", type=Path,
+        help="`govulncheck -format json` output from a neighbouring job; answers "
+             "Go reachability from a real call graph instead of from names",
+    )
     r.add_argument(
         "--resolve-symbols",
         dest="resolve_symbols",

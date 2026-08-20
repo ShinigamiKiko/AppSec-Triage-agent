@@ -110,7 +110,6 @@ def _to_finding(obj: dict[str, Any], fallback_id: str) -> Finding:
             ecosystem=(str(v) if (v := raw_dependency.get("ecosystem")) else None),
             installed_version=(str(v) if (v := raw_dependency.get("installed_version")) else None),
             fixed_versions=[str(x) for x in (raw_dependency.get("fixed_versions") or [])],
-            advisory_aliases=[str(x) for x in (raw_dependency.get("advisory_aliases") or [])],
             advisory_url=(str(v) if (v := raw_dependency.get("advisory_url")) else None),
             dev_only=raw_dependency.get("dev_only"),
             imported=raw_dependency.get("imported"),

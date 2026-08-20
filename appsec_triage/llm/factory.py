@@ -27,5 +27,3 @@ def build_client(cfg: ProviderConfig) -> LLMClient:
     return klass(cfg)  # type: ignore[return-value]
 
 
-def build_client_by_name(name: str, *, config_dir: Path | None = None) -> LLMClient:
-    return build_client(load_provider_config(name, config_dir=config_dir))
