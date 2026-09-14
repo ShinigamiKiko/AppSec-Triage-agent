@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .presence import PresenceResult, SymbolPresence
-from .reach import ReachResult, Reachability
+from .reach import Reachability, ReachResult
 from .resolve import VulnerableSymbol
 
 
@@ -29,6 +29,7 @@ class CVEVerdict(str, Enum):
     ACTUAL = "actual"
     PRESENT_UNPROVEN = "present"
     ONLY_IN_TESTS = "only_in_tests"
+    ONLY_TEST_IMPORT = "test_only_import"
     CALL_UNCONFIRMED = "call_unconfirmed"
     MENTIONED_ONLY = "mentioned"
     NOT_APPLICABLE = "not_applicable"
@@ -57,7 +58,7 @@ class CVEDecision:
         return self.verdict in (CVEVerdict.NOT_APPLICABLE, CVEVerdict.NOT_SHIPPED,
                                 CVEVerdict.UNUSED, CVEVerdict.CONDITION_ABSENT,
                                 CVEVerdict.INFRASTRUCTURE, CVEVerdict.WRONG_RECEIVER,
-                                CVEVerdict.NOT_REACHED)
+                                CVEVerdict.NOT_REACHED, CVEVerdict.ONLY_TEST_IMPORT)
 
     @property
     def reassigned(self) -> bool:
@@ -81,6 +82,7 @@ def decide(
     dev_only: bool | None = None,
     used: bool | None = None,
     used_detail: str = "",
+    test_only: bool = False,
     package_used: bool | None = None,
     package_used_detail: str = "",
     receiver_disproved: bool = False,
@@ -99,6 +101,14 @@ def decide(
     # from names, imports or a single call site.
     if reachability is not None:
         if reachability.reachable:
+            if dataflow is not None and dataflow is not False:
+                return CVEDecision(
+                    CVEVerdict.ACTUAL,
+                    "уязвимость актуальна: пользовательский ввод доходит до вызова",
+                    [dataflow.render(), "поток данных построен CodeQL по базе этого прогона"],
+                    [f"{dataflow.source_file}:{dataflow.source_line}",
+                     f"{dataflow.file}:{dataflow.line}"],
+                )
             # The graph proved the path; the call site decides whether the flaw
             # can fire along it. A quoted line saying it cannot — plain HTTP
             # where the flaw needs HTTP/2, a link-local address where it needs
@@ -129,8 +139,8 @@ def decide(
                 CVEVerdict.PRESENT_UNPROVEN,
                 "граф вызовов пути не нашёл, но в коде есть вызовы, которых он не видит",
                 [reachability.render(), graph_audit.render(),
-                 "не закрыто: закрытие графом не проходит проверку на "
-                 "рефлексию и подгружаемый код"],
+                 ("не закрыто: закрытие графом не проходит проверку на "
+                 "рефлексию и подгружаемый код")],
                 reachability.trace[:6],
             )
         return CVEDecision(
@@ -186,12 +196,41 @@ def decide(
             [f"{dataflow.source_file}:{dataflow.source_line}",
              f"{dataflow.file}:{dataflow.line}"],
         )
+    # Imported only by test code — the paths listed in the file every prompt
+    # carries. A fact about the import graph outranks CodeQL's "no path", which
+    # is the weakest closure: nothing shipped loads the package at all.
+    if used is False and test_only and direct:
+        return CVEDecision(
+            CVEVerdict.ONLY_TEST_IMPORT,
+            "библиотека подключается только в тестовом коде",
+            [used_detail or "импорты найдены только в тестовых путях",
+             "тестовые пути заданы в prompts/training-context.md, тот же список видит модель",
+             "рабочий код пакет не импортирует — в поставляемом приложении он не вызывается"],
+        )
     if dataflow is False and input_driven:
+        # The weakest closure in the chain: "no path from the sources CodeQL
+        # models" is not "no path". A queue consumer, a CLI argument, an
+        # unmodelled framework are sources the query never saw. This outcome
+        # skips the model entirely, so it closes only after the audit aimed at
+        # that blind spot actually ran; a closure nothing checked stays with a
+        # person.
+        audited = (closure_audit is not None and closure_audit.checked
+                   and closure_audit.kind == "no_input_path")
+        if not audited:
+            return CVEDecision(
+                CVEVerdict.PRESENT_UNPROVEN,
+                "CodeQL не нашёл пути от пользовательского ввода, но закрытие не проверено",
+                ["CodeQL: путь от известных ему источников к этому вызову не найден",
+                 (closure_audit.render() if closure_audit is not None
+                  else "проверка источников, которых CodeQL не моделирует, не выполнялась"),
+                 "не закрыто: отсутствие пути от смоделированных источников не доказательство"],
+            )
         return CVEDecision(
             CVEVerdict.CONDITION_ABSENT,
             "пользовательский ввод до уязвимого вызова не доходит",
             ["CodeQL: путь от источника пользовательских данных к этому вызову не найден",
              "уязвимость этого класса без управляемого ввода не срабатывает",
+             closure_audit.render(),
              "закрыто по потоку данных, а не по отсутствию имени в коде"],
         )
 
@@ -293,8 +332,8 @@ def decide(
             CVEVerdict.NO_DIRECT_CALL,
             f"прямого вызова {symbol} в коде нет",
             [*reasons, presence.detail,
-             "закрывать нельзя: функция может вызываться внутри библиотеки "
-             "из публичного API, который вы вызываете"],
+             ("закрывать нельзя: функция может вызываться внутри библиотеки "
+             "из публичного API, который вы вызываете")],
         )
 
     if presence.presence is SymbolPresence.CALL_UNCONFIRMED:
@@ -336,8 +375,8 @@ def decide(
         return CVEDecision(
             CVEVerdict.ACTUAL,
             f"уязвимость актуальна: {symbol} вызывается в коде",
-            [*reasons, "эксплуатация не требует пользовательского ввода — "
-                       "достаточно самого вызова"],
+            [*reasons, ("эксплуатация не требует пользовательского ввода — "
+                       "достаточно самого вызова")],
             evidence,
         )
 

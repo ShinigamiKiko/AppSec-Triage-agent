@@ -2,7 +2,7 @@
 
 Kept apart from both the queue and the checks because both need it and neither
 owns it. This is *consequence*, not likelihood and not the scanner's severity —
-that one was measured to be a poor signal, since Semgrep records it on the rule
+risk severity was measured to be a poor signal, since scanners can record it on the rule
 rather than the result and 207 of 296 findings on a real project arrived as
 `unknown` severity.
 """

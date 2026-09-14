@@ -10,14 +10,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from . import scanners
 from .config import (
     ConfigError,
     list_providers,
-    list_scanners,
     load_lsp_config,
     load_pipeline_config,
     load_provider_config,

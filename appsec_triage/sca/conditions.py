@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
 from ..prompts import registry
 
 log = logging.getLogger(__name__)
@@ -187,8 +188,8 @@ def check(
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="не задан ни один корень исходников — искать негде")
 
-    patterns = [(token, re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", re.I))
-                for token in tokens]  # noqa: E501 - kept flat for readability
+    patterns = [(token, re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", re.IGNORECASE))
+                for token in tokens]
     hits: list[str] = []
     scanned = 0
     for root in roots:

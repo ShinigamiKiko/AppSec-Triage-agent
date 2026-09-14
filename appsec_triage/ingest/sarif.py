@@ -1,4 +1,4 @@
-"""SARIF 2.1.0 adapter — covers Semgrep, CodeQL, Trivy, and Checkmarx exports.
+"""SARIF 2.1.0 adapter — covers CodeQL, Psalm, Wolfee, and Checkmarx exports.
 
 SARIF is verbose and every tool fills it slightly differently, so this adapter
 sticks to the fields all four actually populate, and reaches into
@@ -8,8 +8,9 @@ sticks to the fields all four actually populate, and reaches into
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..models import CodeContext, Finding, Severity, TraceStep
 from . import dependency as dependency_parser
@@ -82,6 +83,23 @@ def _snippet(loc: dict[str, Any]) -> tuple[str | None, bool]:
     return chosen, bool(region.get("endLine") and not chosen)
 
 
+def _flow_role(loc: dict[str, Any]) -> str | None:
+    """Read CodeQL's explicit dataflow role when the message is generic."""
+    for kind in loc.get("kinds") or []:
+        role = str(kind).lower()
+        if role in {"source", "entrypoint"}:
+            return "source"
+        if role in {"sink", "vulnerable-function"}:
+            return "sink"
+        if role in {"sanitizer", "step", "call"}:
+            return "sanitizer" if role == "sanitizer" else "step"
+    for taxa in loc.get("taxa") or []:
+        role = ((taxa.get("properties") or {}).get("CodeQL/DataflowRole") or "").lower()
+        if role in {"source", "sink", "sanitizer", "step"}:
+            return role
+    return None
+
+
 def _cwe_from_rule(rule: dict[str, Any], result: dict[str, Any]) -> str | None:
     name = rule.get("name") or (rule.get("shortDescription") or {}).get("text") or ""
     if cwe := _PSALM_TAINT_TO_CWE.get(name):
@@ -137,12 +155,13 @@ def _trace(result: dict[str, Any]) -> tuple[list[TraceStep], str | None, str | N
                 inner = loc.get("location") or {}
                 msg = (inner.get("message") or {}).get("text")
                 lowered = (msg or "").lower()
-                role = "step"
-                if any(h in lowered for h in _SOURCE_HINTS):
+                explicit_role = _flow_role(loc)
+                role = explicit_role or "step"
+                if explicit_role is None and any(h in lowered for h in _SOURCE_HINTS):
                     role = "source"
-                elif any(h in lowered for h in _SANITIZER_HINTS):
+                elif explicit_role is None and any(h in lowered for h in _SANITIZER_HINTS):
                     role = "sanitizer"
-                elif any(h in lowered for h in _SINK_HINTS):
+                elif explicit_role is None and any(h in lowered for h in _SINK_HINTS):
                     role = "sink"
                 steps.append(
                     TraceStep(

@@ -18,7 +18,10 @@ def usable_scanners() -> list[str]:
 
 
 _LANG_SCANNERS = {
-    ".php": ["semgrep", "psalm"],
+    ".php": ["psalm"],
+    ".phtml": ["psalm"], ".inc": ["psalm"],
+    ".php3": ["psalm"], ".php4": ["psalm"], ".php5": ["psalm"],
+    ".php7": ["psalm"], ".php8": ["psalm"],
     ".go":  ["codeql"],
     ".ts": ["codeql"], ".tsx": ["codeql"],
     ".js": ["codeql"], ".jsx": ["codeql"],
@@ -30,14 +33,14 @@ _LANG_SCANNERS = {
     ".cxx": ["codeql"], ".c++": ["codeql"],
     ".rs": ["codeql"], ".swift": ["codeql"],
 }
-_ALWAYS_SCANNERS = ["gitleaks", "trivy"]
+_ALWAYS_SCANNERS = ["wolfee"]
 _SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "vendor", "target", "build", "dist", "__pycache__"}
 
 
 def scanners_for_target(target: Path) -> list[str]:
     """Pick scanners by the languages actually present, then keep only usable ones.
 
-    This is what makes a PHP target run semgrep+Psalm and a Go target run
+    This is what makes a PHP target run Psalm and a Go target run
     CodeQL, without the operator having to know which tool covers which
     language. Falls back to every usable scanner when nothing is recognised —
     a strange tree should still get looked at, not silently skipped.
@@ -57,10 +60,8 @@ def scanners_for_target(target: Path) -> list[str]:
 
     usable = set(usable_scanners())
     chosen = [s for s in wanted if s in usable]
-    if chosen:
-        skipped = [s for s in wanted if s not in usable]
-        if skipped:
-            print(f"→ language-relevant but unavailable: {', '.join(skipped)} "
-                  "(run `appsec-triage doctor`)", file=sys.stderr)
-        return chosen
-    return sorted(usable)
+    skipped = [s for s in wanted if s not in usable]
+    if skipped:
+        print(f"→ language-relevant but unavailable: {', '.join(skipped)} "
+              "(run `appsec-triage doctor`)", file=sys.stderr)
+    return chosen if seen_ext or chosen else sorted(usable)

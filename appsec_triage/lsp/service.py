@@ -27,7 +27,7 @@ from pathlib import Path
 
 from ..config import LSPConfig
 from ..models import Finding
-from .client import LSPClient, Location, uri_to_path
+from .client import Location, LSPClient, uri_to_path
 
 log = logging.getLogger(__name__)
 
@@ -44,13 +44,13 @@ _KEYWORDS = {
 _NON_PRODUCTION = re.compile(
     r"(^|/)(tests?|spec|__tests__|fixtures?|testdata|docs?|examples?|samples?|"
     r"migrations?|vendor|node_modules)/",
-    re.I,
+    re.IGNORECASE,
 )
 
 _ENTRYPOINT_FILE = re.compile(
     r"(^|/)(urls?|routes?|routing|web|api|endpoints?|controllers?|handlers?|resources?)\.(py|php|js|ts|rb|go|java)$"
     r"|(controller|handler|endpoint|resource|listener|subscriber|consumer|webhook)",
-    re.I,
+    re.IGNORECASE,
 )
 
 _TAINT_SOURCE_RHS = re.compile(
@@ -59,14 +59,14 @@ _TAINT_SOURCE_RHS = re.compile(
     r"|->\s*getParameter\s*\("
     r"|php://input"
     r"|\bfilter_input\s*\(",
-    re.I,
+    re.IGNORECASE,
 )
 
 _ENTRYPOINT_CALL = re.compile(
     r"(\bpath\s*\(|\bre_path\s*\(|\burl\s*\(|@app\.route|@router\.|@(Get|Post|Put|Delete|Request)Mapping"
     r"|Route::(get|post|put|delete|any|match)|->(get|post|put|delete)\s*\(\s*['\"]/"
     r"|#\[Route|@Route|app\.(get|post|put|delete)\s*\(|router\.(get|post|put|delete)\s*\()",
-    re.I,
+    re.IGNORECASE,
 )
 
 

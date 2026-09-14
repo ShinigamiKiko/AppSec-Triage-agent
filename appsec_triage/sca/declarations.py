@@ -60,9 +60,9 @@ class Declaration:
 
 _PHP_DECL = re.compile(
     r"^[ \t]*(?:(public|protected|private)\s+)?(?:static\s+|final\s+|abstract\s+)*"
-    r"function\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
+    r"function\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
 _PHP_OWNER = re.compile(
-    r"^[ \t]*(?:final\s+|abstract\s+)*(?:class|trait|interface)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+    r"^[ \t]*(?:final\s+|abstract\s+)*(?:class|trait|interface)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 
 _JS_DECL = re.compile(
     r"^[ \t]*(?P<exp>export\s+(?:default\s+)?)?"
@@ -71,15 +71,15 @@ _JS_DECL = re.compile(
     r"(?:function\s*\*?\s*(?P<fn>[A-Za-z_$][\w$]*)"
     r"|(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?"
     r"(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
-    r"|(?P<meth>[A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{)", re.M)
-_JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)", re.M)
+    r"|(?P<meth>[A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{)", re.MULTILINE)
+_JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
 _JS_KEYWORD = {"if", "for", "while", "switch", "catch", "return", "do", "else", "function"}
 
-_PY_DECL = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)\s*\(", re.M)
-_PY_OWNER = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z_]\w*)", re.M)
+_PY_DECL = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_OWNER = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z_]\w*)", re.MULTILINE)
 
 _GO_DECL = re.compile(
-    r"^func\s*(?:\(\s*\w+\s+\*?(?P<recv>[A-Za-z_]\w*)\s*\)\s*)?(?P<fn>[A-Za-z_]\w*)\s*\(", re.M)
+    r"^func\s*(?:\(\s*\w+\s+\*?(?P<recv>[A-Za-z_]\w*)\s*\)\s*)?(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
 
 
 def _php(text: str) -> list[Declaration]:
@@ -128,7 +128,7 @@ def _js(text: str) -> list[Declaration]:
 
 def _python(text: str) -> list[Declaration]:
     exported = set()
-    for block in re.findall(r"__all__\s*=\s*[\[(](.*?)[\])]", text, re.S):
+    for block in re.findall(r"__all__\s*=\s*[\[(](.*?)[\])]", text, re.DOTALL):
         exported |= {m.group(1) for m in re.finditer(r"[\"']([^\"']+)[\"']", block)}
 
     owners = [(m.start(), len(m.group("indent")), m.group(2)) for m in _PY_OWNER.finditer(text)]
@@ -204,5 +204,5 @@ def call_pattern(function: str, language: str | None = None) -> re.Pattern[str]:
     name = re.escape(function)
     return re.compile(
         rf"(?:->|::|\.|\$)\s*{name}\s*\(" rf"|(?<![\w$.>:]){name}\s*\(",
-        re.I if language == PHP else 0,
+        re.IGNORECASE if language == PHP else 0,
     )

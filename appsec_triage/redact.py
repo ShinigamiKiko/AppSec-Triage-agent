@@ -26,7 +26,7 @@ import re
 from .context.heuristics import shannon_entropy
 
 _QUOTED = re.compile(r"""(?P<head>\s*(?:=>|:=|[:=])\s*)(?P<q>["'])(?P<value>[^"'\n]{12,})(?P=q)""")
-_CONFIG_VALUE = re.compile(r"""(?P<head>^[ \t]*[\w.\-]+[ \t]*[:=][ \t]*)(?P<value>[A-Za-z0-9+/_-]{16,}={0,2})[ \t]*$""", re.M)
+_CONFIG_VALUE = re.compile(r"""(?P<head>^[ \t]*[\w.\-]+[ \t]*[:=][ \t]*)(?P<value>[A-Za-z0-9+/_-]{16,}={0,2})[ \t]*$""", re.MULTILINE)
 
 _ENTROPY_FLOOR = 3.6
 _MIN_LENGTH = 16
@@ -34,7 +34,7 @@ _MIN_LENGTH = 16
 
 def _describe(value: str) -> str:
     kinds = []
-    if re.fullmatch(r"[0-9a-f]+", value, re.I):
+    if re.fullmatch(r"[0-9a-f]+", value, re.IGNORECASE):
         kinds.append("hex")
     elif re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value):
         kinds.append("base64-ish")

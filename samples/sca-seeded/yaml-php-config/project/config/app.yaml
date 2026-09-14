@@ -1,0 +1,2 @@
+service: billing
+timeout: 30

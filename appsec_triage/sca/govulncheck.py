@@ -63,7 +63,7 @@ class Verdict:
     advisory_id: str
     reach: Reach
     trace: list[str] = field(default_factory=list)
-    sites: "list[tuple[str, int]]" = field(default_factory=list)
+    sites: list[tuple[str, int]] = field(default_factory=list)
     """Each frame's file and line, outermost first, for reading the call site."""
 
     @property
@@ -130,7 +130,7 @@ def _frames(trace: list[dict]) -> list[str]:
     return out
 
 
-def _positions(trace: list[dict]) -> "list[tuple[str, int]]":
+def _positions(trace: list[dict]) -> list[tuple[str, int]]:
     """Where each frame sits, outermost first — the entry point comes last.
 
     Kept because "the call graph reaches it" and "this call can actually fire the

@@ -17,6 +17,10 @@ fail_fast: false          # false: сбой одного finding не роняе
 code_context_lines: 6
 max_code_chars: 4000
 max_trace_steps: 12
+# Additional source/config evidence; one quarter is reserved for follow-up reads.
+max_evidence_chars: 32000
+# 0 disables follow-ups. Each round can plan reads and then revise the verdict.
+context_retrieval_rounds: 2
 
 # Второй, состязательный проход по отдельным вердиктам.
 # Не переголосование: на один и тот же вопрос модель дважды даёт один и тот же
@@ -71,7 +75,7 @@ queue:
 scope:
   enabled: true
   exclude_rules: []
-    # Здесь пусто не случайно: bandit отключён (см. _LANG_SCANNERS в cli.py),
+    # Здесь пусто не случайно: языковые SAST-сканеры выбираются автоматически,
     # а все прежние исключения были про его шум — 31074 «в коде есть assert»,
     # `import subprocess`, `except: pass`. Правило-исключение переживает свою
     # причину и потом молча режет находки, поэтому они убраны вместе с ним.

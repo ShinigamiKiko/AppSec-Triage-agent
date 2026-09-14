@@ -75,12 +75,24 @@ cdxgen → OSV/GHSA/NVD → коммит с фиксом → символ → п
 
 | | |
 |---|---|
-| semgrep, CodeQL | SAST |
-| gitleaks | секреты |
-| psalm | PHP taint |
+| CodeQL | SAST для всех поддерживаемых языков кроме PHP, с dataflow-трассами |
+| psalm | основной PHP SAST, межфункциональный taint-анализ |
+| wolfee | SCA и reachability для уязвимых зависимостей |
 
 **Языковые серверы** — `phpactor`, `gopls`, `typescript-language-server`,
 `pylsp`. Без них агент работает, но теряет разрешение типов.
+
+Для PHP автоматически выбирается Psalm, без fallback на другой SAST. В целевом
+проекте нужен `psalm.xml` или `psalm.xml.dist`; для Composer-проекта также
+`vendor/autoload.php` улучшает разрешение framework-классов, но не обязателен:
+при их отсутствии агент создаёт временный конфиг и не скачивает проект или зависимости.
+Модели Symfony/Doctrine/API Platform нужно настроить в проекте: пустой taint-отчёт
+не доказывает полноту покрытия фреймворка. Проверки секретов и зависимостей
+проверка зависимостей выполняется Wolfee.
+
+```bash
+appsec-triage scan /path/to/php-project -s psalm -o /tmp/psalm-out
+```
 
 ```bash
 appsec-triage doctor
@@ -123,6 +135,20 @@ docker run --rm -v "$CI_PROJECT_DIR:/src:ro" -v "$CI_PROJECT_DIR/out:/out" \
 Коды возврата: `0` — чисто, `1` — сработал `--fail-on`, `2` — не поднялся обязательный языковой сервер.
 
 Образ ~6,4 ГБ: CodeQL с наборами запросов, Go, PHP, Node и четыре языковых сервера. Это цена «весь анализ в одном артефакте».
+
+## PHP-зависимости перед анализом
+
+Psalm доказывает вызов и путь от ввода до уязвимого PHP-метода, только если в
+проекте есть `vendor/autoload.php`. Без него SCA по PHP идёт текстовым поиском.
+
+Агент зависимости не ставит: сборку и `composer install` делайте до запуска,
+например в `before_script` джобы. Пример:
+[`ci/gitlab-ci.example.yml`](ci/gitlab-ci.example.yml). Уязвимые версии должны
+установиться — `composer config audit.block-insecure false`; приватные
+репозитории — через `COMPOSER_AUTH`.
+
+Psalm загружает автозагрузчик проекта, поэтому `autoload.files` зависимостей
+исполняются.
 
 ## Запуск локально
 

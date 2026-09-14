@@ -10,8 +10,8 @@ Three mechanisms, in order of how much work they remove:
    59. Reviewing a representative and applying the call to its cluster is by far
    the biggest lever — bigger than any model improvement.
 2. **Scoring.** Rank by *risk*, not by the scanner's severity field. A weak hash
-   guarding a cache key and a weak hash guarding a signature are both `WARNING`
-   to Semgrep and are not remotely the same thing.
+   guarding a cache key and a weak hash guarding a signature can both be flagged
+   by a scanner and are not remotely the same thing.
 3. **Budget.** Take the top N% and mark the rest deferred.
 
 The safety rule that makes the budget honest: **nothing is deleted or hidden.**
@@ -28,7 +28,8 @@ import re
 from dataclasses import dataclass, field
 
 from .config import TriageQueueConfig
-from .consequence import CWE_WEIGHT as _CWE_WEIGHT, DEFAULT_WEIGHT as _DEFAULT_CWE_WEIGHT
+from .consequence import CWE_WEIGHT as _CWE_WEIGHT
+from .consequence import DEFAULT_WEIGHT as _DEFAULT_CWE_WEIGHT
 from .models import Finding, TriageRecord, VerdictLabel
 
 _SEVERITY_WEIGHT = {"critical": 12, "high": 9, "medium": 5, "low": 2, "info": 0, "unknown": 4}
@@ -163,9 +164,7 @@ def is_exempt(record: TriageRecord) -> bool:
     """Never deferred by the budget, however tight it is."""
     if any(sig in o for o in record.overrides for sig in _ALWAYS_REVIEW_SIGNALS):
         return True
-    if any(o.startswith(kind) for o in record.overrides for kind in _ALWAYS_REVIEW_OVERRIDES):
-        return True
-    return False
+    return bool(any(o.startswith(kind) for o in record.overrides for kind in _ALWAYS_REVIEW_OVERRIDES))
 
 
 @dataclass(slots=True)
@@ -193,7 +192,7 @@ class Queue:
         return round(100 * self.manual_findings / self.total_findings, 1) if self.total_findings else 0.0
 
     @property
-    def to_decide(self) -> list["QueueItem"]:
+    def to_decide(self) -> list[QueueItem]:
         """Items where a human still has to work something out.
 
         `unknown` means the pipeline could not settle it, and a `confirmed`
@@ -204,7 +203,7 @@ class Queue:
                 or i.record.verdict.requires_human_review]
 
     @property
-    def to_do(self) -> list["QueueItem"]:
+    def to_do(self) -> list[QueueItem]:
         """Confirmed with the remediation already named — work, not judgement.
 
         Mostly dependency upgrades. Reporting these together with the undecided

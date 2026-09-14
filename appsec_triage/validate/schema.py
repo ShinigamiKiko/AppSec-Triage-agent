@@ -142,7 +142,7 @@ VERDICT_SCHEMA: dict[str, Any] = {
     },
 }
 
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class SchemaError(ValueError):

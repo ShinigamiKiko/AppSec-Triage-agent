@@ -19,10 +19,31 @@ separately from generic accuracy because it is not interchangeable with it.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from ..models import TriageRecord, VerdictLabel
+from ..sca.verdict import CVEDecision, CVEVerdict
+
+
+def _kind_bucket() -> dict:
+    return {"n": 0, "decided": 0, "agree_decided": 0, "unknown": 0,
+            "dangerous_misses": [], "false_alarms": [],
+            "closed_without_model": 0, "dangerous_closures_without_model": [], "routes": {}}
+
+
+def _closed_by_chain(record: TriageRecord) -> bool:
+    """The dependency chain closed it on its own — no verdict call was made.
+
+    Tracked apart because these closures skip the model and post-validation
+    alike, so a wrong one is invisible everywhere except here.
+    """
+    if record.sca is None or not record.sca.outcome:
+        return False
+    try:
+        return CVEDecision(CVEVerdict(record.sca.outcome), "").closes
+    except ValueError:
+        return False
 
 
 @dataclass(slots=True)
@@ -48,6 +69,9 @@ class Scorecard:
     with_dataflow: int = 0
     with_symbol: int = 0
     unknowns_with_blocking_question: int = 0
+    # SAST ("weakness") and SCA ("dependency") answer different questions with
+    # different machinery; one blended accuracy hides a regression in either.
+    by_kind: dict[str, dict] = field(default_factory=lambda: defaultdict(_kind_bucket))
 
     def as_dict(self) -> dict:
         lat = sorted(self.latencies_ms)
@@ -89,6 +113,21 @@ class Scorecard:
                 }
                 for cwe, s in sorted(self.by_cwe.items(), key=lambda kv: -kv[1]["n"])
             },
+            "by_kind": {
+                kind: {
+                    "n": s["n"],
+                    "agreement_decided": _pct(s["agree_decided"], s["decided"]),
+                    "abstention_rate": _pct(s["unknown"], s["n"]),
+                    "dangerous_misses": len(s["dangerous_misses"]),
+                    "dangerous_miss_ids": s["dangerous_misses"][:20],
+                    "false_alarms": len(s["false_alarms"]),
+                    "closed_without_model": s["closed_without_model"],
+                    "dangerous_closures_without_model": len(s["dangerous_closures_without_model"]),
+                    "dangerous_closure_ids": s["dangerous_closures_without_model"][:20],
+                    "routes": dict(s["routes"]),
+                }
+                for kind, s in sorted(self.by_kind.items())
+            },
         }
 
 
@@ -123,6 +162,13 @@ def score(records: Iterable[TriageRecord], labels: dict[str, str], provider: str
 
         card.total += 1
         bucket["n"] += 1
+        kind = card.by_kind[r.kind]
+        kind["n"] += 1
+        closed_by_chain = _closed_by_chain(r)
+        if closed_by_chain:
+            kind["closed_without_model"] += 1
+        if r.sca is not None and r.sca.route:
+            kind["routes"][r.sca.route] = kind["routes"].get(r.sca.route, 0) + 1
         if r.error:
             card.schema_failures += 1
         if r.overrides:
@@ -150,18 +196,25 @@ def score(records: Iterable[TriageRecord], labels: dict[str, str], provider: str
 
         if predicted is VerdictLabel.unknown:
             card.unknown_count += 1
+            kind["unknown"] += 1
             if r.verdict.blocking_question:
                 card.unknowns_with_blocking_question += 1
         else:
             card.decided += 1
             bucket["decided"] += 1
+            kind["decided"] += 1
             if predicted.value == truth:
                 card.agree_decided += 1
                 bucket["agree_decided"] += 1
+                kind["agree_decided"] += 1
             elif truth == "confirmed" and predicted is VerdictLabel.false_positive:
                 card.dangerous_misses.append(r.finding_id)
+                kind["dangerous_misses"].append(r.finding_id)
+                if closed_by_chain:
+                    kind["dangerous_closures_without_model"].append(r.finding_id)
             elif truth == "false_positive" and predicted is VerdictLabel.confirmed:
                 card.false_alarms.append(r.finding_id)
+                kind["false_alarms"].append(r.finding_id)
 
     return card
 

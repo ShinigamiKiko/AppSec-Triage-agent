@@ -17,7 +17,8 @@ import yaml
 from ..config import REPO_ROOT
 
 PROMPTS_ROOT = REPO_ROOT / "prompts"
-_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+TRAINING_CONTEXT_PATH = PROMPTS_ROOT / "training-context.md"
+_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +40,22 @@ class Prompt:
 
 class PromptError(RuntimeError):
     pass
+
+
+@lru_cache(maxsize=1)
+def training_context() -> str:
+    """Load trusted, project-specific context attached to every model request."""
+    try:
+        text = TRAINING_CONTEXT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise PromptError(f"{TRAINING_CONTEXT_PATH}: context not read ({exc})") from exc
+    if not text:
+        raise PromptError(f"{TRAINING_CONTEXT_PATH}: context is empty")
+    return text
+
+
+def _with_training_context(system: str) -> str:
+    return "\n\n---\n\n## Project-specific context\n\n" + training_context() + "\n\n---\n\n" + system
 
 
 def _parse(path: Path) -> Prompt:
@@ -129,7 +146,7 @@ def render_system(
         parts.append(fragment.body)
     if stack_section:
         parts.append(stack_section)
-    return "\n\n---\n\n".join(parts), prompt
+    return _with_training_context("\n\n---\n\n".join(parts)), prompt
 
 
 @lru_cache(maxsize=32)
@@ -153,7 +170,7 @@ def step(name: str) -> str:
     body = text[match.end():] if match else text
     if not body.strip():
         raise PromptError(f"{path}: промпт пуст")
-    return body.strip()
+    return _with_training_context(body.strip())
 
 
 def coverage(pack: str = "default") -> dict[str, str]:

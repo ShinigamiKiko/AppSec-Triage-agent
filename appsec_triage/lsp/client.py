@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
@@ -259,7 +259,7 @@ class LSPClient:
             self._proc = None
             self.started = False
 
-    def __enter__(self) -> "LSPClient":
+    def __enter__(self) -> Self:
         self.start()
         return self
 

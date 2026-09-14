@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Iterator
 
 from ..models import Finding
-from . import bandit, native, sarif
+from . import native, sarif
 
 log = logging.getLogger(__name__)
 
@@ -26,12 +25,10 @@ def detect_format(path: Path) -> str:
         raise IngestError(f"{path}: not valid JSON ({exc})") from exc
     if isinstance(head, dict) and isinstance(head.get("runs"), list):
         return "sarif"
-    if bandit.looks_like_bandit(head):
-        return "bandit"
     return "native"
 
 
-_PARSERS = {"sarif": sarif.parse, "bandit": bandit.parse, "native": native.parse}
+_PARSERS = {"sarif": sarif.parse, "native": native.parse}
 
 
 def load(path: Path) -> list[Finding]:
@@ -76,8 +73,8 @@ def _richness(f: Finding) -> tuple:
     """Which duplicate to keep. A finding carrying a dataflow trace wins.
 
     This is what "the deep tool leads, the pattern matcher supports" means in
-    practice: when CodeQL and Semgrep both flag a line, the record that survives
-    is the one with `codeFlows`, because the trace is the thing the model cannot
+    practice: when multiple scanners flag a line, the record that survives is
+    the one with `codeFlows`, because the trace is the thing the model cannot
     reconstruct on its own and the whole verdict on a dataflow class hangs on it.
     """
     return (len(f.trace), bool(f.source), bool(f.sink), len(f.sanitizers), len(f.code_context.snippet or ""))
@@ -122,4 +119,4 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return merged
 
 
-__all__ = ["load", "detect_format", "IngestError", "sarif", "bandit", "native"]
+__all__ = ["IngestError", "detect_format", "load", "native", "sarif"]

@@ -30,6 +30,30 @@ facts:
   # закоммиченных .env. ВНИМАНИЕ: это не делает закоммиченный ключ безопасным —
   # он всё равно утёк, — но объясняет, почему значение в файле не боевое.
   secrets_injected_at_deploy: false
+  # SSH в подах не используется ни в какой роли — ни сервер, ни клиент: доступ к
+  # контейнеру только через kubectl exec. Решение владельца платформы: SSH внутри
+  # сервиса — антипаттерн, SSH-уязвимости к сервисам не относятся.
+  no_ssh_in_workloads: true
+
+# Компоненты, которых в сервисах платформы нет по решению её владельца. CVE,
+# эксплуатируемая ТОЛЬКО через такой компонент, закрывается сразу — до поиска в
+# коде и до CodeQL. Каждая запись называет факт выше; без факта запись не действует.
+#   keywords — дешёвый фильтр: модель спрашивается, только если слово есть в advisory.
+#   markers  — признаки, что компонент всё же есть в коде или образе: закрытие
+#              остаётся, но в отчёт уходит пометка об антипаттерне с файлом и строкой.
+out_of_scope_components:
+  - id: ssh
+    requires: no_ssh_in_workloads
+    describe: >-
+      Any use of SSH by the service itself, on either side: accepting SSH
+      connections (sshd, golang.org/x/crypto/ssh NewServerConn or ServerConfig
+      callbacks, an ssh2 Server, a paramiko ServerInterface), connecting out over
+      SSH or SFTP (ssh.Dial, NewClientConn, an ssh2 Client, paramiko SSHClient),
+      SSH agents as client or server, and SSH key, certificate and known_hosts
+      handling. A flaw on the server side and a flaw on the client side both count.
+    keywords: [ssh, sshd, sftp]
+    markers: ["golang.org/x/crypto/ssh", "NewServerConn", "ssh2", "paramiko", "openssh", "sshd", "containerPort: 22"]
+    why: "SSH в подах Kubernetes не используется ни сервером, ни клиентом — антипаттерн, доступ к контейнеру только через kubectl exec"
 
 # Правила сканеров, которые платформа закрывает по существу. Только те, где
 # проверка буквально не о приложении. Каждая запись обязана назвать факт выше,

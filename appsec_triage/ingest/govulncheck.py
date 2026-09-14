@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..models import CodeContext, DependencyInfo, Finding, Severity, TraceStep
 
@@ -157,5 +158,8 @@ def parse(path: Path) -> Iterator[Finding]:
                 advisory_url=f"https://pkg.go.dev/vuln/{advisory_id}",
                 imported=True,
             ),
-            raw={"advisory": advisory, "findings": occurrences},
+            raw={
+                "advisory": advisory,
+                "findings": occurrences,
+            },
         )

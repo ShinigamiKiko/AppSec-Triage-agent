@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from ..testpaths import is_test
+
 log = logging.getLogger(__name__)
 
 _INTERNAL_SEGMENT = re.compile(r"(?:^|/)internal(?:/|$)")
@@ -53,15 +55,14 @@ _ECOSYSTEM_SUFFIXES = {
     "nuget": {".cs"}, "rubygems": {".rb"}, "gem": {".rb"},
 }
 
-_TEST_PARTS = re.compile(
-    r"(^|[\\/])(tests?|spec|specs|__tests__|testing|fixtures?|e2e)([\\/]|$)", re.I)
-_TEST_FILE = re.compile(r"(Test|Spec)\.[a-z]+$|(^|[\\/])(test|spec)_", re.I)
+# What counts as a test is not decided here: the list lives in the file every
+# prompt carries (prompts/training-context.md), so the model and this search agree.
 
 _MAX_FILES = 8000
 _MAX_BYTES = 600_000
 
 _LINE_COMMENT = re.compile(r"(?://|#).*$")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def package_namespaces(ecosystem: str, package: str) -> list[str]:
@@ -87,8 +88,8 @@ def package_namespaces(ecosystem: str, package: str) -> list[str]:
 
 
 def _first_file_matching(
-    root: Path, ecosystem: str, patterns: "list[re.Pattern[str]]"
-) -> "tuple[Path | None, int] | None":
+    root: Path, ecosystem: str, patterns: list[re.Pattern[str]]
+) -> tuple[Path | None, int] | None:
     """First first-party file matching any pattern, as (relative path, index).
 
     `None` means the question could not be asked — no files of this language —
@@ -114,32 +115,56 @@ def _first_file_matching(
     return None, -1
 
 
-def package_is_used(root: Path | str, ecosystem: str, package: str) -> tuple[bool | None, str]:
-    """Is this package referenced anywhere in first-party code at all?
+def package_usage(root: Path | str, ecosystem: str, package: str) -> tuple[bool | None, str, bool]:
+    """(used, detail, test_only): is this package named in first-party production code?
 
     Deliberately coarse and deliberately conservative. A `true` says nothing on
     its own — the package is used, which the lockfile already implied. A `false`
-    is the useful direction: nothing in the repository names this library, so no
-    code path of ours enters it. Frameworks can still reach a package through a
-    container or autoloading, so this is evidence rather than proof, and it is
-    reported as such.
+    is the useful direction: nothing shipped names this library, so no code path
+    of ours enters it. Test code does not count as use — the test paths are the
+    list in prompts/training-context.md — and `test_only` says the name was seen
+    there and nowhere else. Frameworks can still reach a package through a
+    container or autoloading, so this is evidence rather than proof.
     """
     names = package_namespaces(ecosystem, package)
     if not names:
-        return None, "имя пакета не разобрано"
+        return None, "имя пакета не разобрано", False
 
-    patterns = [re.compile(rf"(?<![\w\\]){re.escape(n)}(?![\w])", re.I) for n in names]
-    hit = _first_file_matching(Path(root), ecosystem, patterns)
-    if hit is None:
-        return None, "в проекте нет файлов на языке пакета"
-    path, index = hit
-    if path is None:
-        return False, f"ни одно из имён ({', '.join(names)}) не встречается в коде проекта"
-    return True, f"{names[index]} встречается в {path}"
+    patterns = [re.compile(rf"(?<![\w\\]){re.escape(n)}(?![\w])", re.IGNORECASE) for n in names]
+    root = Path(root)
+    files, _ = _source_files(root, _ECOSYSTEM_SUFFIXES.get((ecosystem or "").strip().lower(), _SUFFIXES))
+    if not files:
+        return None, "в проекте нет файлов на языке пакета", False
+
+    test_hit = ""
+    for path in files:
+        try:
+            if path.stat().st_size > _MAX_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        index = next((i for i, pattern in enumerate(patterns) if pattern.search(text)), None)
+        if index is None:
+            continue
+        rel = path.relative_to(root).as_posix()
+        if is_test(rel):
+            test_hit = test_hit or f"{names[index]} встречается в {rel}"
+            continue
+        return True, f"{names[index]} встречается в {rel}", False
+    if test_hit:
+        return False, f"{test_hit} — только в тестовом коде", True
+    return False, f"ни одно из имён ({', '.join(names)}) не встречается в коде проекта", False
+
+
+def package_is_used(root: Path | str, ecosystem: str, package: str) -> tuple[bool | None, str]:
+    """`package_usage` without the test-only flag."""
+    used, detail, _ = package_usage(root, ecosystem, package)
+    return used, detail
 
 
 def import_path_used(
-    root: Path | str, ecosystem: str, paths: "list[str] | tuple[str, ...]"
+    root: Path | str, ecosystem: str, paths: list[str] | tuple[str, ...]
 ) -> tuple[bool | None, str]:
     """Is any of these exact import paths brought in by first-party code?
 
@@ -248,7 +273,7 @@ _DECLARATION_LINE = re.compile(
     r"|^\s*func\s*\([^)]*\)\s*\w+\s*\("
     r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?"
     r"(?:function\b|\([^)]*\)\s*=>)",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -273,7 +298,7 @@ def _call_patterns(function: str) -> re.Pattern[str]:
     return re.compile(
         rf"(?:->|::|\.|\$)\s*{name}\s*\("
         rf"|{declaration}(?<![\w$>:.]){name}\s*\(",
-        re.I,
+        re.IGNORECASE,
     )
 
 
@@ -312,11 +337,15 @@ def _class_is_bound(klass: str, text: str) -> bool:
     count.
     """
     name = re.escape(klass)
+    # Anything before the class name must be a namespace ending in a backslash:
+    # `[\w\\]*Parser` also matched `DateParser::parse`, binding a project class
+    # to a library one by a shared suffix.
+    qualified = rf"\\?(?:[\w\\]*\\)?{name}"
     binding = re.compile(
         rf"(?:^|\n)\s*(?:use|import|from)\s+[^\n;]*(?<![\w]){name}(?![\w])"
-        rf"|(?<![\w$])new\s+\\?[\w\\]*{name}\s*\("
-        rf"|(?<![\w$])\\?[\w\\]*{name}\s*::"
-        rf"|(?::|\|)\s*\\?[\w\\]*{name}(?![\w])"
+        rf"|(?<![\w$])new\s+{qualified}\s*\("
+        rf"|(?<![\w$\\]){qualified}\s*::"
+        rf"|(?::|\|)\s*{qualified}(?![\w])"
         rf"|(?<![\w$]){name}\s+\$[\w]+",
     )
     return bool(binding.search(text))
@@ -345,7 +374,7 @@ def _package_is_imported(package: str, text: str) -> bool:
         rf"""|(?:import\s+['"](?:{alternation})(?:/[^'"]*)?['"])"""
         rf"""|(?:^\s*(?:import|from)\s+(?:{alternation})\b)"""
         rf"""|(?:['"][^'"\s]*(?:{alternation})[^'"\s]*['"]\s*$)""",
-        re.M,
+        re.MULTILINE,
     )
     return bool(pattern.search(text))
 
@@ -383,6 +412,35 @@ def _source_files(root: Path, suffixes: set[str]) -> tuple[list[Path], bool]:
 
     _FILE_LISTS[key] = (files, truncated)
     return files, truncated
+
+
+_USE_ALIAS = re.compile(r"^\s*use\s+\\?([\w\\]+)\s+as\s+(\w+)\s*;", re.MULTILINE | re.IGNORECASE)
+
+
+def _class_aliases(text: str) -> dict[str, str]:
+    """`use Vendor\\Pkg\\Yaml as SfYaml;` → {"sfyaml": "yaml"}: the alias names that class."""
+    return {alias.lower(): name.rpartition("\\")[2].lower() for name, alias in _USE_ALIAS.findall(text)}
+
+
+def _call_on_this_class(line: str, call_re: re.Pattern[str], static_re: re.Pattern[str] | None,
+                        klass: str, aliases: dict[str, str]) -> re.Match[str] | None:
+    """The first call on the line that is not a static call naming a different class.
+
+    Only the calls a foreign `Other::method(` covers are set aside: an alias of
+    the class (`SfYaml::parse` for `Yaml`) is this class, and a second call on the
+    same line (`DateParser::parse($d) ?: $this->parser->parse($t)`) is still seen.
+    """
+    foreign: list[tuple[int, int]] = []
+    if static_re is not None:
+        own = {klass.lower(), "self", "static", "parent"}
+        for named in static_re.finditer(line):
+            short = named.group(1).rpartition("\\")[2].lower()
+            if short not in own and aliases.get(short) != klass.lower():
+                foreign.append((named.start(), named.end()))
+    for match in call_re.finditer(line):
+        if not any(start <= match.start() < end for start, end in foreign):
+            return match
+    return None
 
 
 def find_symbol(
@@ -428,6 +486,11 @@ def find_symbol(
                     f"({', '.join(sorted(suffixes))}) — вызывать неоткуда"))
     call_re = _call_patterns(function) if function else None
     class_re = _class_pattern(klass) if klass else None
+    # `Other::parse(` names its class: it is a call on that class, not a candidate
+    # for this one. Only calls whose receiver is unknown (`$x->parse(`) stay candidates.
+    static_re = (re.compile(rf"(?<![\w$\\])\\?((?:[A-Za-z_]\w*\\)*[A-Za-z_]\w*)\s*::\s*{re.escape(function)}\s*\(",
+                            re.IGNORECASE)
+                 if klass and function else None)
     tail = file_hint.lstrip("./").lower() if file_hint else ""
 
     calls: list[Hit] = []
@@ -453,12 +516,13 @@ def find_symbol(
             anchored = _class_is_bound(klass, body)
         else:
             anchored = _package_is_imported(package, body)
-        in_tests = bool(_TEST_PARTS.search(rel) or _TEST_FILE.search(rel))
+        in_tests = is_test(rel)
+        aliases = _class_aliases(body) if static_re is not None else {}
 
         for number, line in enumerate(body.splitlines(), 1):
             if _declares_a_function(line):
                 continue
-            if call_re is not None and (match := call_re.search(line)):
+            if call_re is not None and (match := _call_on_this_class(line, call_re, static_re, klass, aliases)):
                 column = line.find(function, match.start()) if function else match.start()
                 hit = Hit(rel, number, line.strip()[:160], in_tests,
                           column if column >= 0 else match.start())

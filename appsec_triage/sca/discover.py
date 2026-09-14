@@ -1,7 +1,7 @@
 """Dependency findings without a scanner: cdxgen names the packages, OSV the flaws.
 
-Until now the finding list came from Trivy. That works on a workstation and not
-in a sealed image: drop the scanner and the SCA half has nothing to triage, even
+The finding list can also come directly from Wolfee. This fallback works in
+a sealed image: drop the scanner and the SCA half still has something to triage, even
 though everything it needs — the SBOM and the advisory databases — is already
 wired in. A container that can build the graph but cannot start the pipeline is
 a container that does not work.

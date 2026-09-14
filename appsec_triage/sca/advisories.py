@@ -40,6 +40,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from . import cassette
+
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 30
@@ -130,7 +132,7 @@ def _get_json(url: str, body: bytes | None = None, headers: dict | None = None):
         try:
             request = urllib.request.Request(
                 url, data=body, headers={**_UA, **(headers or {})})
-            with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            with cassette.urlopen(request, timeout=_TIMEOUT) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:

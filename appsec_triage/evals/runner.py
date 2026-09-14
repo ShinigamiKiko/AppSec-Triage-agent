@@ -11,13 +11,29 @@ points at a real checkout), so the source resolver widens windows and the
 language servers answer origin questions exactly as they do in production —
 a bench that skips them scores a pipeline nobody actually runs, and its
 misses are the resolver's absence, not the model's.
+
+Dependency findings (SCA) go in the same corpus, carrying the native
+`dependency` object, and are scored separately under `by_kind`:
+
+    {"finding_id": "...", "scanner": "wolfee", "rule_id": "GHSA-...", "cwe": "CWE-502",
+     "file_path": "package-lock.json",
+     "dependency": {"package": "js-yaml", "ecosystem": "npm", "installed_version": "4.1.0",
+                    "reachability": "reachable", "call_site": "src/config.js:12"},
+     "label": "false_positive", "label_note": "only reads bundled config files"}
+
+The dependency chain runs only with `resolve_symbols` and a real checkout: it
+searches the project tree, and against materialized snippets every package
+reads as unused — a closure the bench would then score as correct. Its live
+lookups are pinned with a cassette (`sca/cassette.py`); without one, two runs
+of the same corpus also measure the network.
 """
 
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from ..config import PipelineConfig, load_provider_config
 from ..context.source import SourceResolver
@@ -26,6 +42,7 @@ from ..llm.factory import build_client
 from ..lsp.service import LSPService
 from ..pipeline import TriagePipeline
 from ..report import audit
+from ..sca import cassette
 from .materialize import materialize
 from .metrics import compare, score
 
@@ -55,6 +72,8 @@ def run_bench(
     progress: Callable[[int, int], None] | None = None,
     source_roots: list[Path] | None = None,
     no_lsp: bool = False,
+    resolve_symbols: bool = False,
+    scan_dir: Path | None = None,
 ) -> dict:
     corpus = Path(corpus)
     labels = load_labels(corpus)
@@ -64,6 +83,18 @@ def run_bench(
     findings = list(native.parse(corpus))
     if limit:
         findings = findings[:limit]
+
+    dependencies = sum(1 for f in findings if f.dependency is not None)
+    if resolve_symbols and dependencies and not source_roots:
+        raise BenchSetupError(
+            f"{dependencies} dependency finding(s) with --resolve-symbols need the real checkout "
+            "(--source-root): the chain searches the project tree, and against materialized "
+            "snippets every package reads as unused."
+        )
+    if resolve_symbols:
+        cfg.resolve_vulnerable_symbols = True
+    if scan_dir:
+        cfg.scan_out_dir = str(scan_dir)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +157,12 @@ def run_bench(
     result["source_roots"] = [str(r) for r in roots]
     result["materialized_corpus"] = materialized
     result["lsp"] = symbols is not None
+    result["dependency_findings"] = dependencies
+    result["sca_chain"] = bool(cfg.resolve_vulnerable_symbols)
+    result["http_cassette"] = {
+        "dir": os.environ.get(cassette.DIR_ENV),
+        "mode": os.environ.get(cassette.MODE_ENV, "replay") if os.environ.get(cassette.DIR_ENV) else None,
+    }
     if symbols:
         result["lsp_stats"] = dict(symbols.stats)
     result["source_stats"] = source.stats()

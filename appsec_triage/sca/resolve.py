@@ -38,17 +38,17 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import registries
-from .advisories import Advisory
 from ..prompts import registry
+from . import cassette, registries
+from .advisories import Advisory
 
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 45
 _MAX_DIFF = 60_000
 _SKIP_IN_DIFF = re.compile(
-    r"(^|/)(tests?|spec|fixtures?|samples?|docs?)/|CHANGELOG|\.md$", re.I)
-_NOT_SHIPPED = re.compile(r"(^|/)(samples?|tests?|docs?|examples?)/", re.I)
+    r"(^|/)(tests?|spec|fixtures?|samples?|docs?)/|CHANGELOG|\.md$", re.IGNORECASE)
+_NOT_SHIPPED = re.compile(r"(^|/)(samples?|tests?|docs?|examples?)/", re.IGNORECASE)
 
 SYSTEM = registry.step("symbol")
 
@@ -154,7 +154,7 @@ class VulnerableSymbol:
 def _fetch(url: str) -> str | None:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "appsec-triage"})
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+        with cassette.urlopen(request, timeout=_TIMEOUT) as response:
             return response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.debug("could not fetch %s: %s", url, exc)
@@ -212,7 +212,7 @@ def _declaration_pattern(name: str) -> re.Pattern[str]:
         rf"|(?:\b{escaped}\s*[:=]\s*(?:async\s+)?function\b)"
         rf"|(?:\b{escaped}\s*[:=]\s*(?:async\s+)?\([^)]*\)\s*=>)"
         rf"|(?:\bfunc\s+(?:\([^)]*\)\s*)?{escaped}\s*\()",
-        re.I,
+        re.IGNORECASE,
     )
 
 
@@ -304,7 +304,7 @@ def _declared(name: str, files: dict[str, str]) -> list[str]:
 _MAX_LISTED = 40
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
 _LOOKS_LIKE_A_FILE = re.compile(
-    r"\.(?:js|mjs|cjs|ts|php|py|go|rb|java|json|min\.js)$", re.I)
+    r"\.(?:js|mjs|cjs|ts|php|py|go|rb|java|json|min\.js)$", re.IGNORECASE)
 
 _JS_DIFF_DECL = re.compile(
     r"\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|"
@@ -550,7 +550,7 @@ class SymbolResolver:
     def _ask(self, user: str) -> dict:
         try:
             return json.loads(self._client.complete(SYSTEM, user, json_schema=SCHEMA).text)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider/schema failures are intentionally fail-soft
             log.warning("symbol extraction failed: %s", exc)
             return {"vulnerable_function": "", "vulnerable_class": "",
                     "vulnerable_file": "", "evidence": "", "why": f"ошибка модели: {exc}"}
@@ -649,8 +649,8 @@ class SymbolResolver:
             "Do not recommend upgrading the package.",
             "If the whole package is affected, use scope=package. If exploitation requires an action",
             "or runtime setting, put it in required_actions or preconditions.",
-            "Every evidence item must be copied verbatim from the advisory or diff. "
-            "Never paraphrase evidence.",
+            ("Every evidence item must be copied verbatim from the advisory or diff. "
+            "Never paraphrase evidence."),
             f"Advisory IDs: {advisory.advisory_id}, {', '.join(advisory.aliases)}",
             f"Package: {advisory.package} ({advisory.ecosystem})",
             f"Language hint: {advisory.ecosystem or 'unknown'}",

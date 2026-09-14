@@ -65,7 +65,7 @@ class BaseHTTPClient(ABC):
     modes are identical over HTTP; only the request/response shape differs.
     """
 
-    def __init__(self, cfg: "ProviderConfig") -> None:  # noqa: F821 - forward ref, see config.py
+    def __init__(self, cfg: ProviderConfig) -> None:  # noqa: F821 - forward ref, see config.py
         self.cfg = cfg
         self.name = cfg.name
         self.model = cfg.model

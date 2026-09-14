@@ -8,8 +8,9 @@ the *shape* is fixed: one object per finding, a file path, and a snippet.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..models import CodeContext, DependencyInfo, Finding, Severity, TraceStep
 
@@ -110,9 +111,15 @@ def _to_finding(obj: dict[str, Any], fallback_id: str) -> Finding:
             ecosystem=(str(v) if (v := raw_dependency.get("ecosystem")) else None),
             installed_version=(str(v) if (v := raw_dependency.get("installed_version")) else None),
             fixed_versions=[str(x) for x in (raw_dependency.get("fixed_versions") or [])],
+            advisory_aliases=[str(x) for x in (raw_dependency.get("advisory_aliases") or [])],
             advisory_url=(str(v) if (v := raw_dependency.get("advisory_url")) else None),
             dev_only=raw_dependency.get("dev_only"),
             imported=raw_dependency.get("imported"),
+            # A reachability verdict and its call site are what the chain asks
+            # CodeQL about; dropping them here benched a chain that never ran.
+            reachability=(str(v) if (v := raw_dependency.get("reachability")) else None),
+            call_site=(str(v) if (v := raw_dependency.get("call_site")) else None),
+            call_line=(str(v) if (v := raw_dependency.get("call_line")) else None),
         )
 
     return Finding(

@@ -59,9 +59,7 @@ def _needs_redo(record: TriageRecord, redo: tuple[str, ...]) -> bool:
         return True
     if "error" in redo and record.error:
         return True
-    if "overridden" in redo and record.overrides:
-        return True
-    return False
+    return bool("overridden" in redo and record.overrides)
 
 
 @dataclass(slots=True)

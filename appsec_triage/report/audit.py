@@ -9,19 +9,19 @@ from __future__ import annotations
 
 import json
 import platform
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
+    from ..models import TriageRecord
     from ..pipeline import TriageRun
 
 
-def write_jsonl(run: "TriageRun", path: Path) -> Path:
+def write_jsonl(run: TriageRun, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = datetime.now(UTC).isoformat()
     with path.open("w", encoding="utf-8") as fh:
         for record in run.records:
             row = record.model_dump(mode="json")
@@ -35,7 +35,7 @@ def write_jsonl(run: "TriageRun", path: Path) -> Path:
 _PROVENANCE_KEYS = ("decided_at", "prompt_pack", "host")
 
 
-def _from_row(row: dict) -> "TriageRecord":
+def _from_row(row: dict) -> TriageRecord:
     """One audit line back into a record, provenance stripped."""
     from ..models import TriageRecord
 
@@ -44,7 +44,7 @@ def _from_row(row: dict) -> "TriageRecord":
     return TriageRecord.model_validate(row)
 
 
-def read_jsonl(path: Path) -> list["TriageRecord"]:
+def read_jsonl(path: Path) -> list[TriageRecord]:
     """Load an audit log back into records. Inverse of `write_jsonl`."""
     return [
         _from_row(json.loads(line))
@@ -53,7 +53,7 @@ def read_jsonl(path: Path) -> list["TriageRecord"]:
     ]
 
 
-def write_summary(run: "TriageRun", path: Path) -> Path:
+def write_summary(run: TriageRun, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     counts = run.counts()
@@ -64,7 +64,7 @@ def write_summary(run: "TriageRun", path: Path) -> Path:
 
     latencies = sorted(r.latency_ms for r in run.records if r.latency_ms)
     summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         **(run.coverage.as_dict() if run.coverage is not None else {"coverage_complete": None}),
         "provider": run.provider,
         "model": run.model,
@@ -118,7 +118,7 @@ class Journal:
         self._prompt_pack = prompt_pack
         self._fh = None
 
-    def __enter__(self) -> "Journal":
+    def __enter__(self) -> Self:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = self.path.open("a", encoding="utf-8")
         return self
@@ -132,7 +132,7 @@ class Journal:
         if not self._fh:
             return
         row = record.model_dump(mode="json")
-        row["decided_at"] = datetime.now(timezone.utc).isoformat()
+        row["decided_at"] = datetime.now(UTC).isoformat()
         row["prompt_pack"] = self._prompt_pack
         row["host"] = platform.node()
         self._fh.write(json.dumps(row, ensure_ascii=False) + "\n")

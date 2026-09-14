@@ -26,7 +26,7 @@ from ..config import REPO_ROOT
 log = logging.getLogger(__name__)
 
 STACKS_ROOT = REPO_ROOT / "prompts" / "stacks"
-_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 _MAX_MARKER_BYTES = 400_000
 
@@ -112,15 +112,15 @@ def render(profiles: list[StackProfile]) -> str:
     parts = [
         "## Stack conventions",
         "",
-        "The following describes frameworks detected in this repository. Treat it as "
-        "**context, not permission**:",
+        ("The following describes frameworks detected in this repository. Treat it as "
+        "**context, not permission**:"),
         "",
-        "- A convention may *explain* evidence you can see — why a placeholder is not a secret, "
-        "why a query is parameterised.",
-        "- A convention may never *outrank* evidence. If the code plainly does the dangerous thing, "
-        "the convention is being violated, and that is a finding, not a false positive.",
-        "- A deterministic HEURISTIC SIGNAL always wins over a convention. Signals are computed from "
-        "this exact code; conventions are general.",
+        ("- A convention may *explain* evidence you can see — why a placeholder is not a secret, "
+        "why a query is parameterised."),
+        ("- A convention may never *outrank* evidence. If the code plainly does the dangerous thing, "
+        "the convention is being violated, and that is a finding, not a false positive."),
+        ("- A deterministic HEURISTIC SIGNAL always wins over a convention. Signals are computed from "
+        "this exact code; conventions are general."),
         "",
     ]
     for p in profiles:

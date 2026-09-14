@@ -1,6 +1,6 @@
 """Widen the code window by reading the real file.
 
-Scanners crop aggressively. Bandit's `code` for a multi-line call starts at the
+Scanners crop aggressively. A scanner's `code` for a multi-line call starts at the
 flagged line, so `subprocess.Popen(` never appears — the model correctly infers
 the call and then fails the grounding check because it cannot quote it. On a
 real repository that accounted for most of the remaining hallucination flags.

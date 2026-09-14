@@ -10,7 +10,7 @@ calls outwards and asks whether any of them is an entry point — a controller
 action, a route handler. That establishes the call is reachable from outside,
 and nothing about what flows into it.
 
-*CodeQL* knows dataflow. Its taint queries carry a path from an untrusted source
+*CodeQL and Psalm* model dataflow. Their taint queries carry a path from an untrusted source
 to a sink. If a path ends at one of our call sites, an attacker's value arrives
 there. That establishes the flow, and nothing about whether the query modelled
 this particular library correctly.
@@ -25,10 +25,14 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlsplit
+
 from ..prompts import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -85,16 +89,16 @@ def needs_input_path(cwe: str | None) -> bool:
 
 
 def _entrypoint_above(
-    lsp: "LSPService",
-    routes: "RouteIndex | None",
-    hit: "Hit",
+    lsp: LSPService,
+    routes: RouteIndex | None,
+    hit: Hit,
     root: Path,
 ) -> tuple[str, str]:
     """Walk incoming calls outwards; return (description, problem)."""
     language = lsp.cfg.language_for(hit.file)
     if not language:
         return "", f"нет языкового сервера для {hit.file}"
-    client = lsp._client(language)  # noqa: SLF001 - single accessor, kept internal
+    client = lsp._client(language)
     if client is None:
         return "", f"языковой сервер {language} не запустился"
     if not client.supports("callHierarchyProvider"):
@@ -135,29 +139,71 @@ def _entrypoint_above(
 
 
 
-def _taint_into(findings: Iterable["Finding"], hits: Iterable["Hit"]) -> tuple[str, str]:
-    """A CodeQL dataflow whose sink lands on one of our call sites."""
-    targets = {(h.file.replace("\\", "/"), h.line) for h in hits}
-    files = {f for f, _ in targets}
-    saw_any = False
+def _trace_file(file: str, root: Path, *, psalm: bool = False) -> str | None:
+    """Repository-relative identity, including scanner-specific virtual roots."""
+    file = file.replace("\\", "/")
+    if file.startswith("file:"):
+        try:
+            uri = urlsplit(file)
+        except ValueError:
+            return None
+        if uri.netloc not in ("", "localhost") or uri.query or uri.fragment:
+            return None
+        file = unquote(uri.path).replace("\\", "/")
+        if not file.startswith("/"):
+            return None
+    if not file or file == "<unknown>" or any(ord(ch) < 32 for ch in file):
+        return None
+    file = posixpath.normpath(file)
+    if psalm and file.startswith("../"):
+        # An autonomous Psalm config is rooted in the output directory, so its
+        # SARIF can name project files as ../src/Foo.php. Only accept the
+        # stripped path when it resolves inside the actual scanned root.
+        candidate = file
+        while candidate.startswith("../"):
+            candidate = candidate[3:]
+            if (root / candidate).is_file():
+                file = candidate
+                break
+    bases = [root.resolve().as_posix().rstrip("/") + "/"]
+    for base in bases:
+        if file.startswith(base):
+            return file[len(base):]
+    if file.startswith(("/", "../")) or ":" in file or file in (".", ".."):
+        return None
+    return file
+
+
+def _taint_into(
+    findings: Iterable[Finding], hits: Iterable[Hit], root: Path,
+) -> tuple[str, str, str]:
+    """Return (path, problem, scanner) for a trace ending at a call site."""
+    targets = {
+        (path, h.line)
+        for h in hits if h.line > 0
+        for path in (_trace_file(h.file, root), _trace_file(h.file, root, psalm=True))
+        if path is not None
+    }
     for finding in findings:
-        if (finding.scanner or "").lower() != "codeql":
+        scanner = (finding.scanner or "").strip().lower()
+        if scanner not in {"codeql", "psalm"}:
             continue
-        saw_any = True
         steps = finding.trace or []
-        if not steps:
+        if len(steps) < 2 or not steps[0].file_path or not steps[0].line or steps[0].line < 1:
+            continue
+        source = steps[0]
+        source_file = _trace_file(source.file_path, root, psalm=scanner == "psalm")
+        if source_file is None:
             continue
         sink = steps[-1]
-        sink_file = (sink.file_path or "").replace("\\", "/")
-        if sink_file not in files:
+        sink_file = _trace_file(sink.file_path or "", root, psalm=scanner == "psalm")
+        if sink_file is None or not sink.line or sink.line < 1:
             continue
-        if any(sink_file == f and abs((sink.line or 0) - line) <= 3 for f, line in targets):
-            source = steps[0]
-            return (f"{source.file_path}:{source.line} -> {sink_file}:{sink.line} "
-                    f"({finding.rule_id or finding.title})"), ""
-    if not saw_any:
-        return "", "CodeQL не отработал — потоков данных нет"
-    return "", "CodeQL отработал, но потока в эту точку не нашёл"
+        if (sink_file, sink.line) in targets:
+            return (f"{scanner}: {source_file}:{source.line} -> {sink_file}:{sink.line} "
+                    f"({finding.rule_id or finding.title})"), "", scanner
+    # Findings alone cannot establish whether a scanner ran or covered this sink.
+    return "", "no matching CodeQL/Psalm source-to-sink trace supplied; coverage unknown", ""
 
 
 
@@ -179,9 +225,9 @@ _TAINT_CONTEXT_LINES = 25
 def _taint_by_model(hits, root: Path, client, symbol: str) -> tuple[str, str, str]:
     """(verdict, quote, why) for whether untrusted input reaches the call.
 
-    The pair of tools answers this only where both can run: CodeQL needs a
-    database for the language, the language server needs a call graph, and
-    neither exists for PHP. Reading the file is what a reviewer does instead,
+    Scanner traces and the language server answer this only where their models
+    cover the code. CodeQL has no PHP
+    extractor. Reading the file is what a reviewer does when traces are missing,
     and it is held to the same rule as every other model answer here — quote
     the material or be discarded.
     """
@@ -222,15 +268,19 @@ def _taint_by_model(hits, root: Path, client, symbol: str) -> tuple[str, str, st
 
 
 def assess(
-    hits: list["Hit"],
+    hits: list[Hit],
     root: Path | str,
     *,
-    lsp: "LSPService | None",
-    routes: "RouteIndex | None",
-    codeql_findings: Iterable["Finding"] = (),
+    lsp: LSPService | None,
+    routes: RouteIndex | None,
+    codeql_findings: Iterable[Finding] = (),
     client=None,
 ) -> ReachResult:
-    """Both halves, or `UNKNOWN`. Never "safe" from a missing tool."""
+    """Both halves, or `UNKNOWN`. Never "safe" from a missing tool.
+
+    codeql_findings contains CodeQL and Psalm traces; retain the keyword used by
+    callers while reporting the actual scanner that supplied evidence.
+    """
     if not hits:
         return ReachResult(Reachability.UNKNOWN, detail="нет мест вызова для проверки")
 
@@ -250,18 +300,18 @@ def assess(
         missing.append(f"lsp ({entry_problem})")
 
     findings = list(codeql_findings)
-    taint, taint_problem = _taint_into(findings, hits)
+    taint, taint_problem, taint_tool = _taint_into(findings, hits, root)
     if taint:
-        used.append("codeql")
+        used.append(taint_tool)
     else:
-        missing.append(f"codeql ({taint_problem})")
+        missing.append(f"dataflow ({taint_problem})")
 
     if not taint:
         verdict, quote, why = _taint_by_model(hits, root, client, str(hits[0]) if hits else "")
         if verdict == "yes":
             taint = f"по чтению кода: {why} | цитата: {quote[:120]}"
             used.append("модель")
-            missing = [m for m in missing if not m.startswith("codeql")]
+            taint_tool = "модель (чтение кода)"
         elif verdict == "no":
             return ReachResult(
                 Reachability.NO_INPUT_PATH, entry, "", [*used, "модель"], missing,
@@ -271,17 +321,7 @@ def assess(
     if entry and taint:
         return ReachResult(
             Reachability.REACHABLE, entry, taint, used, missing,
-            detail="точка входа найдена языковым сервером, поток данных — CodeQL",
-        )
-
-    both_ran = ("не отработал" not in taint_problem
-                and "не запустился" not in entry_problem
-                and "нет языкового сервера" not in entry_problem
-                and "не подключён" not in entry_problem)
-    if both_ran and not entry and not taint:
-        return ReachResult(
-            Reachability.NO_INPUT_PATH, tools_used=["lsp", "codeql"], tools_missing=[],
-            detail=f"{entry_problem}; {taint_problem}",
+            detail=f"точка входа найдена языковым сервером, поток данных — {taint_tool}",
         )
 
     return ReachResult(

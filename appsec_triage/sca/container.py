@@ -115,7 +115,7 @@ if yaml is not None:  # pragma: no branch - trivial
         """
 
 
-    def _ignore_tag(loader, suffix, node):  # noqa: ANN001 - pyyaml signature
+    def _ignore_tag(loader, suffix, node):
         if isinstance(node, yaml.ScalarNode):
             return loader.construct_scalar(node)
         if isinstance(node, yaml.SequenceNode):
@@ -210,7 +210,7 @@ def property_type(text: str, prop: str) -> str:
         rf"function\s+__construct\s*\([^)]*?\??([\w\\]+)\s+\${name}\b",
     )
     for pattern in patterns:
-        match = re.search(pattern, text, re.S)
+        match = re.search(pattern, text, re.DOTALL)
         if match:
             found = match.group(1)
             if found.lower() not in ("array", "string", "int", "float", "bool",
@@ -222,8 +222,8 @@ def property_type(text: str, prop: str) -> str:
 
 def class_of_file(text: str) -> str:
     """The fully qualified class this file declares, for keying configuration."""
-    namespace = re.search(r"^\s*namespace\s+([\w\\]+)\s*;", text, re.M)
-    declared = re.search(r"^\s*(?:final\s+|abstract\s+)*class\s+(\w+)", text, re.M)
+    namespace = re.search(r"^\s*namespace\s+([\w\\]+)\s*;", text, re.MULTILINE)
+    declared = re.search(r"^\s*(?:final\s+|abstract\s+)*class\s+(\w+)", text, re.MULTILINE)
     if not declared:
         return ""
     return f"{namespace.group(1)}\\{declared.group(1)}" if namespace else declared.group(1)

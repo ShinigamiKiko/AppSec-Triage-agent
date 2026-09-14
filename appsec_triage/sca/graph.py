@@ -154,11 +154,11 @@ class DependencyGraph:
         return bool(self._nodes)
 
     @classmethod
-    def empty(cls) -> "DependencyGraph":
+    def empty(cls) -> DependencyGraph:
         return cls({}, set(), set())
 
     @classmethod
-    def from_project(cls, root: Path | str) -> "DependencyGraph":
+    def from_project(cls, root: Path | str) -> DependencyGraph:
         """cdxgen, and nothing else.
 
         A second source is a second set of quirks: a hand-written lockfile
@@ -191,7 +191,7 @@ class DependencyGraph:
         return graph
 
     @classmethod
-    def from_sbom_file(cls, path: Path | str) -> "DependencyGraph":
+    def from_sbom_file(cls, path: Path | str) -> DependencyGraph:
         """An SBOM built by an earlier pipeline stage."""
         document, problem = sbom_mod.read(Path(path))
         if document is None:
@@ -200,7 +200,7 @@ class DependencyGraph:
         return cls._from_sbom(document)
 
     @classmethod
-    def _from_sbom(cls, document: dict) -> "DependencyGraph":
+    def _from_sbom(cls, document: dict) -> DependencyGraph:
         parts = sbom_mod.components(document)
         links = sbom_mod.edges(document)
         root = sbom_mod.root_ref(document)

@@ -124,7 +124,7 @@ def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str
         if len(name) >= 3:
             patterns.append(rf"\b{re.escape(name.split('/')[-1])}\b")
 
-    return [re.compile(p, re.I) for p in patterns]
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
 def is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool | None:

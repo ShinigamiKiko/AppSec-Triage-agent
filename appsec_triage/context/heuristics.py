@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from ..config import HeuristicsConfig
 from ..models import Finding, HeuristicSignal
+from ..testpaths import is_test
 
 TEMPLATE_PATTERNS = [
     re.compile(r"\$\{[A-Za-z0-9_.\-]+\}"),
@@ -30,7 +31,7 @@ TEMPLATE_PATTERNS = [
 ]
 
 UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-HEX_ID_RE = re.compile(r"\b(?:trace|request|span|correlation|session)[_-]?id\b", re.I)
+HEX_ID_RE = re.compile(r"\b(?:trace|request|span|correlation|session)[_-]?id\b", re.IGNORECASE)
 
 DEFAULT_PLACEHOLDER_MARKERS = [
     "placeholder", "dummy", "sample", "example", "changeme", "change_me",
@@ -56,7 +57,7 @@ KNOWN_SECRET_SHAPES = [
 ]
 
 SECRETISH_VAR_RE = re.compile(
-    r"\b(pass(word|wd)?|secret|token|api[_-]?key|apikey|private[_-]?key|credential|passphrase)\b", re.I
+    r"\b(pass(word|wd)?|secret|token|api[_-]?key|apikey|private[_-]?key|credential|passphrase)\b", re.IGNORECASE
 )
 
 DISABLED_TLS_RE = re.compile(
@@ -72,7 +73,7 @@ DISABLED_TLS_RE = re.compile(
       | NSAllowsArbitraryLoads
       | ssl\._create_unverified_context
       | CERT_NONE)""",
-    re.I | re.X,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 SQL_INTERPOLATION_RE = re.compile(
@@ -84,12 +85,12 @@ SQL_INTERPOLATION_RE = re.compile(
           # requiring `\w` alone silently missed the commonest PHP form.
         | \b(?:SELECT|INSERT|UPDATE|DELETE)\b[^;\n]*["']\s*[+.]\s*[\w$]
         )""",
-    re.I | re.X,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 SQL_INJECTION_CWES = {"CWE-89", "CWE-564", "CWE-943"}
 
-FRAMEWORK_DEFAULT_CONFIG_RE = re.compile(r"(^|/)\.env(\.(dist|example|test|dev))?$", re.I)
+FRAMEWORK_DEFAULT_CONFIG_RE = re.compile(r"(^|/)\.env(\.(dist|example|test|dev))?$", re.IGNORECASE)
 
 CLASS_FQN_RE = re.compile(
     r"^(?:\\?[A-Za-z_]\w*\\){2,}[A-Za-z_]\w*$"
@@ -108,12 +109,12 @@ RANDOMNESS_FAMILY_CWES = {"CWE-330", "CWE-338", "CWE-336", "CWE-337"}
 SECURITY_CONSUMER_RE = re.compile(
     r"\b\w*(session[_-]?id|csrf|xsrf|nonce|salt|otp|api[_-]?key|secret|token|password|"
     r"reset[_-]?code|invite[_-]?code|auth[_-]?code|iv|seed|key)\w*\b",
-    re.I,
+    re.IGNORECASE,
 )
 NONSECURITY_CONSUMER_RE = re.compile(
     r"\b\w*(jitter|backoff|delay|sleep|shuffle|sample|shard|replica|"
     r"animation|placeholder|cache[_-]?bust|dither|noise)\w*\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -149,9 +150,18 @@ def shannon_entropy(s: str) -> float:
 def _noisy_zone(path: str, patterns: list[str]) -> tuple[bool, str | None]:
     normalized = path.replace("\\", "/")
     for pat in patterns:
-        if re.search(pat, normalized, re.I):
+        if re.search(pat, normalized, re.IGNORECASE):
             return True, pat
     return False, None
+
+
+def _is_test_path(path: str) -> bool:
+    """Identify code that is not part of the production artifact.
+
+    The list is the one in prompts/training-context.md, shared with the prompts
+    and the dependency chain, so the three cannot disagree about what a test is.
+    """
+    return is_test(path)
 
 
 def evaluate(finding: Finding, cfg: HeuristicsConfig) -> HeuristicResult:
@@ -164,6 +174,16 @@ def evaluate(finding: Finding, cfg: HeuristicsConfig) -> HeuristicResult:
     markers = cfg.placeholder_markers or DEFAULT_PLACEHOLDER_MARKERS
 
     in_noisy, noisy_reason = _noisy_zone(path, noisy_patterns)
+    in_test_path = _is_test_path(path)
+    if in_test_path:
+        signals.append(
+            HeuristicSignal(
+                name="test_path",
+                detail=f"path is test-only code: {path}",
+                direction="toward_fp",
+                weight=1.0,
+            )
+        )
     if in_noisy:
         signals.append(
             HeuristicSignal(
@@ -340,7 +360,9 @@ def evaluate(finding: Finding, cfg: HeuristicsConfig) -> HeuristicResult:
     toward_confirmed = any(s.direction == "toward_confirmed" for s in signals)
     hard_fp = False
     hard_fp_reason = None
-    if cfg.autoclose_on_hard_fp and not toward_confirmed:
+    if in_test_path and not toward_confirmed:
+        hard_fp, hard_fp_reason = True, "finding is inside a test-only path"
+    elif cfg.autoclose_on_hard_fp and not toward_confirmed:
         if "template_expression" in names:
             hard_fp, hard_fp_reason = True, "literal is a config template expression"
         elif "uuid_literal" in names and in_noisy:

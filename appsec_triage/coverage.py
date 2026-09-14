@@ -2,7 +2,7 @@
 
 A scan where a scanner failed still produces a clean-looking report: fewer
 findings, no errors, exit zero. The reader has no way to tell "we looked and
-found little" from "half the tools never ran". On a real project Trivy died on
+found little" from "half the tools never ran". On a real project a scanner died on
 a single compiled artifact and the whole dependency layer vanished — more than
 half the findings — and it was noticed only because someone read the log.
 
@@ -18,11 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _COVERAGE = {
-    "semgrep": "pattern rules — secrets, PHP injection sinks, JS/TS weaknesses",
     "codeql": "dataflow traces for Go, Python, JS/TS, Java and C-family code",
-    "psalm": "PHP taint analysis — cross-function dataflow that semgrep cannot see",
-    "trivy": "vulnerable dependencies (SCA) and configuration checks",
-    "gitleaks": "secrets in the working tree and in git history",
+    "psalm": "PHP taint analysis — source-to-sink paths across functions",
+    "wolfee": "vulnerable dependencies (SCA) with source-aware reachability",
 }
 
 

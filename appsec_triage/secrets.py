@@ -28,11 +28,11 @@ _PLACEHOLDER_WORDS = re.compile(
     r"^(?:changeme|change_me|password|passwd|secret|token|example|sample|dummy|test|testing|"
     r"local|localhost|dev|development|root|toor|admin|user|guest|none|null|empty|todo|fixme|"
     r"your[_-]?\w*|my[_-]?\w*|xxx+|foo|bar|baz|placeholder|redacted|hidden|\*+|\.+|-+)$",
-    re.I,
+    re.IGNORECASE,
 )
 _TEMPLATE = re.compile(r"^\s*(?:\$\{[^}]*\}|%[^%]+%|\{\{[^}]*\}\}|<[^>]+>|\$[A-Z_]+)\s*$")
 
-_DSN_PASSWORD = re.compile(r"^[a-z][a-z0-9+.\-]*://[^:/@\s]+:(?P<password>[^@/\s]*)@\S+$", re.I)
+_DSN_PASSWORD = re.compile(r"^[a-z][a-z0-9+.\-]*://[^:/@\s]+:(?P<password>[^@/\s]*)@\S+$", re.IGNORECASE)
 
 _MIN_KEY_LENGTH = 16
 _MIN_KEY_ENTROPY = 3.5
@@ -67,8 +67,8 @@ def classify(value: str | None) -> tuple[str, str]:
     if len(raw) >= _MIN_KEY_LENGTH and entropy >= _MIN_KEY_ENTROPY and not any(c.isspace() for c in raw):
         return (
             "credential",
-            f"{len(raw)} characters at entropy {entropy:.2f} with no dictionary structure — "
-            "this is a generated credential, not a placeholder",
+            (f"{len(raw)} characters at entropy {entropy:.2f} with no dictionary structure — "
+            "this is a generated credential, not a placeholder"),
         )
     if len(raw) < _MIN_KEY_LENGTH and entropy < _MIN_KEY_ENTROPY and _reads_as_a_word(raw):
         return "placeholder", f"`{raw}` is a short dictionary-shaped default, not a generated key"
@@ -113,7 +113,7 @@ def _looks_like_identifier(value: str) -> bool:
     """
     if value.startswith(("/", "@", "\\", "./", "%", "$")) or "\\" in value:
         return True
-    if re.search(r"\.(php|ya?ml|json|xml|twig|html?|js|ts|png|jpe?g|svg|sql|txt|md)$", value, re.I):
+    if re.search(r"\.(php|ya?ml|json|xml|twig|html?|js|ts|png|jpe?g|svg|sql|txt|md)$", value, re.IGNORECASE):
         return True
 
     parts = [p for p in _SEGMENTS.split(value) if p]

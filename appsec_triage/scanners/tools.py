@@ -1,4 +1,4 @@
-"""Concrete scanners: Semgrep · CodeQL · Bandit · Trivy · Gitleaks.
+"""Concrete scanners: CodeQL · Psalm · Wolfee.
 
 Each one is small; the interesting content is the per-tool quirks, which is
 exactly what a config file cannot express.
@@ -10,12 +10,12 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
 
-from ..config import REPO_ROOT
-from .base import Availability, ScanResult, Scanner, _first_line
+from .base import Availability, Scanner, ScannerError, ScanResult
 
 log = logging.getLogger(__name__)
 
@@ -35,222 +35,56 @@ def exclude_directory(name: str) -> None:
     Needed because the output directory usually sits *inside* the tree being
     scanned — `appsec-triage run . -o appsec-out` is the ordinary CI shape, and
     in CI the artefacts have to stay in the project. Left alone, the second
-    phase would extract the CodeQL database the first phase wrote, semgrep would
+    phase would extract the CodeQL database the first phase wrote, and every
     read the SARIF as source, and every rerun would grow what it scans.
     """
     name = (name or "").strip().strip("/")
     if not name or "/" in name:
         return
     _SKIP_DIRS.add(name)
-    if name not in _SEMGREP_EXCLUDES:
-        _SEMGREP_EXCLUDES.append(name)
-_SEMGREP_EXCLUDES = [
-    ".git", "vendor", "node_modules", ".run", "var", "cache", "logs",
-    "_data", "_output", "build", "dist", "tmp", "tests", "tests-codeception",
-]
 
+class WolfeeScanner(Scanner):
+    """Wolfee SCA scan with source-aware dependency reachability."""
 
-class SemgrepScanner(Scanner):
-    """Semgrep. No native Windows build exists, so Docker is the usual route.
-
-    `--sarif` writes to stdout, which keeps the container filesystem read-only.
-    The default ruleset needs network access to fetch `p/default`; a local
-    ruleset (`--config <dir>`) runs fully offline — see the config comment.
-    """
-
-    name = "semgrep"
-
-    @property
-    def success_exit_codes(self) -> frozenset[int]:
-        """0 clean · 1 findings · 2 partial · 7 invalid rules.
-
-        2 is allowed because Semgrep returns it after a fully successful scan
-        whenever a single target was skipped (an oversized file is enough).
-        Trusting the exit code alone would either reject good scans or accept
-        broken ones, so the real gate is `report_health`, which reads
-        `executionSuccessful` out of the SARIF. 7 stays fatal: an invalid
-        ruleset means nothing was checked.
-        """
-        return frozenset({0, 1, 2})
-
-    def _native_version_argv(self) -> list[str] | None:
-        return [self.resolve_binary("semgrep"), "--version"]
-
-    def local_rules_path(self) -> Path | None:
-        if not self.cfg.local_rules_dir:
-            return None
-        path = (REPO_ROOT / self.cfg.local_rules_dir).resolve()
-        return path if path.is_dir() else None
-
-    def _rules_args(self, mounted_at: str | None = None) -> list[str]:
-        """Local rules win: the registry needs semgrep.dev, which a closed loop
-        cannot reach — and depending on it would contradict the whole design."""
-        if local := self.local_rules_path():
-            return ["--config", mounted_at or str(local)]
-        return [arg for rule in self.cfg.rules for arg in ("--config", rule)]
-
-    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            self.resolve_binary("semgrep"), "scan", *self._rules_args(),
-            *(arg for directory in _SEMGREP_EXCLUDES for arg in ("--exclude", directory)),
-            "--sarif", "--quiet", "--no-git-ignore", "--disable-version-check",
-            "--metrics", "off",
-            "--timeout", str(self.cfg.per_file_timeout_s),
-            str(target),
-        ]
-
-    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        local = self.local_rules_path()
-        prefix = ["docker", "run", "--rm", "-v", f"{target}:/src:ro", "-w", "/src"]
-        if local:
-            prefix += ["-v", f"{local}:/rules:ro", "--network", "none"]
-        elif not self.cfg.docker_network:
-            prefix += ["--network", "none"]
-        prefix += [*self.cfg.docker_args, self.cfg.image or ""]
-        return [
-            *prefix,
-            "semgrep", "scan", *self._rules_args(mounted_at="/rules" if local else None),
-            *(arg for directory in _SEMGREP_EXCLUDES for arg in ("--exclude", directory)),
-            "--sarif", "--quiet", "--no-git-ignore", "--disable-version-check",
-            "--metrics", "off",
-            "--timeout", str(self.cfg.per_file_timeout_s),
-            "/src",
-        ]
-
-
-class BanditScanner(Scanner):
-    """Bandit (Python). Invoked as the `bandit` console script on PATH.
-
-    Not `python -m bandit`: bandit is installed in its own isolated environment
-    (pipx), so the interpreter running this process cannot import it. The
-    console script is the portable entry point regardless of how it was
-    installed; override the path with `binary:` in the scanner profile if needed.
-
-    Bandit exits 1 whenever it finds anything, which the base class already
-    treats as normal. Its JSON is not SARIF; the bandit ingest adapter handles it.
-    """
-
-    name = "bandit"
-
-    @property
-    def output_suffix(self) -> str:
-        return ".json"
-
-    def _native_version_argv(self) -> list[str] | None:
-        return [self.resolve_binary("bandit"), "--version"]
-
-    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        argv = [self.resolve_binary("bandit"), "-r", str(target), "-f", "json", "-q"]
-        if self.cfg.severity:
-            argv.append("-" + "l" * {"low": 1, "medium": 2, "high": 3}.get(self.cfg.severity, 1))
-        return argv
-
-    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [*self._docker_prefix(target), "bandit", "-r", "/src", "-f", "json", "-q"]
-
-    def count_findings(self, path: Path) -> int:
-        try:
-            return len(json.loads(path.read_text(encoding="utf-8")).get("results") or [])
-        except (OSError, json.JSONDecodeError):
-            return 0
-
-
-class TrivyScanner(Scanner):
-    """Trivy filesystem scan: misconfigurations, secrets, vulnerable dependencies.
-
-    Note this is the one tool here that legitimately produces CVEs — its
-    `vuln` scanner reads dependency manifests, which is SCA, not SAST.
-    """
-
-    name = "trivy"
-
-    @property
-    def success_exit_codes(self) -> frozenset[int]:
-        return frozenset({0})
-
-    def _native_version_argv(self) -> list[str] | None:
-        return ["trivy", "--version"]
-
-    def _scanners_arg(self) -> list[str]:
-        return ["--scanners", ",".join(self.cfg.rules or ["vuln", "secret", "misconfig"])]
-
-    def _skip_args(self) -> list[str]:
-        """Directories of build output that are not dependency manifests.
-
-        Not an optimisation. On a real Python repository trivy timed out on a
-        single `__pycache__/*.pyc` and aborted the *entire* scan — the whole SCA
-        leg for that project was lost to one compiled artifact. Nothing of value
-        is given up: none of these directories carries a manifest or a lockfile.
-        """
-        skip = ["__pycache__", "node_modules", ".git", "vendor/bundle", ".venv", "venv"]
-        args: list[str] = []
-        for directory in skip:
-            args += ["--skip-dirs", f"**/{directory}"]
-        return args
-
-    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            "trivy", "fs", "--format", "sarif", "--quiet",
-            *self._scanners_arg(), *self._skip_args(), str(target),
-        ]
-
-    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            *self._docker_prefix(target), "fs", "--format", "sarif", "--quiet",
-            *self._scanners_arg(), *self._skip_args(), "/src",
-        ]
-
-
-class GitleaksScanner(Scanner):
-    """Gitleaks: secrets in the working tree and in history."""
-
-    name = "gitleaks"
-
-    @property
-    def success_exit_codes(self) -> frozenset[int]:
-        return frozenset({0})
-
-    def _native_version_argv(self) -> list[str] | None:
-        return ["gitleaks", "version"]
-
-    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            "gitleaks", "detect", "--source", str(target),
-            "--report-format", "sarif", "--report-path", str(out_file),
-            "--no-banner", "--exit-code", "0",
-        ]
-
-    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        return [
-            "docker", "run", "--rm",
-            "-v", f"{target}:/src:ro",
-            "-v", f"{out_file.parent.resolve()}:/out",
-            self.cfg.image or "zricethezav/gitleaks:latest",
-            "detect", "--source", "/src",
-            "--report-format", "sarif", "--report-path", f"/out/{out_file.name}",
-            "--no-banner", "--exit-code", "0",
-        ]
+    name = "wolfee"
 
     @property
     def writes_stdout(self) -> bool:
         return False
 
+    @property
+    def success_exit_codes(self) -> frozenset[int]:
+        # Wolfee can finish the govulncheck phase and write a useful SARIF
+        # report even when optional OSV/EPSS enrichment times out. The report
+        # is validated separately by Scanner.scan; do not discard its traces
+        # because of the enrichment process exit code.
+        return frozenset(range(256))
+
+    def _native_version_argv(self) -> list[str] | None:
+        return [self.resolve_binary("wolfee"), "version"]
+
+    def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        return [
+            self.resolve_binary("wolfee"), "scan", "--reachable", str(target),
+            "--format", "sarif", "--output", str(out_file), "--quiet",
+        ]
+
+    def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        raise ScannerError("wolfee must run natively; configure binary: with the wolfee executable path")
+
 
 class PsalmScanner(Scanner):
-    """Psalm taint analysis — the only real source->sink dataflow for PHP.
+    """Psalm interprocedural taint analysis for PHP.
 
-    CodeQL has no PHP support and never will, so for PHP this is the one tool that
-    answers "does untrusted input actually reach this sink" rather than "does this
-    line match a dangerous pattern". Its SARIF carries `codeFlows`, which the
-    ingest layer prefers over any pattern match at the same location.
+    Psalm follows calls across functions. Its SARIF carries `codeFlows`, which
+    the ingest layer preserves as the strongest evidence.
 
     Two things make Psalm unlike the other scanners here:
 
-    * **It needs the project's autoloader.** Taint tracking follows calls across
-      files, so Psalm has to resolve the classes it analyses — it runs *inside*
-      the target (`run_in_target`) and reads `psalm.xml` + `vendor/autoload.php`
-      there. A target without `composer install` (or at least
-      `composer dump-autoload`) gives Psalm nothing to trace, and it says so.
+    * **It can run without the project's autoloader.** When a target has no
+      vendor tree, the wrapper supplies a temporary minimal config and scans
+      the source directly. Framework-specific symbols may then be unresolved,
+      but direct and inter-file PHP flows still produce useful evidence.
     * **It writes its report to a file, not stdout** (`--report`), so
       `writes_stdout` is False and the base class does not capture stdout.
 
@@ -260,14 +94,48 @@ class PsalmScanner(Scanner):
 
     name = "psalm"
 
+    def scan(self, target: Path, out_dir: Path) -> ScanResult:
+        target = Path(target).resolve()
+        # Psalm writes a file itself: a failed invocation must not reuse an old report.
+        try:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            (Path(out_dir) / f"{self.name}{self.output_suffix}").unlink(missing_ok=True)
+        except OSError as exc:
+            return ScanResult(scanner=self.name, ok=False, error=f"cannot clear previous Psalm report: {exc}")
+        configured = next((target / name for name in ("psalm.xml", "psalm.xml.dist")
+                            if (target / name).is_file()), None)
+        self._runtime_config = configured
+        self._runtime_root = target
+        temporary = None
+        if configured is None or not (target / "vendor" / "autoload.php").is_file():
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".xml", prefix="psalm-autonomous-", dir=out_dir,
+                encoding="utf-8", delete=False,
+            ) as handle:
+                handle.write(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8">\n'
+                    '  <projectFiles>\n'
+                    f'    <directory name="{target}" />\n'
+                    '  </projectFiles>\n'
+                    '</psalm>\n'
+                )
+                temporary = Path(handle.name)
+            self._runtime_config = temporary
+            self._runtime_root = Path(out_dir).resolve()
+        try:
+            return super().scan(target, out_dir)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     @property
     def writes_stdout(self) -> bool:
         return False
 
     @property
     def success_exit_codes(self) -> frozenset[int]:
-        """0 clean · 1/2 issues found. Psalm exits non-zero once it reports
-        anything, the same shape as Semgrep; `report_health` is the real gate."""
+        """0 clean · 1/2 issues found; `report_health` is the real gate."""
         return frozenset({0, 1, 2})
 
     def _native_version_argv(self) -> list[str] | None:
@@ -275,15 +143,14 @@ class PsalmScanner(Scanner):
 
     def _probe_docker(self) -> Availability:
         return Availability(
-            False, detail="psalm is native-only here (taint tracking needs the target's own autoloader)"
+            False, detail="psalm is native-only here (autonomous analysis uses the local Psalm binary)"
         )
 
     def report_health(self, path: Path) -> str | None:
         """Zero taint findings is a real clean result, not a broken run.
 
         The base check treats a SARIF with no rules and no results as "the
-        scanner ran nothing" — correct for Semgrep, where an empty ruleset means
-        nothing was inspected. Taint analysis is different: a codebase with no
+        scanner ran nothing. Taint analysis is different: a codebase with no
         reachable source->sink flow legitimately yields zero results, and a
         target where taint tracking cannot recognise framework sources (a Symfony
         app without psalm/plugin-symfony) also yields zero. Rejecting those would
@@ -295,9 +162,11 @@ class PsalmScanner(Scanner):
             doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return f"report is not readable JSON: {exc}"
-        if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list):
+        if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list) or not doc["runs"]:
             return "report is not SARIF"
         for run in doc["runs"]:
+            if not isinstance(run, dict) or not isinstance(run.get("results"), list):
+                return "SARIF run has no results array"
             for inv in run.get("invocations") or []:
                 if inv.get("executionSuccessful") is False:
                     detail = (inv.get("exitCodeDescription") or "").strip()
@@ -305,11 +174,14 @@ class PsalmScanner(Scanner):
         return None
 
     def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        config = getattr(self, "_runtime_config", None)
+        root = getattr(self, "_runtime_root", target)
         return [
             self.resolve_binary("psalm"),
+            *( [f"--config={config}"] if config else []),
             "--taint-analysis",
             f"--report={out_file.resolve()}",
-            f"--root={target}",
+            f"--root={root}",
             "--no-progress",
             "--no-cache",
             "--no-diff",
@@ -451,6 +323,7 @@ class CodeQLScanner(Scanner):
                 proc = subprocess.run(
                     argv, capture_output=True, text=True,
                     timeout=self.cfg.timeout_s, encoding="utf-8", errors="replace",
+                    check=False,
                 )
                 if proc.returncode != 0:
                     tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
@@ -528,10 +401,7 @@ class CodeQLScanner(Scanner):
 
 
 REGISTRY: dict[str, type[Scanner]] = {
-    "semgrep": SemgrepScanner,
-    "bandit": BanditScanner,
-    "trivy": TrivyScanner,
-    "gitleaks": GitleaksScanner,
+    "wolfee": WolfeeScanner,
     "codeql": CodeQLScanner,
     "psalm": PsalmScanner,
 }

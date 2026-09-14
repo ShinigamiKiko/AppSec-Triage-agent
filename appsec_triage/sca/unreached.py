@@ -72,6 +72,24 @@ _BLIND_SPOTS = {
         "поле. Ищите вызовы того же имени на значениях, тип которых по коду "
         "не определить."
     ),
+    "no_input_path": (
+        "Утверждение получено запросом CodeQL: от известных ему источников "
+        "пользовательских данных путь до места вызова не найден. Источники — это "
+        "модель фреймворков, а не свойство кода: мимо неё проходят потребители "
+        "очередей и сообщений, аргументы командной строки и переменные окружения, "
+        "gRPC- и WebSocket-обработчики, самописный или редкий веб-фреймворк, "
+        "данные из файла, базы или кэша, куда их записал пользователь, и значения, "
+        "переданные через рефлексию или контейнер. Ищите, откуда аргумент "
+        "уязвимого вызова приходит в этих формах."
+    ),
+    "test_only": (
+        "Утверждение получено по списку тестовых путей из prompts/training-context.md: "
+        "пакет импортируется только в файлах, которые этот список считает тестовыми. "
+        "Мимо него проходит тестовый хелпер или фикстура, которую рабочий код "
+        "подключает сам (require из директории tests в обработчике, сидер, "
+        "вызванный рабочей командой), и директория с тестовым именем, которая на "
+        "самом деле собирается в образ. Ищите импорт этих тестовых файлов из рабочего кода."
+    ),
 }
 
 _SEARCH_SCHEMA = {
@@ -107,6 +125,11 @@ class Audit:
     # "import the search would miss" are looking for different things.
     subject: str = "граф вызовов"
     passed: str = "проверено на вызовы, невидимые графу — не найдено"
+    # Which mechanical closure was audited, and whether the audit actually ran.
+    # A closure that nothing checks may rest on the check alone; one that is too
+    # weak for that needs to tell "audited, nothing found" from "never audited".
+    kind: str = ""
+    checked: bool = False
 
     @property
     def reopens(self) -> bool:
@@ -160,8 +183,8 @@ def audit(reachability, root: Path | str, advisory, symbol, client) -> Audit:
         header,
         f"=== ВЫ ЗАПРОСИЛИ ПОИСК: {', '.join(patterns)} ===",
         results or "(ни одно совпадение не найдено)",
-        "Отсутствие совпадений — тоже факт: если рефлексии и подгрузки модулей "
-        "в коде нет, графу нечего было пропустить.",
+        ("Отсутствие совпадений — тоже факт: если рефлексии и подгрузки модулей "
+        "в коде нет, графу нечего было пропустить."),
     ])
 
     try:
@@ -238,14 +261,14 @@ def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, cli
         return Audit(detail=f"закрытие не проверено: {exc}")
 
     if not patterns:
-        return Audit(detail="проверять это закрытие было нечем")
+        return Audit(detail="проверять это закрытие было нечем", kind=kind, checked=True)
 
     material = "\n\n".join([
         header,
         f"=== ВЫ ЗАПРОСИЛИ ПОИСК: {', '.join(patterns)} ===",
         _grep(root, patterns) or "(ни одно совпадение не найдено)",
-        "Отсутствие совпадений — тоже факт: если ни одной из этих форм в коде "
-        "нет, мимо механической проверки ничего не прошло.",
+        ("Отсутствие совпадений — тоже факт: если ни одной из этих форм в коде "
+        "нет, мимо механической проверки ничего не прошло."),
     ])
 
     try:
@@ -264,10 +287,12 @@ def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, cli
         if not quote or " ".join(quote.split()) not in shown:
             return Audit(
                 detail=(f"переоткрытие отклонено: цитаты «{quote[:60]}» нет "
-                        "ни в коде, ни в результатах поиска"))
+                        "ни в коде, ни в результатах поиска"),
+                kind=kind, checked=True)
 
     return Audit(
         invisible_path=wrong, quote=quote, why=why,
         subject=f"закрытие «{kind}» не выдержало проверки",
         passed=f"закрытие «{kind}» проверено на свою слепую зону — не опровергнуто",
+        kind=kind, checked=True,
     )

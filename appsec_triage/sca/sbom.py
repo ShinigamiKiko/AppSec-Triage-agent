@@ -74,7 +74,7 @@ def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None
         argv = [exe, "-r", "-o", str(out), "--no-install-deps", str(project)]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout_s, encoding="utf-8", errors="replace")
+                                  timeout=timeout_s, encoding="utf-8", errors="replace", check=False)
         except subprocess.TimeoutExpired:
             return None, f"cdxgen не уложился в {timeout_s}s"
         except OSError as exc:

@@ -2,7 +2,7 @@
 
 Some findings should not be triaged at all, and that is a policy decision, not a
 judgement call for a model. `B101 assert_used` across a test suite is the
-canonical case: 768 of httpie's 811 Bandit findings, none of them a question
+    canonical case: a large batch of low-value findings, none of them a question
 anyone wants an LLM to answer.
 
 Two rules make this safe rather than a silent hole:
@@ -22,8 +22,8 @@ import re
 from dataclasses import dataclass, field
 
 from .config import ScopeConfig
-from .reuse import fingerprint as _fingerprint
 from .models import EvidenceClass, Finding, TriageRecord, Verdict, VerdictLabel
+from .reuse import fingerprint as _fingerprint
 
 _SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
 
@@ -93,12 +93,15 @@ def apply(findings: list[Finding], cfg: ScopeConfig) -> ScopeResult:
             result.excluded.append(_excluded_record(f, rule, f"CWE {f.cwe} is not in the triaged set"))
             result.counts["cwe_not_in_scope"] = result.counts.get("cwe_not_in_scope", 0) + 1
             continue
-        if min_idx >= 0 and f.severity.value in _SEVERITY_ORDER:
-            if _SEVERITY_ORDER.index(f.severity.value) < min_idx:
-                rule = f"min_severity={cfg.min_severity}"
-                result.excluded.append(_excluded_record(f, rule, f"severity {f.severity.value} is below the floor"))
-                result.counts["below_min_severity"] = result.counts.get("below_min_severity", 0) + 1
-                continue
+        if (
+            min_idx >= 0
+            and f.severity.value in _SEVERITY_ORDER
+            and _SEVERITY_ORDER.index(f.severity.value) < min_idx
+        ):
+            rule = f"min_severity={cfg.min_severity}"
+            result.excluded.append(_excluded_record(f, rule, f"severity {f.severity.value} is below the floor"))
+            result.counts["below_min_severity"] = result.counts.get("below_min_severity", 0) + 1
+            continue
         result.kept.append(f)
 
     return result

@@ -25,9 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..prompts import registry
 from . import container as container_mod
 from .presence import Hit, PresenceResult, SymbolPresence
-from ..prompts import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..lsp.service import LSPService
@@ -130,7 +130,7 @@ _SCHEMA = {
     },
 }
 
-_IMPORT = re.compile(r"^\s*(?:use|import|from|require)\b.*$", re.M)
+_IMPORT = re.compile(r"^\s*(?:use|import|from|require)\b.*$", re.MULTILINE)
 _CONTEXT_LINES = 12
 
 
@@ -223,7 +223,7 @@ def _by_model(
 
 def resolve(
     result: PresenceResult,
-    lsp: "LSPService | None",
+    lsp: LSPService | None,
     root: Path | str,
     klass: str,
     package: str = "",
@@ -269,7 +269,7 @@ def _inside(where: str, directory: Path | None) -> bool:
 
 
 def _by_lsp(
-    result: PresenceResult, lsp: "LSPService | None", root: Path, klass: str,
+    result: PresenceResult, lsp: LSPService | None, root: Path, klass: str,
     package: str, package_dir: Path | None = None,
 ) -> Resolution:
     """Resolve the receiver by asking the language server for the definition.
@@ -299,7 +299,7 @@ def _by_lsp(
         if not language:
             continue
         considered += 1
-        client = lsp._client(language)  # noqa: SLF001 - the single accessor
+        client = lsp._client(language)
         if client is None:
             return Resolution(result, asked,
                               detail=f"сервер {language} не запустился")
@@ -322,7 +322,7 @@ def _by_lsp(
         if not locations:
             continue
         answered += 1
-        path_map = lsp._path_map_for(language)  # noqa: SLF001
+        path_map = lsp._path_map_for(language)
         landed_away = False
         for location in locations:
             name, where = _definition_class(location, path_map)

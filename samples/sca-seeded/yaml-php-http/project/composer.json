@@ -1,0 +1,19 @@
+{
+    "name": "seeded/yaml-php-http",
+    "type": "project",
+    "require": {
+        "php": ">=8.2",
+        "symfony/yaml": "7.3.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        }
+    },
+    "config": {
+        "audit": {
+            "block-insecure": false
+        }
+    },
+    "_comment": "Deliberately vulnerable seeded project: symfony/yaml 7.3.0 is affected by GHSA-c2p3-7m5p-cv8x."
+}

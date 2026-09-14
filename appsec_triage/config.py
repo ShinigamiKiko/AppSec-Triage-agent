@@ -97,7 +97,7 @@ class ProviderConfig:
     options: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> "ProviderConfig":
+    def from_dict(cls, data: dict[str, Any], *, name: str) -> ProviderConfig:
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(data) - known - {"name"}
         if unknown:
@@ -149,7 +149,7 @@ class ScannerConfig:
     run_in_target: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> "ScannerConfig":
+    def from_dict(cls, data: dict[str, Any], *, name: str) -> ScannerConfig:
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(data) - known - {"name"}
         if unknown:
@@ -239,6 +239,8 @@ class PipelineConfig:
     dataflow_context_lines_after: int = 10
     max_code_chars: int = 4000
     max_trace_steps: int = 12
+    max_evidence_chars: int = 32000
+    context_retrieval_rounds: int = 2
     redact_secrets: bool = False
     secrets_without_model: bool = True
     deployment_config: str | None = None

@@ -65,9 +65,13 @@ class DependencyInfo(BaseModel):
     ecosystem: str | None = None
     installed_version: str | None = None
     fixed_versions: list[str] = Field(default_factory=list)
+    advisory_aliases: list[str] = Field(default_factory=list)
     advisory_url: str | None = None
     dev_only: bool | None = None
     imported: bool | None = None
+    reachability: str | None = None
+    call_site: str | None = None
+    call_line: str | None = None
 
     @property
     def upgrade_target(self) -> str | None:
@@ -168,6 +172,10 @@ class EvidencePackage(BaseModel):
     lsp_resolved_clean: bool = False
     dependency: DependencyInfo | None = None
     history: list[str] = Field(default_factory=list)
+    evidence_blocks: list[str] = Field(default_factory=list)
+    context_notes: list[str] = Field(default_factory=list)
+    dependency_analysis: str | None = None
+    repository_code_collected: bool = False
 
     def quotable_text(self) -> str:
         """Exactly the text the model was shown, used to verify its quotes.
@@ -320,6 +328,12 @@ class SCASummary(BaseModel):
     # it would be invisible in the report — a reviewer could not tell a checked
     # closure from an unchecked one, which is the whole reason the audit exists.
     audit: str = ""
+    # Which machinery decided it: excluded (platform fact), callgraph, codeql,
+    # text, package, condition, unknown. A verdict reads differently by route.
+    route: str = ""
+    # Every question put to CodeQL for this finding: who asked (the chain or the
+    # model), what was asked, what came back, and whether it ran or was reused.
+    codeql_calls: list[str] = Field(default_factory=list)
     problems: list[str] = Field(default_factory=list)
 
 
@@ -334,6 +348,7 @@ class TriageRecord(BaseModel):
     kind: Literal["weakness", "dependency", "misconfiguration"] = "weakness"
     rule_id: str | None = None
     start_line: int | None = None
+    trace: list[TraceStep] = Field(default_factory=list)
     symbol_context: list[str] = Field(default_factory=list)
     reachability: str | None = None
     challenge_note: str | None = None
@@ -356,4 +371,4 @@ class TriageRecord(BaseModel):
     # What the dependency chain established, kept so the report can show it.
     # Without this the chain's work exists only inside the prompt: the reviewer
     # sees a verdict and no way to check where it came from.
-    sca: "SCASummary | None" = None
+    sca: SCASummary | None = None

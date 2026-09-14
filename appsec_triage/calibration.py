@@ -88,7 +88,7 @@ def calibrate(verdict: Verdict, pkg: EvidencePackage, finding: Finding, override
         score -= min(0.25, opposing * 0.3)
         reasons.append("deterministic pre-checks point the other way")
 
-    if pkg.code_source == "description_only" and pkg.dependency is None:
+    if pkg.code_source == "description_only" and not pkg.repository_code_collected and pkg.dependency is None:
         score = min(score, 0.45)
         reasons.append("no code was available — the verdict rests on the scanner's description alone")
     elif pkg.dependency is not None:

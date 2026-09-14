@@ -23,7 +23,7 @@ one. Either tool missing means the answer is unknown, never safe.
 
 from .advisories import Advisory, collect
 from .presence import PresenceResult, SymbolPresence, find_symbol
-from .reach import ReachResult, Reachability, assess, needs_input_path
+from .reach import Reachability, ReachResult, assess, needs_input_path
 from .resolve import SymbolResolver, VulnerableSymbol
 from .verdict import CVEDecision, CVEVerdict, decide
 

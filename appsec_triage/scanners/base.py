@@ -2,9 +2,8 @@
 
 Two execution modes, because the tools genuinely differ in how they ship:
 
-* `native`  — a binary on PATH, or a Python module (`python -m bandit`).
-* `docker`  — the only sane route for Semgrep on Windows, which has no native
-              Windows build, and a reasonable default for Trivy.
+* `native`  — a binary on PATH.
+* `docker`  — an optional isolated execution mode for scanners that support it.
 
 Safety rules that are not negotiable here:
 
@@ -38,12 +37,7 @@ from ..config import ScannerConfig
 
 
 def _native_scanner_env() -> dict[str, str]:
-    """Local scanners must not inherit the host's HTTP proxy configuration.
-
-    Semgrep initialises its networking layer even for offline local rules.  In
-    WSL the injected Windows proxy value can be malformed for the OCaml client,
-    while the parent process still needs that proxy for its LLM provider.
-    """
+    """Local scanners must not inherit the host's HTTP proxy configuration."""
     env = os.environ.copy()
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         env.pop(key, None)
@@ -150,7 +144,7 @@ class Scanner(ABC):
             hint = " (set `binary:` in the scanner profile)" if not self.cfg.binary else ""
             return Availability(False, detail=f"{exe!r} not on PATH and not a file{hint}")
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=_native_scanner_env())
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=_native_scanner_env(), check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return Availability(False, detail=f"version probe failed: {exc}")
         if proc.returncode != 0:
@@ -166,6 +160,7 @@ class Scanner(ABC):
             daemon = subprocess.run(
                 ["docker", "version", "--format", "{{.Server.Version}}"],
                 capture_output=True, text=True, timeout=30,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return Availability(False, detail=f"docker unreachable: {exc}")
@@ -200,7 +195,7 @@ class Scanner(ABC):
     def report_health(self, path: Path) -> str | None:
         """Inspect the report itself. Returns a reason string when it is not trustworthy.
 
-        This exists because exit codes are a poor success signal. Semgrep returns
+        This exists because exit codes are a poor success signal. A scanner can return
         2 after a completely successful scan if a single oversized file was
         skipped, while a scan that died on an invalid ruleset still writes a
         syntactically valid, *empty* SARIF. Reading that as "0 findings" would
@@ -273,6 +268,7 @@ class Scanner(ABC):
                 env=_native_scanner_env() if avail.mode == "native" else None,
                 encoding="utf-8",
                 errors="replace",
+                check=False,
             )
         except subprocess.TimeoutExpired:
             return ScanResult(

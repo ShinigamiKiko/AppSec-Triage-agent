@@ -58,7 +58,7 @@ _ROUTE = re.compile(
     r"""|@app\.route\s*\(\s*["']([^"']*)["']"""
     r"""|Route::\w+\s*\(\s*["']([^"']*)["']"""
     r"""|@(?:Get|Post|Put|Delete|Request)Mapping\s*\(\s*["']?([^"')]*)""",
-    re.I,
+    re.IGNORECASE,
 )
 
 

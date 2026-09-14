@@ -7,8 +7,7 @@ pile last. No external assets so it can be attached to a ticket or emailed.
 from __future__ import annotations
 
 import html
-import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import review
@@ -163,7 +162,35 @@ def _where(r: TriageRecord) -> str:
     return "<br>".join(_e(p) if not p.startswith("<code>") else p for p in parts) or "—"
 
 
+_ROUTES = {
+    "excluded": "вне платформы — факт среды, без поиска и CodeQL",
+    "callgraph": "граф вызовов",
+    "codeql": "CodeQL",
+    "psalm": "Psalm (типы и taint, PHP)",
+    "text": "поиск по тексту, без CodeQL",
+    "package": "факт импорта пакета",
+    "condition": "условие эксплуатации",
+    "unknown": "не определён",
+}
+
+
 def _trace(r: TriageRecord) -> str:
+    """What was followed, and which route the dependency chain took to get there."""
+    body = _trace_body(r)
+    route = r.sca.route if r.sca else ""
+    calls = r.sca.codeql_calls if r.sca else []
+    parts = []
+    if route:
+        parts.append(f"<em>маршрут: {_e(_ROUTES.get(route, route))}</em>")
+    if body != "—":
+        parts.append(body)
+    if calls:
+        # Who asked CodeQL what, and the answer — the reviewer's proof the database was consulted.
+        parts.append("<small>" + "<br>".join(_e(call[:240]) for call in calls[:4]) + "</small>")
+    return "<br>".join(parts) or "—"
+
+
+def _trace_body(r: TriageRecord) -> str:
     """What was actually followed, not what might exist."""
     # The audit line first, when there is one: it says how the closure was
     # checked, and a reviewer reading a closed row wants that before the trace.
@@ -238,14 +265,14 @@ def _record_html(r: TriageRecord) -> str:
     sym = v.vulnerable_symbol
     sym_summary = f'<span class="sym">{_e(sym.name)}</span>' if sym else ""
     parts = [
-        f'<details><summary>'
+        (f'<details><summary>'
         f'<span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
         f'<span class="cwe">{_e(r.cwe or "—")}</span>'
         f"{sym_summary}"
         f'<span class="path" title="{_e(r.file_path)}">{_e(r.file_path)}</span>'
         f'<span class="conf" title="{_e(v.confidence_rationale)}">'
         f'{_e(v.confidence_band or "—")} · {v.confidence:.2f}</span>'
-        f'</summary><div class="body">',
+        f'</summary><div class="body">'),
         f"<h4>Verdict rationale</h4><p>{_e(v.reason)}</p>",
     ]
 
@@ -384,7 +411,7 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
     findings_html = "".join(_record_html(r) for r in ordered)
 
     coverage_html = _coverage_html(run)
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

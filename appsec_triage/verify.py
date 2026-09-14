@@ -94,13 +94,11 @@ def should_challenge(record: TriageRecord, cfg: VerificationConfig) -> bool:
         return True
     if cfg.challenge_cwes and (record.cwe or "").upper() in {c.upper() for c in cfg.challenge_cwes}:
         return True
-    if (
+    return bool(
         cfg.challenge_closures_above_consequence
         and record.verdict.verdict is VerdictLabel.false_positive
         and consequence_weight(record.cwe) >= cfg.challenge_closures_above_consequence
-    ):
-        return True
-    return False
+    )
 
 
 def _render_prompt(
@@ -119,7 +117,7 @@ def _render_prompt(
     sanitiser fragment declares invalid. A reviewer who knows less than the
     author does not review; it second-guesses.
     """
-    system, _ = registry.render_system(pkg.cwe, pack, stack_section)
+    system, _ = registry.render_system(pkg.cwe, pack, stack_section, "dependency" if pkg.dependency else None)
     challenge = registry.load_pack(pack)["_challenge"]
     system = f"{system}\n\n---\n\n{challenge.body}"
 
