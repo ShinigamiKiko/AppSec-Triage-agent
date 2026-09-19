@@ -1,25 +1,11 @@
-"""OpenAI and DeepSeek — same wire format, different structured-output support.
-
-Both speak /chat/completions, so they share a base. They are separate classes
-because their JSON guarantees genuinely differ:
-
-* OpenAI supports `response_format: {"type": "json_schema", ..., "strict": true}`
-  — the schema is enforced by the decoder, so an out-of-contract verdict is
-  impossible rather than merely unlikely.
-* DeepSeek supports only `{"type": "json_object"}` and additionally *requires*
-  the word "json" to appear in the prompt, otherwise it returns an empty string
-  or 400s. It also exposes prompt-cache hit counters we fold into cost.
-
-Sending an OpenAI-style json_schema block to DeepSeek is a 400, which is exactly
-why the provider profiles carry different `json_mode` values.
-"""
+"""OpenAI and DeepSeek — same wire format, different structured-output support."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from .base import BaseHTTPClient, LLMError
+from .base import BaseHTTPClient, LLMError, ToolCall, ToolTurn, tool_arguments
 
 
 class _ChatCompletionsClient(BaseHTTPClient):
@@ -59,6 +45,51 @@ class _ChatCompletionsClient(BaseHTTPClient):
         usage = body.get("usage") or {}
         return text, usage.get("prompt_tokens"), usage.get("completion_tokens")
 
+
+    _NATIVE_TOOLS = True
+
+    def _tool_payload(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        # No `response_format`: a JSON-mode reply cannot also be a tool call.
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "temperature": self.cfg.temperature,
+            "max_tokens": self.cfg.max_tokens,
+            **self.cfg.options,
+        }
+        if self.cfg.top_p is not None:
+            payload["top_p"] = self.cfg.top_p
+        if self.cfg.stop:
+            payload["stop"] = self.cfg.stop
+        return "/chat/completions", payload
+
+    def _tool_parse(self, body: dict[str, Any]) -> ToolTurn:
+        choices = body.get("choices") or []
+        if not choices:
+            raise LLMError(f"{self.cfg.name}: response had no choices: {str(body)[:300]}")
+        choice = choices[0]
+        message = choice.get("message") or {}
+        raw_calls = [item for item in (message.get("tool_calls") or []) if isinstance(item, dict)]
+        text = message.get("content") or ""
+        if not text and not raw_calls and choice.get("finish_reason") == "length":
+            raise LLMError(f"{self.cfg.name}: hit max_tokens before emitting any content")
+        calls = [
+            ToolCall(
+                id=str(item.get("id") or f"call_{index}"),
+                name=str((item.get("function") or {}).get("name") or ""),
+                arguments=tool_arguments((item.get("function") or {}).get("arguments")),
+            )
+            for index, item in enumerate(raw_calls)
+        ]
+        echo: dict[str, Any] = {"role": "assistant", "content": text}
+        if raw_calls:
+            echo["tool_calls"] = raw_calls
+        usage = body.get("usage") or {}
+        return ToolTurn(text, calls, echo, usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+    def tool_result_message(self, call: ToolCall, content: str) -> dict[str, Any]:
+        return {"role": "tool", "tool_call_id": call.id, "content": content}
 
 class OpenAIClient(_ChatCompletionsClient):
     def _build_payload(self, system: str, user: str, json_schema: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:

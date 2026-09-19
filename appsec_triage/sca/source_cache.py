@@ -1,10 +1,4 @@
-"""Run-scoped, read-only source cache for exact dependency versions.
-
-The cache exists for transitive bridge analysis. It never installs a package,
-runs package-manager scripts, or adds files to the project. Composer archives
-are resolved through Packagist metadata, bounded, validated, and unpacked into
-a fresh temporary directory that is deleted when the SCA run ends.
-"""
+"""Run-scoped, read-only source cache for exact dependency versions."""
 
 from __future__ import annotations
 
@@ -21,6 +15,8 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+
+from . import cassette
 
 log = logging.getLogger(__name__)
 
@@ -176,7 +172,7 @@ class PackageSourceCache:
             shasum = str(dist.get("shasum") or "").lower()
             if shasum and len(shasum) == 40 and hashlib.sha1(archive).hexdigest() != shasum:
                 raise ValueError("archive SHA-1 does not match Packagist metadata")
-            destination = self.root / hashlib.sha256("://".join((ecosystem, package, version)).encode()).hexdigest()[:20]
+            destination = self.root / hashlib.sha256(f"{ecosystem}://{package}://{version}".encode()).hexdigest()[:20]
             destination.mkdir()
             snapshot.files = self._extract_zip(archive, destination)
             if not snapshot.files:
@@ -221,7 +217,7 @@ class PackageSourceCache:
             raise ValueError(f"download URL is not allowlisted: {url[:200]}")
         request = urllib.request.Request(url, headers=_UA)
         opener = urllib.request.build_opener(_AllowlistedRedirectHandler(hosts))
-        with opener.open(request, timeout=_TIMEOUT_S) as response:
+        with cassette.urlopen(request, timeout=_TIMEOUT_S, opener=opener) as response:
             body = response.read(limit + 1)
             if len(body) > limit:
                 raise ValueError(f"download exceeds {limit} bytes")

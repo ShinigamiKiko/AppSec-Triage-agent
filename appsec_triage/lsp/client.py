@@ -1,19 +1,4 @@
-"""A minimal LSP client: JSON-RPC over the server's stdio.
-
-Only the handful of requests triage actually needs. A full client would handle
-diagnostics, completion and the rest of the protocol; none of that helps decide
-whether a finding is real, and every extra feature is another thing to hang.
-
-The hard-won rules, learned from the scanner layer:
-
-* **Everything is bounded.** A language server that stops answering must not
-  stop the run. Every request has a timeout and a failure returns `None`, never
-  an exception that propagates into triage.
-* **Failure is visible.** A silently degraded resolver would quietly turn into
-  "no extra context, verdicts got worse for no visible reason".
-* **The server sees the workspace read-only.** We open documents and ask
-  questions; we never send edits.
-"""
+"""A minimal LSP client: JSON-RPC over the server's stdio."""
 
 from __future__ import annotations
 
@@ -25,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
@@ -37,14 +22,7 @@ class LSPError(RuntimeError):
 
 
 def path_to_uri(path: Path, path_map: dict[str, str] | None = None) -> str:
-    """A file URI the *server* can open.
-
-    `path_map` exists because a language server does not always share the
-    client's filesystem. The PHP servers here run inside WSL, where the project
-    lives at `/mnt/c/Users/...` while this process sees `C:\\Users\\...`. Without
-    translation every request names a path the server cannot find, and it answers
-    nothing at all — which looks exactly like a server that does not work.
-    """
+    """A file URI the *server* can open."""
     text = str(Path(path).resolve()).replace("\\", "/")
     for src, dst in (path_map or {}).items():
         src_norm = src.replace("\\", "/")
@@ -89,6 +67,7 @@ class LSPClient:
     init_timeout_s: float = 120.0
     index_timeout_s: float = 90.0
     path_map: dict[str, str] = field(default_factory=dict)
+    warmup: tuple[Path, str] | None = None
     index_ready: bool = field(default=False, init=False)
 
     _proc: subprocess.Popen | None = field(default=None, init=False, repr=False)
@@ -138,11 +117,7 @@ class LSPClient:
             return None
 
     def _request(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any:
-        """Send a request and wait for its reply, skipping unrelated traffic.
-
-        Servers interleave diagnostics and progress notifications with replies,
-        so the id has to be matched rather than assuming the next message is ours.
-        """
+        """Send a request and wait for its reply, skipping unrelated traffic."""
         with self._lock:
             self._next_id += 1
             request_id = self._next_id
@@ -211,6 +186,8 @@ class LSPClient:
         self.capabilities = (result or {}).get("capabilities") or {}
         self._notify("initialized", {})
         self.started = True
+        if self.warmup is not None:
+            self.open_document(*self.warmup)
         self._await_index()
         return True
 
@@ -218,24 +195,14 @@ class LSPClient:
         return bool(self.capabilities.get(capability))
 
     def _await_index(self) -> None:
-        """Wait until the server can actually answer, not just until it started.
-
-        Servers index in the background after `initialized`, and until that
-        finishes they answer every question with an empty result rather than an
-        error. Measured on a real PHP project: the first four findings resolved
-        nothing and the last two resolved fine, purely because the index had
-        caught up by then — which reads as a flaky resolver, not a warm-up.
-
-        `workspace/symbol` is the probe because it is the one request that
-        touches the index directly. A timeout here is not fatal: an unindexed
-        server degrades to fewer answers, which is the same as no server.
-        """
+        """Wait until the server can actually answer, not just until it started."""
         if not self.supports("workspaceSymbolProvider"):
             return
         deadline = time.monotonic() + self.index_timeout_s
         attempt = 0
         while time.monotonic() < deadline:
-            if self._request("workspace/symbol", {"query": "a"}, timeout=10):
+            if (self._request("workspace/symbol", {"query": "a"}, timeout=10)
+                    or self._request("workspace/symbol", {"query": ""}, timeout=10)):
                 self.index_ready = True
                 return
             attempt += 1
@@ -259,7 +226,7 @@ class LSPClient:
             self._proc = None
             self.started = False
 
-    def __enter__(self) -> "LSPClient":
+    def __enter__(self) -> Self:
         self.start()
         return self
 
@@ -285,7 +252,7 @@ class LSPClient:
 
 
     def definition(self, path: Path, line: int, character: int) -> list[dict[str, Any]]:
-        """Where is the symbol under this position defined? (`line` is 1-indexed.)"""
+        """Where is the symbol under this position defined?"""
         result = self._request(
             "textDocument/definition",
             {

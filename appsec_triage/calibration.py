@@ -1,29 +1,4 @@
-"""Replace the model's self-reported confidence with a measured one.
-
-Measured on a real run: every one of 14 decided verdicts came back at 0.95 or
-above. A number that never varies carries no information, and it was being used
-for two real decisions — the post-validation floor and the ordering of the review
-queue. Both were effectively no-ops that looked like controls.
-
-This is not a flaw in the prompt to be fixed by asking harder. A model asked how
-sure it is answers from the same context that produced the answer; there is no
-independent second look inside a single generation. So the number is computed
-here instead, from facts nothing in the generation can fake:
-
-* how much of the model's own evidence survived the verbatim grounding check
-* whether a second scanner reported the same weakness
-* whether a resolver or a scanner trace actually established the dataflow
-* whether the deterministic signals agree with the verdict or contradict it
-* whether the model was working from code at all
-
-The model's own number is kept — it goes to the report as
-`self_reported_confidence`, so a reviewer can see the gap — but it no longer
-decides anything.
-
-Direction matters here: the score is a **downgrade** instrument. It starts from
-the evidence actually present and only rises with corroboration, so a thin
-verdict cannot inherit certainty from an assertive tone.
-"""
+"""Replace the model's self-reported confidence with a measured one."""
 
 from __future__ import annotations
 
@@ -88,7 +63,7 @@ def calibrate(verdict: Verdict, pkg: EvidencePackage, finding: Finding, override
         score -= min(0.25, opposing * 0.3)
         reasons.append("deterministic pre-checks point the other way")
 
-    if pkg.code_source == "description_only" and pkg.dependency is None:
+    if pkg.code_source == "description_only" and not pkg.repository_code_collected and pkg.dependency is None:
         score = min(score, 0.45)
         reasons.append("no code was available — the verdict rests on the scanner's description alone")
     elif pkg.dependency is not None:
@@ -109,12 +84,56 @@ def calibrate(verdict: Verdict, pkg: EvidencePackage, finding: Finding, override
     return Calibration(score=max(0.05, min(0.95, round(score, 2))), reasons=reasons)
 
 
-def _signal_weight(pkg: EvidencePackage, verdict: Verdict, *, agree: bool) -> float:
-    """Total weight of signals pointing with (or against) the verdict.
+_CLOSURE_STRENGTH = {
+    "version_unaffected": 0.95,
+    "not_applicable": 0.90,
+    "wrong_receiver": 0.85,
+    # A tool compiled the program, or a query traced the data.
+    "not_reached": 0.80,
+    "condition_absent": 0.75,
+    "not_shipped": 0.70,
+    "test_only_import": 0.70,
+    "unused": 0.60,
+    "not_called": 0.60,
+    # An operator's statement about the platform, not a property of this code.
+    "infrastructure": 0.60,
+}
 
-    `unknown` has no direction to agree with, so it scores neither way — an
-    abstention is not made more certain by evidence it declined to weigh.
-    """
+_CLOSURE_EVIDENCE = {
+    "version_unaffected": "the installed version lies outside every affected range of the advisory",
+    "not_applicable": "the vulnerable path is not inside the installed package",
+    "wrong_receiver": "the language server resolved every call site outside the flawed package",
+    "not_reached": "a compiled call graph found no path to the vulnerable function",
+    "condition_absent": "the condition the advisory requires is not met in this code",
+    "not_shipped": "the bill of materials marks the package build-only",
+    "test_only_import": "the package is imported only from paths the project lists as tests",
+    "unused": "a search of the source tree found no use of the package",
+    "not_called": "the language server found no project caller of the vulnerable function",
+    "infrastructure": "the declared deployment owns this component, not the service",
+}
+
+_AUDIT_GATED = {"not_reached", "unused", "not_shipped", "test_only_import", "wrong_receiver",
+                "not_called"}
+
+
+def calibrate_closure(outcome: str, audited: bool, audit_note: str = "") -> Calibration:
+    """Confidence for a finding the dependency chain closed without the model."""
+    score = _CLOSURE_STRENGTH.get(outcome, 0.5)
+    reasons = ["closed by the dependency chain on a checked fact, without a verdict call"]
+    if evidence := _CLOSURE_EVIDENCE.get(outcome):
+        reasons.append(evidence)
+    if outcome in _AUDIT_GATED:
+        if audited:
+            score += 0.05
+            reasons.append("the audit of this closure's blind spot ran and did not overturn it")
+        else:
+            score = min(score, 0.45)
+            reasons.append(audit_note or "no audit of this closure's blind spot is recorded")
+    return Calibration(score=max(0.05, min(0.95, round(score, 2))), reasons=reasons)
+
+
+def _signal_weight(pkg: EvidencePackage, verdict: Verdict, *, agree: bool) -> float:
+    """Total weight of signals pointing with (or against) the verdict."""
     if verdict.verdict is VerdictLabel.unknown:
         return 0.0
     wanted = "toward_confirmed" if verdict.verdict is VerdictLabel.confirmed else "toward_fp"

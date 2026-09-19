@@ -1,15 +1,11 @@
-"""Native adapter: our own normalized JSON / JSONL.
-
-This is the escape hatch for scanners without decent SARIF. Field names are
-aliased generously because every internal export names them differently, but
-the *shape* is fixed: one object per finding, a file path, and a snippet.
-"""
+"""Native adapter: our own normalized JSON / JSONL."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..models import CodeContext, DependencyInfo, Finding, Severity, TraceStep
 
@@ -90,10 +86,6 @@ def _to_finding(obj: dict[str, Any], fallback_id: str) -> Finding:
     if isinstance(sanitizers, str):
         sanitizers = [sanitizers]
 
-    # The agent's own output nests the location and carries the package. Not
-    # reading it meant `sbom` wrote a file that `triage` refused to open, and
-    # any dependency loaded through this parser silently lost its package and
-    # version — the two things the SCA chain runs on.
     nested = obj.get("code_context")
     if isinstance(nested, dict):
         obj = {**nested, **{k: v for k, v in obj.items() if k != "code_context"}}
@@ -110,9 +102,13 @@ def _to_finding(obj: dict[str, Any], fallback_id: str) -> Finding:
             ecosystem=(str(v) if (v := raw_dependency.get("ecosystem")) else None),
             installed_version=(str(v) if (v := raw_dependency.get("installed_version")) else None),
             fixed_versions=[str(x) for x in (raw_dependency.get("fixed_versions") or [])],
+            advisory_aliases=[str(x) for x in (raw_dependency.get("advisory_aliases") or [])],
             advisory_url=(str(v) if (v := raw_dependency.get("advisory_url")) else None),
             dev_only=raw_dependency.get("dev_only"),
             imported=raw_dependency.get("imported"),
+            reachability=(str(v) if (v := raw_dependency.get("reachability")) else None),
+            call_site=(str(v) if (v := raw_dependency.get("call_site")) else None),
+            call_line=(str(v) if (v := raw_dependency.get("call_line")) else None),
         )
 
     return Finding(

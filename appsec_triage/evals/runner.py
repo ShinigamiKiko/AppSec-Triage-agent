@@ -1,31 +1,20 @@
-"""Benchmark runner: same corpus, same prompts, N providers, one comparison table.
-
-Corpus format is the native JSONL adapter plus one extra field:
-
-    {"finding_id": "...", "cwe": "CWE-798", "file_path": "...", "snippet": "...",
-     "label": "false_positive", "label_note": "reviewed by AppSec 2026-03"}
-
-The bench runs the pipeline as deployed, resolvers included. Snippets are
-materialized into a real tree under the output directory (or `source_roots`
-points at a real checkout), so the source resolver widens windows and the
-language servers answer origin questions exactly as they do in production —
-a bench that skips them scores a pipeline nobody actually runs, and its
-misses are the resolver's absence, not the model's.
-"""
+"""Benchmark runner: same corpus, same prompts, N providers, one comparison table."""
 
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from ..config import PipelineConfig, load_provider_config
 from ..context.source import SourceResolver
 from ..ingest import native
 from ..llm.factory import build_client
-from ..lsp.service import LSPService
+from ..lsp.service import LSPService, required_languages as lsp_required_languages
 from ..pipeline import TriagePipeline
 from ..report import audit
+from ..sca import cassette
 from .materialize import materialize
 from .metrics import compare, score
 
@@ -55,6 +44,8 @@ def run_bench(
     progress: Callable[[int, int], None] | None = None,
     source_roots: list[Path] | None = None,
     no_lsp: bool = False,
+    resolve_symbols: bool = False,
+    scan_dir: Path | None = None,
 ) -> dict:
     corpus = Path(corpus)
     labels = load_labels(corpus)
@@ -64,6 +55,18 @@ def run_bench(
     findings = list(native.parse(corpus))
     if limit:
         findings = findings[:limit]
+
+    dependencies = sum(1 for f in findings if f.dependency is not None)
+    if resolve_symbols and dependencies and not source_roots:
+        raise BenchSetupError(
+            f"{dependencies} dependency finding(s) with --resolve-symbols need the real checkout "
+            "(--source-root): the chain searches the project tree, and against materialized "
+            "snippets every package reads as unused."
+        )
+    if resolve_symbols:
+        cfg.resolve_vulnerable_symbols = True
+    if scan_dir:
+        cfg.scan_out_dir = str(scan_dir)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -79,13 +82,7 @@ def run_bench(
     source = SourceResolver(roots)
     symbols = LSPService(cfg.lsp, roots) if cfg.lsp.enabled and not no_lsp else None
 
-    required_present = sorted(
-        {
-            lang
-            for f in findings
-            if (lang := cfg.lsp.language_for(f.code_context.file_path)) and lang in cfg.lsp.required_languages
-        }
-    )
+    required_present = lsp_required_languages(findings, cfg.lsp, cfg.scope.only_ecosystems)
     if required_present and not no_lsp:
         langs = ", ".join(required_present)
         if symbols is None:
@@ -126,6 +123,12 @@ def run_bench(
     result["source_roots"] = [str(r) for r in roots]
     result["materialized_corpus"] = materialized
     result["lsp"] = symbols is not None
+    result["dependency_findings"] = dependencies
+    result["sca_chain"] = bool(cfg.resolve_vulnerable_symbols)
+    result["http_cassette"] = {
+        "dir": os.environ.get(cassette.DIR_ENV),
+        "mode": os.environ.get(cassette.MODE_ENV, "replay") if os.environ.get(cassette.DIR_ENV) else None,
+    }
     if symbols:
         result["lsp_stats"] = dict(symbols.stats)
     result["source_stats"] = source.stats()

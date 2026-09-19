@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ..config import ConfigError, list_scanners, load_scanner_config
-from .base import Availability, ScanResult, Scanner, ScannerError
+from .base import Availability, Scanner, ScannerError, ScanResult
 from .tools import REGISTRY
 
 
@@ -42,10 +42,11 @@ def scan_all(target: Path, scanners: list[str], out_dir: Path, on_start=None) ->
 def write_manifest(target: Path, results: list[ScanResult], out_dir: Path) -> Path:
     """Provenance: which tool, which version, which exact argv, how many findings."""
     path = Path(out_dir) / "scan-manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
-                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "scanned_at": datetime.now(UTC).isoformat(),
                 "target": str(Path(target).resolve()),
                 "scans": [r.as_dict() for r in results],
                 "total_findings": sum(r.findings for r in results if r.ok),
@@ -59,6 +60,13 @@ def write_manifest(target: Path, results: list[ScanResult], out_dir: Path) -> Pa
 
 
 __all__ = [
-    "build_scanner", "probe_all", "scan_all", "write_manifest",
-    "Scanner", "ScanResult", "Availability", "ScannerError", "REGISTRY",
+    "REGISTRY",
+    "Availability",
+    "ScanResult",
+    "Scanner",
+    "ScannerError",
+    "build_scanner",
+    "probe_all",
+    "scan_all",
+    "write_manifest",
 ]

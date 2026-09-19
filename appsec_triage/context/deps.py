@@ -1,19 +1,4 @@
-"""Two facts about a vulnerable dependency that the scanner does not report.
-
-**Does it ship?** A CVE in PHPUnit is not an attack surface: the package builds
-and tests the application and never reaches a server. Scanners do not make the
-distinction — on a real project a PHPUnit advisory arrived tagged HIGH — but the
-lockfile does, and reading it is cheap and exact.
-
-**Does anything here use it?** A transitive package pulled in by something else
-and never imported cannot be reached through our code. This is the SCA analogue
-of reachability, and the honest version of it is textual: we look for imports.
-
-Both are deliberately conservative. `dev_only` is only ever set from an explicit
-lockfile section, and `imported` is only ever set to False when the lockfile was
-readable and the search ran — "we could not tell" stays `None`, because a
-missing answer must never read as "safe".
-"""
+"""Two facts about a vulnerable dependency that the scanner does not report."""
 
 from __future__ import annotations
 
@@ -23,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .detection import get_source_suffixes
+
 log = logging.getLogger(__name__)
 
 _SKIP_DIRS = {
@@ -30,7 +17,12 @@ _SKIP_DIRS = {
     "dist", "__pycache__", ".idea", ".vscode",
 }
 
-_SOURCE_SUFFIXES = {".php", ".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".rb", ".java", ".kt", ".cs"}
+
+def _skip_path(path: Path) -> bool:
+    """Do not treat generated triage output as first-party source."""
+    return bool(_SKIP_DIRS & set(path.parts)) or any(
+        part.lower().startswith("appsec-out") for part in path.parts
+    )
 
 _MAX_FILES = 4000
 _MAX_BYTES = 400_000
@@ -103,12 +95,7 @@ def build_index(roots: list[Path]) -> DependencyIndex:
 
 
 def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str]]:
-    """How this package would appear if the code used it.
-
-    Namespace-based for PHP (`Symfony\\Component\\Routing`), literal for the
-    module-name ecosystems. Kept loose on purpose: a false "imported" costs a
-    review, a false "not imported" hides a reachable vulnerability.
-    """
+    """How this package would appear if the code used it."""
     vendor, _, short = package.partition("/")
     patterns: list[str] = []
 
@@ -121,25 +108,20 @@ def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str
     else:
         name = package.lstrip("@")
         patterns.append(rf"""["'`]{re.escape(package)}(?:/[^"'`]*)?["'`]""")
-        if len(name) >= 3:
-            patterns.append(rf"\b{re.escape(name.split('/')[-1])}\b")
 
-    return [re.compile(p, re.I) for p in patterns]
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
 def is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool | None:
-    """Does any source file here reference the package? None when unanswerable.
-
-    Read the answers asymmetrically. `True` is evidence: the code names the
-    package, so our code can reach it. `False` is **not** evidence of the
-    opposite — a framework wires plenty of packages through its container and
-    they never appear in an import. Measured on a Symfony project, `twig/twig`
-    came back False while every rendered template goes through it.
-
-    So callers turn `True` into a signal and `False` into a question.
-    """
+    """Does any source file here reference the package?"""
     patterns = _import_patterns(package, ecosystem)
     if not patterns:
+        return None
+    
+    try:
+        suffixes = get_source_suffixes(roots, for_ecosystem=ecosystem)
+    except Exception as exc:
+        log.warning("Cannot determine suffixes for %s: %s", ecosystem, exc)
         return None
 
     scanned = 0
@@ -151,9 +133,9 @@ def is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool 
             if scanned >= _MAX_FILES:
                 log.debug("import search for %s hit the file budget", package)
                 return None
-            if path.suffix.lower() not in _SOURCE_SUFFIXES:
+            if path.suffix.lower() not in suffixes:
                 continue
-            if _SKIP_DIRS & set(path.parts):
+            if _skip_path(path):
                 continue
             try:
                 if path.stat().st_size > _MAX_BYTES:

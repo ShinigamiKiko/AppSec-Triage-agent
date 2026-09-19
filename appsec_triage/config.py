@@ -1,10 +1,4 @@
-"""Config loading: one YAML profile per provider + one pipeline config.
-
-Provider profiles deliberately do NOT share a schema beyond the common fields —
-`options` is a free-form dict passed straight through to the provider, because
-Ollama's `num_ctx`/`num_predict` and OpenAI's `seed`/`top_p` have nothing to do
-with each other and pretending otherwise leaks one provider's model into all.
-"""
+"""Config loading: one YAML profile per provider + one pipeline config."""
 
 from __future__ import annotations
 
@@ -27,11 +21,7 @@ class ConfigError(RuntimeError):
 
 
 def _expand_env(value: Any) -> Any:
-    """Recursively expand ${VAR} and ${VAR:-default} inside loaded YAML.
-
-    Secrets never live in the YAML files; they are referenced by env var name
-    so the configs stay committable.
-    """
+    """Recursively expand ${VAR} and ${VAR:-default} inside loaded YAML."""
     if isinstance(value, str):
 
         def repl(m: re.Match[str]) -> str:
@@ -53,21 +43,14 @@ def _expand_env(value: Any) -> Any:
 
 @dataclass(slots=True)
 class ProviderConfig:
-    """Common transport/decoding knobs. Provider-specific ones live in `options`."""
+    """Common transport/decoding knobs."""
 
     name: str
     kind: Literal["ollama", "openai", "deepseek"]
 
     @property
     def leaves_the_perimeter(self) -> bool:
-        """Does a prompt sent to this provider reach a third party?
-
-        Ollama runs where the pipeline runs, so the code never moves. The hosted
-        providers keep request logs, and a prompt built from a `.env` can carry
-        live signing keys — measured on a real project, 32 and 64 characters of
-        them. What follows from this is which defaults apply, not a refusal:
-        the choice of provider is the operator's.
-        """
+        """Does a prompt sent to this provider reach a third party?"""
         return self.kind != "ollama"
     model: str
     base_url: str
@@ -88,16 +71,14 @@ class ProviderConfig:
     concurrency: int = 4
 
     pricing: dict[str, float] = field(default_factory=dict)
-    # A ceiling for one run, not a target. The optional steps check it before
-    # spending, so a project that would otherwise cost unbounded model calls
-    # stops and says so instead of billing on.
-    budget_usd: float = 1.0
+    budget_usd: float = 5.0
     keep_raw_response: bool = False
+    tool_calling: bool = True
 
     options: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> "ProviderConfig":
+    def from_dict(cls, data: dict[str, Any], *, name: str) -> ProviderConfig:
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(data) - known - {"name"}
         if unknown:
@@ -129,13 +110,10 @@ class PostValidationConfig:
 
 @dataclass(slots=True)
 class ScannerConfig:
-    """How to invoke one SAST tool. Per-tool quirks live in scanners/tools.py."""
+    """How to invoke one SAST tool."""
 
     name: str = "scanner"
     mode: Literal["auto", "native", "docker"] = "auto"
-    # One path, or several to try in order. A list is what lets one profile
-    # serve a workstation and an image at once: the same tool lives under `~`
-    # on one and in `/usr/local/bin` on the other.
     binary: str | list[str] | None = None
     image: str | None = None
     rules: list[str] = field(default_factory=list)
@@ -149,7 +127,7 @@ class ScannerConfig:
     run_in_target: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> "ScannerConfig":
+    def from_dict(cls, data: dict[str, Any], *, name: str) -> ScannerConfig:
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(data) - known - {"name"}
         if unknown:
@@ -159,13 +137,14 @@ class ScannerConfig:
 
 @dataclass(slots=True)
 class ScopeConfig:
-    """What is not worth triaging at all. Deterministic policy, never a guess."""
+    """What is not worth triaging at all."""
 
     enabled: bool = True
     exclude_rules: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=list)
     only_cwes: list[str] = field(default_factory=list)
     min_severity: str | None = None
+    only_ecosystems: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -193,16 +172,7 @@ class LSPConfig:
 
 @dataclass(slots=True)
 class VerificationConfig:
-    """Second, adversarial pass over selected verdicts.
-
-    Not a re-vote: asked the same question twice a model repeats its mistake, and
-    this one's errors are systematic. The second pass asks "what is wrong with
-    this verdict" instead, which is a different task and breaks the shared prior.
-
-    Selective by default — a pass costs as much as the first, so it is spent
-    where precision is measurably weakest (`confirmed`) and where the checks
-    already flagged something.
-    """
+    """Second, adversarial pass over selected verdicts."""
 
     enabled: bool = False
     mode: Literal["advisory", "authoritative"] = "advisory"
@@ -239,18 +209,15 @@ class PipelineConfig:
     dataflow_context_lines_after: int = 10
     max_code_chars: int = 4000
     max_trace_steps: int = 12
+    max_evidence_chars: int = 32000
+    context_retrieval_rounds: int = 2
+    code_walk_first: bool = True
     redact_secrets: bool = False
     secrets_without_model: bool = True
     deployment_config: str | None = None
     resolve_vulnerable_symbols: bool = False
     nvd_api_key: str | None = None
-    # `govulncheck -format json` output from a neighbouring pipeline job. Optional:
-    # it is the only source that answers reachability from a real call graph, and
-    # without it the chain falls back to its own approximations.
     govulncheck_report: str | None = None
-    # Where the SAST phase wrote its scanner output, including the CodeQL
-    # databases it no longer deletes. Both phases run in one container against
-    # one source tree, so the database describes exactly the code being triaged.
     scan_out_dir: str | None = None
 
 

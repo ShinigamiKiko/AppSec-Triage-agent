@@ -1,18 +1,4 @@
-"""Widen the code window by reading the real file.
-
-Scanners crop aggressively. Bandit's `code` for a multi-line call starts at the
-flagged line, so `subprocess.Popen(` never appears — the model correctly infers
-the call and then fails the grounding check because it cannot quote it. On a
-real repository that accounted for most of the remaining hallucination flags.
-
-This is not the thing the article warns against. We are not reconstructing a
-dataflow the scanner did not report; we are showing more of the file the scanner
-already pointed at, verbatim. The window is bounded, and every line still comes
-from disk rather than from the model.
-
-Paths are resolved strictly inside the configured roots — a scanner report is
-untrusted input, and `../../etc/shadow` in a filename must not read anything.
-"""
+"""Widen the code window by reading the real file."""
 
 from __future__ import annotations
 
@@ -83,15 +69,7 @@ class SourceResolver:
         context: int,
         before: int | None = None,
     ) -> Window | None:
-        """Lines around the flagged region, 1-indexed inclusive.
-
-        `before` allows an asymmetric window, which matters more than it sounds:
-        for a dataflow finding the sanitiser is almost always *above* the sink.
-        Measured on DVWA, a symmetric ±6 window cut the four `is_numeric()`
-        octet checks out of view and the model confirmed a command injection in
-        the deliberately-fixed version, writing "there is no sanitization" —
-        which was true of what it had been shown.
-        """
+        """Lines around the flagged region, 1-indexed inclusive."""
         if not self.roots or not start:
             return None
         path = self._resolve(file_path)
@@ -110,13 +88,7 @@ class SourceResolver:
         return Window(text=body, start_line=lo, end_line=hi, resolved=True)
 
     def line(self, file_path: str, number: int | None) -> str | None:
-        """One source line, for annotating a trace.
-
-        CodeQL's threadFlow steps carry `file:line` and an engine-internal node
-        name ("ControlFlowNode for Attribute") and no code at all. Rendered as-is
-        the trace is noise; with the real line beside it, it becomes the thing
-        the model cannot otherwise reconstruct.
-        """
+        """One source line, for annotating a trace."""
         if not self.roots or not number:
             return None
         path = self._resolve(file_path)

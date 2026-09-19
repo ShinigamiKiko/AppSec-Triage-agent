@@ -1,25 +1,4 @@
-"""Materialize a labelled corpus into a source tree the pipeline can read.
-
-The bench used to hand the pipeline bare snippets: no file on disk, nothing
-for the source resolver to widen, nothing for a language server to index.
-That silently benched a *different* pipeline than the one deployed — the live
-procim run closed the ORM-interpolation CWE-89 that the bench got wrong,
-purely because the live run had phpactor and the bench did not.
-
-Writing every snippet to a real file closes that gap. Two adjustments make
-the tree worth indexing:
-
-* PHP fragments get a `<?php` opener when they lack one — phpactor parses
-  nothing in a file that opens with a bare `$id = $_GET['id'];`.
-* The flagged line is anchored on the sink. Corpus entries say `line: 1`
-  because a snippet has no meaningful absolute line, but a real scanner flags
-  the sink, and the language server resolves identifiers *on the flagged
-  line* — pointed at line 1 it would resolve the source assignment instead
-  of the interpolated values that decide the verdict.
-
-Everything else is left alone: the snippet text is written verbatim, so
-grounding checks compare against exactly what the corpus author wrote.
-"""
+"""Materialize a labelled corpus into a source tree the pipeline can read."""
 
 from __future__ import annotations
 
@@ -42,13 +21,7 @@ def _safe_relpath(file_path: str) -> Path:
 
 
 def _flag_offset(snippet_lines: list[str], declared_line: int | None, sink: str | None) -> int:
-    """0-based line of the snippet a scanner would actually flag.
-
-    The sink wins when it can be located: `$pdo->query($sql)` is searched
-    verbatim, then as its call prefix (`system()` -> `system(`) because corpus
-    authors write the sink without arguments. When nothing matches, the
-    declared line is honoured, and line 1 is the final fallback.
-    """
+    """0-based line of the snippet a scanner would actually flag."""
     if sink:
         needles = [sink]
         if "(" in sink:
@@ -63,13 +36,7 @@ def _flag_offset(snippet_lines: list[str], declared_line: int | None, sink: str 
 
 
 def materialize(findings: list[Finding], root: Path) -> list[Finding]:
-    """Write each snippet under `root`, return findings re-pointed at the tree.
-
-    Findings sharing a file path are appended to one file (a blank line
-    apart); a byte-identical snippet seen twice — two scanners, one weakness —
-    lands once and both findings point at the same region, so corroboration
-    keeps meaning "same place" after materialization.
-    """
+    """Write each snippet under `root`, return findings re-pointed at the tree."""
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
 

@@ -1,31 +1,37 @@
-"""Scope filter — the layer before the layers.
-
-Some findings should not be triaged at all, and that is a policy decision, not a
-judgement call for a model. `B101 assert_used` across a test suite is the
-canonical case: 768 of httpie's 811 Bandit findings, none of them a question
-anyone wants an LLM to answer.
-
-Two rules make this safe rather than a silent hole:
-
- 1. **Nothing disappears.** An excluded finding still produces a TriageRecord,
-    marked `decided_by="scope"` with the rule that excluded it. It lands in the
-    audit log like everything else.
- 2. **Exclusions are explicit and counted.** They come from config, never from
-    a heuristic guess, and the summary reports how many were dropped by which
-    rule — a filter you cannot see is a filter you cannot review.
-"""
+"""Scope filter — the layer before the layers."""
 
 from __future__ import annotations
 
 import fnmatch
+import logging
 import re
 from dataclasses import dataclass, field
 
 from .config import ScopeConfig
-from .reuse import fingerprint as _fingerprint
 from .models import EvidenceClass, Finding, TriageRecord, Verdict, VerdictLabel
+from .reuse import fingerprint as _fingerprint
+
+log = logging.getLogger(__name__)
 
 _SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
+
+_ECOSYSTEM_ALIASES = {
+    "go": "go", "golang": "go",
+    "npm": "npm", "node": "npm", "nodejs": "npm", "javascript": "npm",
+    "js": "npm", "ts": "npm", "typescript": "npm", "yarn": "npm", "pnpm": "npm",
+    "composer": "composer", "php": "composer", "packagist": "composer",
+    "pypi": "pypi", "python": "pypi", "pip": "pypi",
+    "nuget": "nuget", "dotnet": "nuget", "csharp": "nuget", "c#": "nuget",
+    "maven": "maven", "java": "maven", "gradle": "maven", "kotlin": "maven",
+    "gem": "gem", "rubygems": "gem", "ruby": "gem",
+    "cargo": "cargo", "crates": "cargo", "rust": "cargo",
+}
+
+
+def _ecosystem(value: str | None) -> str:
+    """One canonical name for an ecosystem, or "" when nothing was given."""
+    name = (value or "").strip().lower()
+    return _ECOSYSTEM_ALIASES.get(name, name)
 
 
 @dataclass(slots=True)
@@ -45,7 +51,8 @@ def _matches(value: str | None, patterns: list[str]) -> str | None:
     return None
 
 
-def _excluded_record(finding: Finding, rule: str, why: str) -> TriageRecord:
+def _excluded_record(finding: Finding, rule: str, why: str,
+                     evidence_class: EvidenceClass = EvidenceClass.test_placeholder) -> TriageRecord:
     return TriageRecord(
         finding_id=finding.finding_id,
         cwe=finding.cwe,
@@ -54,7 +61,7 @@ def _excluded_record(finding: Finding, rule: str, why: str) -> TriageRecord:
         fingerprint=_fingerprint(finding),
         verdict=Verdict(
             verdict=VerdictLabel.false_positive,
-            evidence_class=EvidenceClass.test_placeholder,
+            evidence_class=evidence_class,
             confidence=1.0,
             confidence_rationale=(
                 "Not a model judgement: this finding is outside the configured triage scope, "
@@ -78,6 +85,7 @@ def apply(findings: list[Finding], cfg: ScopeConfig) -> ScopeResult:
         return result
 
     min_idx = _SEVERITY_ORDER.index(cfg.min_severity) if cfg.min_severity else -1
+    ecosystems = {_ecosystem(e) for e in cfg.only_ecosystems if e and e.strip()}
 
     for f in findings:
         if pat := _matches(f.rule_id, cfg.exclude_rules):
@@ -88,17 +96,40 @@ def apply(findings: list[Finding], cfg: ScopeConfig) -> ScopeResult:
             result.excluded.append(_excluded_record(f, pat, "path is excluded from triage"))
             result.counts[f"path:{pat}"] = result.counts.get(f"path:{pat}", 0) + 1
             continue
+        if ecosystems and f.dependency is not None:
+            found = _ecosystem(f.dependency.ecosystem)
+            if found and found not in ecosystems:
+                rule = f"only_ecosystems={sorted(ecosystems)}"
+                result.excluded.append(_excluded_record(
+                    f, rule,
+                    f"экосистема {found} не триажится этой установкой — "
+                    "о самом пакете это ничего не утверждает",
+                    evidence_class=EvidenceClass.insufficient_context))
+                key = f"ecosystem:{found}"
+                result.counts[key] = result.counts.get(key, 0) + 1
+                continue
         if cfg.only_cwes and f.cwe not in cfg.only_cwes:
             rule = f"only_cwes={cfg.only_cwes}"
             result.excluded.append(_excluded_record(f, rule, f"CWE {f.cwe} is not in the triaged set"))
             result.counts["cwe_not_in_scope"] = result.counts.get("cwe_not_in_scope", 0) + 1
             continue
-        if min_idx >= 0 and f.severity.value in _SEVERITY_ORDER:
-            if _SEVERITY_ORDER.index(f.severity.value) < min_idx:
-                rule = f"min_severity={cfg.min_severity}"
-                result.excluded.append(_excluded_record(f, rule, f"severity {f.severity.value} is below the floor"))
-                result.counts["below_min_severity"] = result.counts.get("below_min_severity", 0) + 1
-                continue
+        if (
+            min_idx >= 0
+            and f.severity.value in _SEVERITY_ORDER
+            and _SEVERITY_ORDER.index(f.severity.value) < min_idx
+        ):
+            rule = f"min_severity={cfg.min_severity}"
+            result.excluded.append(_excluded_record(f, rule, f"severity {f.severity.value} is below the floor"))
+            result.counts["below_min_severity"] = result.counts.get("below_min_severity", 0) + 1
+            continue
         result.kept.append(f)
+
+    for key, count in sorted(result.counts.items()):
+        if key.startswith("ecosystem:"):
+            log.warning(
+                "scope: dropped %d finding(s) in ecosystem %r, which is not in "
+                "only_ecosystems=%s. If this ecosystem is now part of the project, "
+                "the filter is hiding real findings — update the config.",
+                count, key.split(":", 1)[1], sorted(ecosystems))
 
     return result

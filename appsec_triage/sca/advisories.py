@@ -1,33 +1,4 @@
-"""Where the vulnerability was described and where it was fixed, looked up live.
-
-Every database holds a different part of the answer, so none of them is
-sufficient alone:
-
-- **OSV** aggregates. It answers "which advisories affect this package at this
-  version", carries the aliases that let one flaw be recognised under CVE, GHSA,
-  BIT and DRUPAL ids, and lists references — including, usually, the fix commit.
-- **GHSA** carries the maintainer's own write-up. That prose is what most often
-  names the vulnerable symbol outright, and it is richer than the NVD summary.
-- **NVD** is the fallback and the cross-check. When an advisory reaches us as a
-  bare CVE id with no ecosystem, NVD is the source that still knows something,
-  and its reference list sometimes carries a patch link the others lack.
-
-References are ranked, not taken first-come: a commit is a fix, a release tag is
-a bundle of fixes, and an advisory page is prose. Getting this order wrong was
-measured — taking the first link that produced a diff handed two different
-advisories the same release diff, and the extraction was then judged on a diff
-that need not contain the fix at all. Ranking reads each reference's declared
-`type` and does not guess from the URL: Go publishes its fixes as Gerrit
-changelists, so a shape test written around `github.com/.../commit/` concluded
-that Go advisories carry no fix at all — a measurement of the test, not of Go.
-
-Some ecosystems state the vulnerable symbols outright. Go's database lists them
-per import path in `ecosystem_specific`, curated by hand, and that is a better
-answer than anything inferred from a diff — so it is read here and used as-is
-rather than re-derived. Only the Go-native `GO-` records carry it; the GHSA
-mirrors of the same flaw do not, which is why entries that have symbols are
-preferred when several describe one vulnerability.
-"""
+"""Where the vulnerability was described and where it was fixed, looked up live."""
 
 from __future__ import annotations
 
@@ -39,6 +10,8 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+
+from . import cassette
 
 log = logging.getLogger(__name__)
 
@@ -77,24 +50,15 @@ class Advisory:
     details: str = ""
     aliases: list[str] = field(default_factory=list)
     fix_refs: list[str] = field(default_factory=list)
+    fixed_versions: list[str] = field(default_factory=list)
     symbols: list[str] = field(default_factory=list)
     import_paths: list[str] = field(default_factory=list)
     named_symbols: list[str] = field(default_factory=list)
-    """Function names the description mentions — candidates, not a statement.
-
-    Kept apart from `symbols`, which a database curated and which can be acted
-    on directly. These come from prose and carry prose's noise, so they are
-    offered to the search as things to look for, never as the answer."""
     cwe_ids: list[str] = field(default_factory=list)
-    """Weakness classes, when a database states them.
-
-    Decides whether "attacker input does not reach this call" closes a finding:
-    it does for a flaw that needs attacker-controlled input and does not for one
-    that does not. Go's own records carry no CWE; the GHSA mirror usually does,
-    which is one more reason to merge the two rather than take the first."""
     sources: list[str] = field(default_factory=list)
     severity: str = ""
     problem: str = ""
+    affected: list[dict] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -106,31 +70,17 @@ class Advisory:
 
 
 class DatabaseUnavailable(Exception):
-    """A database did not answer. Never the same thing as answering "none".
-
-    Swallowing this was measured: one run reported ten advisories for jinja2 and
-    the next reported zero, because the query timed out and the empty list was
-    indistinguishable from a clean package. A scanner that reports "no known
-    vulnerabilities" when it in fact failed to ask is worse than one that
-    crashes.
-    """
+    """A database did not answer."""
 
 
 def _get_json(url: str, body: bytes | None = None, headers: dict | None = None):
-    """Parsed JSON, or `DatabaseUnavailable`. A 404 is an answer and returns None.
-
-    Retried, because a triage run makes one query per CVE and a single dropped
-    connection then costs a whole finding: measured on a real project, 34 of 53
-    lookups failed with "network is unreachable" while the same queries
-    succeeded moments later. Rate limiting is backed off for; a 404 and a
-    malformed body are answers and are not retried.
-    """
+    """Parsed JSON, or `DatabaseUnavailable`."""
     last: Exception | None = None
     for attempt in range(_RETRIES):
         try:
             request = urllib.request.Request(
                 url, data=body, headers={**_UA, **(headers or {})})
-            with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            with cassette.urlopen(request, timeout=_TIMEOUT) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -172,15 +122,7 @@ def _refs(entry: dict) -> list[tuple[str, str]]:
 
 
 def _rank_refs(refs: list[tuple[str, str]]) -> list[str]:
-    """Fetchable fix links, best first.
-
-    Only links a diff can be read from survive, since that is the sole use of
-    this list; a Gerrit changelist names the fix but cannot be turned into a
-    diff here, and keeping it would only buy four dead fetches per advisory.
-    Within that, a reference the database itself typed as FIX outranks one
-    merely shaped like a commit — `gin` publishes three fix commits and an
-    unrelated pull request under the same URL shape.
-    """
+    """Fetchable fix links, best first."""
     tiers: dict[tuple[int, int], list[str]] = {}
     for url, kind in refs:
         match = _COMMIT.match(url)
@@ -202,13 +144,7 @@ def _rank_refs(refs: list[tuple[str, str]]) -> list[str]:
 
 
 def _github_fix_refs(advisory_id: str) -> list[str]:
-    """Find fetchable fix references in GitHub's public advisory record.
-
-    OSV is the primary source. GitHub is only a repair path for npm advisories
-    whose OSV record has prose but no usable FIX reference. The REST endpoint is
-    used instead of requiring a GraphQL token; a token is still accepted when
-    the operator has one, which raises the rate limit without changing behavior.
-    """
+    """Find fetchable fix references in GitHub's public advisory record."""
     if not advisory_id.upper().startswith("GHSA-"):
         return []
     headers = dict(_UA)
@@ -227,16 +163,10 @@ def _github_fix_refs(advisory_id: str) -> list[str]:
 
 _BACKTICKED = re.compile(r"`([^`\n]{1,60})`")
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
-# Words that appear in backticks in these descriptions and are never the flaw:
-# option names, config keys and the prose's own vocabulary.
 _NOT_A_FUNCTION = {
     "true", "false", "null", "undefined", "options", "option", "variable",
     "constructor", "prototype", "__proto__", "name", "value", "type", "default",
 }
-# Built-in types the prose names as the thing being polluted or parsed, never as
-# the call: "modify the prototype of `Object`". Matched with case, because the
-# capital is what separates them from real functions — lodash's vulnerable `set`
-# must survive while `Set` must not.
 _BUILTIN_TYPES = {
     "Object", "Array", "String", "Number", "Boolean", "Function", "JSON",
     "Map", "Set", "Date", "RegExp", "Promise", "Buffer", "Error", "Symbol",
@@ -244,19 +174,7 @@ _BUILTIN_TYPES = {
 
 
 def _named_in_prose(text: str, package: str) -> list[str]:
-    """Function names the description states outright, in backticks.
-
-    npm has no curated symbol list — the field Go fills is empty — so the only
-    place a name is published is the prose, and it is published often enough to
-    be worth reading: "The functions `pick`, `set`, `setWith`, `update`,
-    `updateWith`, and `zipObjectDeep` allow a malicious user to…".
-
-    Unlike Go's list this is not authoritative. The same backticks wrap package
-    names, option names and internal identifiers, so what comes out is a set of
-    candidates to search for, not a statement about the flaw. Measured over nine
-    npm advisories: two yielded exactly the right names, one added noise, and
-    five had no backticks at all.
-    """
+    """Function names the description states outright, in backticks."""
     segments = {part for part in re.split(r"[/@._-]", (package or "").lower()) if part}
     out: list[str] = []
     for token in _BACKTICKED.findall(text or ""):
@@ -284,14 +202,7 @@ def _cwes_of(entry: dict) -> list[str]:
 
 
 def _import_paths_of(entry: dict) -> list[str]:
-    """Vulnerable import paths the database names, symbols or not.
-
-    A package-level advisory — "this package is unmaintained and unsafe" — names
-    the affected import paths but no function, because the flaw is the package
-    itself. That list is what decides such a finding: the module can be present
-    through a safe sub-package while the vulnerable path is never imported, so
-    the answer is at import-path granularity, not module granularity.
-    """
+    """Vulnerable import paths the database names, symbols or not."""
     out: list[str] = []
     for affected in entry.get("affected") or []:
         for item in (affected.get("ecosystem_specific") or {}).get("imports") or []:
@@ -302,12 +213,7 @@ def _import_paths_of(entry: dict) -> list[str]:
 
 
 def _symbols_of(entry: dict) -> list[str]:
-    """Vulnerable symbols the database states outright, fully qualified.
-
-    Returned as `import/path.Symbol` (or `.Receiver.Method`) so the caller can
-    tell a symbol belonging to the package itself from one belonging to the
-    standard library it calls through.
-    """
+    """Vulnerable symbols the database states outright, fully qualified."""
     out: list[str] = []
     for affected in entry.get("affected") or []:
         for item in (affected.get("ecosystem_specific") or {}).get("imports") or []:
@@ -319,13 +225,35 @@ def _symbols_of(entry: dict) -> list[str]:
     return out
 
 
+def _affected_of(entry: dict) -> list[dict]:
+    """Per-package ranges and explicit versions, as OSV states them."""
+    out: list[dict] = []
+    for affected in entry.get("affected") or []:
+        package = (affected.get("package") or {})
+        out.append({
+            "package": str(package.get("name") or ""),
+            "ecosystem": str(package.get("ecosystem") or ""),
+            "ranges": [{"type": str(r.get("type") or ""), "events": list(r.get("events") or [])}
+                       for r in affected.get("ranges") or []],
+            "versions": [str(v) for v in affected.get("versions") or []],
+        })
+    return out
+
+
+def _fixed_versions_of(entry: dict) -> list[str]:
+    """Versions marked fixed by OSV's affected-range events."""
+    out: list[str] = []
+    for affected in entry.get("affected") or []:
+        for item in affected.get("ranges") or []:
+            for event in item.get("events") or []:
+                fixed = str(event.get("fixed") or "").strip()
+                if fixed and fixed not in out:
+                    out.append(fixed)
+    return out
+
 
 def from_osv(package: str, ecosystem: str, version: str) -> list[Advisory]:
-    """Every advisory affecting this exact version.
-
-    Raises `DatabaseUnavailable` rather than returning an empty list when the
-    query fails, so a caller cannot mistake silence for a clean package.
-    """
+    """Every advisory affecting this exact version."""
     osv_name = osv_ecosystem(ecosystem)
     if not (package and osv_name and version):
         return []
@@ -343,11 +271,10 @@ def from_osv(package: str, ecosystem: str, version: str) -> list[Advisory]:
             details=(vuln.get("details") or "")[:8000],
             aliases=list(vuln.get("aliases") or []),
             fix_refs=_rank_refs(_refs(vuln)), symbols=_symbols_of(vuln),
+            fixed_versions=_fixed_versions_of(vuln), affected=_affected_of(vuln),
             import_paths=_import_paths_of(vuln), cwe_ids=_cwes_of(vuln),
             sources=["osv"], severity=_severity_of(vuln),
         ))
-    # One flaw is often returned twice, as the native record and as its mirror.
-    # Only the native one states the symbols, so it must be the one kept.
     out.sort(key=lambda a: not a.symbols)
     return out
 
@@ -365,6 +292,7 @@ def from_ghsa(advisory_id: str) -> Advisory | None:
         details=(data.get("details") or "")[:8000],
         aliases=list(data.get("aliases") or []),
         fix_refs=_rank_refs(_refs(data)), symbols=_symbols_of(data),
+        fixed_versions=_fixed_versions_of(data), affected=_affected_of(data),
         import_paths=_import_paths_of(data), cwe_ids=_cwes_of(data),
         sources=["ghsa"], severity=_severity_of(data),
     )
@@ -399,13 +327,7 @@ def collect(
     *,
     nvd_api_key: str | None = None,
 ) -> Advisory:
-    """One advisory, merged from whichever databases answered.
-
-    Merging matters: OSV reliably has the fix commit, GHSA reliably has the prose
-    that names the symbol, and an advisory with only one of the two is much
-    harder to resolve. Failures are recorded in `problem` rather than raised —
-    a database being down must degrade this to "unknown", not end the scan.
-    """
+    """One advisory, merged from whichever databases answered."""
     merged = Advisory(advisory_id=advisory_id, package=package, ecosystem=ecosystem)
     tried: list[str] = []
     failures: list[str] = []
@@ -421,7 +343,7 @@ def collect(
         if advisory_id:
             wanted = advisory_id.strip().upper()
             found = [a for a in found
-                     if wanted in {a.advisory_id.upper(), *(x.upper() for x in a.aliases)}] or found
+                     if wanted in {a.advisory_id.upper(), *(x.upper() for x in a.aliases)}]
         candidates.extend(found[:1] if advisory_id else found)
 
     ids = {advisory_id, *(a.advisory_id for a in candidates)}
@@ -472,25 +394,21 @@ def collect(
         for ref in entry.fix_refs:
             if ref not in merged.fix_refs:
                 merged.fix_refs.append(ref)
+        for fixed in entry.fixed_versions:
+            if fixed not in merged.fixed_versions:
+                merged.fixed_versions.append(fixed)
+        if not merged.affected and entry.affected:
+            merged.affected = list(entry.affected)
         merged.sources.extend(s for s in entry.sources if s not in merged.sources)
 
-    # npm records occasionally contain the GHSA text but omit a FIX reference
-    # from OSV. Do not make symbol extraction fall back to guessing when GitHub
-    # can still point us at the patch.
     if ecosystem.lower() in {"npm", "node", "javascript", "yarn"} and not merged.fix_refs:
         for ident in [merged.advisory_id, *merged.aliases]:
             for ref in _github_fix_refs(ident):
                 if ref not in merged.fix_refs:
                     merged.fix_refs.append(ref)
 
-    # Read from the merged text, not per source: GHSA carries the prose that
-    # names the functions and OSV carries the version data, and only the merge
-    # has both.
     merged.named_symbols = _named_in_prose(merged.text, package or merged.package)
 
-    # Each source's list is already ranked and merging preserves that order, so
-    # re-ranking here would only re-sort urls whose declared type is long gone —
-    # dropping the FIX-outranks-shape rule exactly on the merged path.
     if failures:
         merged.problem = "базы не ответили — " + "; ".join(failures)
     elif not merged.usable:

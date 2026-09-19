@@ -1,19 +1,4 @@
-"""The dependency graph from cdxgen, for every ecosystem at once.
-
-Writing a lockfile parser per ecosystem does not end: composer, npm, yarn, pnpm,
-pip, poetry, uv, go.mod, gradle, each with versions and quirks. cdxgen already
-does exactly that and emits CycloneDX, which states both the resolved component
-list and the `dependsOn` edges — which is all the graph needs.
-
-Two properties matter for this pipeline and both hold: it reads manifests and
-lockfiles rather than installing anything, and it names components by purl, so
-`pkg:composer/twig/twig@3.3.8` and `pkg:npm/lodash@4.17.15` come back in one
-shape.
-
-A failure here is reported, never smoothed over. Without the graph a transitive
-package cannot be told from a direct one, and calling everything direct would
-produce upgrade advice that does not work.
-"""
+"""The dependency graph from cdxgen, for every ecosystem at once."""
 
 from __future__ import annotations
 
@@ -36,18 +21,12 @@ _PURL_ECOSYSTEM = {
 
 
 def available() -> str | None:
-    """Path to cdxgen, or None. Absence is a normal state, not an error."""
+    """Path to cdxgen, or None."""
     return shutil.which("cdxgen")
 
 
 def parse_purl(purl: str) -> tuple[str, str, str]:
-    """(ecosystem, name, version) from a package URL.
-
-    Namespaced names differ per ecosystem — `pkg:composer/twig/twig` is one
-    package called `twig/twig`, `pkg:npm/%40scope/pkg` is `@scope/pkg` — and
-    losing the namespace was measured to break advisory lookup silently: OSV
-    returned nothing for "guzzle" where "guzzlehttp/guzzle" has dozens.
-    """
+    """(ecosystem, name, version) from a package URL."""
     if not purl.startswith("pkg:"):
         return "", "", ""
     body = purl[4:].split("?", 1)[0].split("#", 1)[0]
@@ -59,12 +38,7 @@ def parse_purl(purl: str) -> tuple[str, str, str]:
 
 
 def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None, str]:
-    """Run cdxgen over `project`. Returns (sbom, problem).
-
-    `--no-install-deps` is not optional here: the project being scanned is the
-    user's checkout, and a tool that installs into it has changed what it was
-    asked to describe.
-    """
+    """Run cdxgen over `project`."""
     exe = available()
     if not exe:
         return None, "cdxgen не установлен — граф зависимостей недоступен"
@@ -74,7 +48,7 @@ def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None
         argv = [exe, "-r", "-o", str(out), "--no-install-deps", str(project)]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout_s, encoding="utf-8", errors="replace")
+                                  timeout=timeout_s, encoding="utf-8", errors="replace", check=False)
         except subprocess.TimeoutExpired:
             return None, f"cdxgen не уложился в {timeout_s}s"
         except OSError as exc:

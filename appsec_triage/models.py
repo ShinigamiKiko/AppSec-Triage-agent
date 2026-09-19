@@ -1,9 +1,4 @@
-"""Core data contracts: Finding -> EvidencePackage -> Verdict.
-
-These three types are the only things that cross layer boundaries. Adapters
-produce Findings, the context builder produces EvidencePackages, the LLM layer
-produces Verdicts, and post-validation only ever rewrites a Verdict.
-"""
+"""Core data contracts: Finding -> EvidencePackage -> Verdict."""
 
 from __future__ import annotations
 
@@ -45,19 +40,7 @@ class TraceStep(BaseModel):
 
 
 class DependencyInfo(BaseModel):
-    """A vulnerable third-party component — the SCA half of the problem.
-
-    SAST and SCA ask different questions and the pipeline must not blur them.
-    For a weakness in *our* code the question is "does untrusted input reach the
-    sink". For a CVE in a dependency the code is not ours to read: what decides
-    it is whether the installed version is in range, whether the package ships
-    to production at all, and whether anything here calls the vulnerable part.
-
-    Scanners emit all of this as prose in a `help` blob. Left unparsed it
-    reaches the model as one long sentence and every CVE lands in `unknown`,
-    which is what happened on a real project: 89 dependency findings, none of
-    them triaged on anything the model could actually weigh.
-    """
+    """A vulnerable third-party component — the SCA half of the problem."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -65,19 +48,17 @@ class DependencyInfo(BaseModel):
     ecosystem: str | None = None
     installed_version: str | None = None
     fixed_versions: list[str] = Field(default_factory=list)
+    advisory_aliases: list[str] = Field(default_factory=list)
     advisory_url: str | None = None
     dev_only: bool | None = None
     imported: bool | None = None
+    reachability: str | None = None
+    call_site: str | None = None
+    call_line: str | None = None
 
     @property
     def upgrade_target(self) -> str | None:
-        """The lowest published fix above the installed version.
-
-        Scanners list one fix per maintained branch and usually surface the
-        first. Told "you run 5.4.3, fixed in 4.4.51" a reader concludes they are
-        already past it — the opposite of the truth, and a real vulnerability
-        gets waved away.
-        """
+        """The lowest published fix above the installed version."""
         if not self.installed_version:
             return self.fixed_versions[0] if self.fixed_versions else None
         current = _release_parts(self.installed_version)
@@ -92,9 +73,7 @@ class DependencyInfo(BaseModel):
 
 
 def _release_parts(version: str) -> tuple[int, ...] | None:
-    """Plain dotted release -> comparable tuple. Pre-release forms are rejected
-    rather than guessed: ordering `1.0.0-rc1` needs full semver precedence, and
-    a subtly wrong answer here mislabels a fix with no visible symptom."""
+    """Plain dotted release -> comparable tuple."""
     text = version.strip().lower().lstrip("v")
     if not text or any(ch in text for ch in "-+ "):
         return None
@@ -139,7 +118,7 @@ class HeuristicSignal(BaseModel):
 
 
 class EvidencePackage(BaseModel):
-    """What the model actually sees. Never the raw finding."""
+    """What the model actually sees."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -168,18 +147,15 @@ class EvidencePackage(BaseModel):
     lsp_resolved_clean: bool = False
     dependency: DependencyInfo | None = None
     history: list[str] = Field(default_factory=list)
+    evidence_blocks: list[str] = Field(default_factory=list)
+    context_notes: list[str] = Field(default_factory=list)
+    dependency_analysis: str | None = None
+    repository_code_collected: bool = False
+    repository_bytes_read: int = 0
+    code_questions: list[str] = Field(default_factory=list)
 
     def quotable_text(self) -> str:
-        """Exactly the text the model was shown, used to verify its quotes.
-
-        This deliberately delegates to the same renderer that builds the prompt.
-        An earlier version rebuilt the string independently and the two drifted:
-        heuristic signals were rendered as `- name [direction]: detail` in the
-        prompt but `name: detail` here, so a model faithfully copying a signal
-        line was accused of hallucinating it. On a real repository that produced
-        8 bogus hallucination flags out of 43 findings. Grounding must compare
-        against what was actually sent, never a parallel reconstruction.
-        """
+        """Exactly the text the model was shown, used to verify its quotes."""
         from .context.builder import render_for_prompt
 
         return render_for_prompt(self)
@@ -208,12 +184,7 @@ class DataflowRole(str, Enum):
 
 
 class DataflowStep(BaseModel):
-    """One hop of the reconstructed path, in the model's own words.
-
-    Explanatory, not authoritative: `code` must be a quote from the input, and
-    post-validation strips any step whose quote cannot be found. A step with no
-    quote is narration and is marked as such in the report.
-    """
+    """One hop of the reconstructed path, in the model's own words."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -227,12 +198,7 @@ class DataflowStep(BaseModel):
 
 
 class VulnerableSymbol(BaseModel):
-    """The specific thing that is wrong — the answer to 'what exactly?'.
-
-    Note this is a CWE-level artefact (a call, a literal, an algorithm in *your*
-    code), not a CVE. CVEs identify published flaws in third-party components
-    and come from SCA, not SAST.
-    """
+    """The specific thing that is wrong — the answer to 'what exactly?'."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -243,18 +209,7 @@ class VulnerableSymbol(BaseModel):
 
 
 class EvidenceQuote(BaseModel):
-    """A verbatim line plus what it proves.
-
-    Split apart after measuring the alternative: with `evidence` as a bare list
-    of strings this model wrote *descriptions* into it — "user input is
-    concatenated into a shell command" — and the grounding check, correctly,
-    could not find those in the source. On DVWA that destroyed every correctly
-    confirmed command injection, 40 of 107 findings in total.
-
-    The model was not being careless; it had a conclusion to express and only
-    one field to put it in. Giving the explanation its own home is the fix, the
-    same lesson as making `vulnerable_symbol` non-nullable.
-    """
+    """A verbatim line plus what it proves."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -264,7 +219,7 @@ class EvidenceQuote(BaseModel):
 
 
 class Verdict(BaseModel):
-    """The strict contract the model must return. Anything else is a schema fail."""
+    """The strict contract the model must return."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -293,12 +248,7 @@ class Verdict(BaseModel):
 
 
 class SCASummary(BaseModel):
-    """What the dependency chain found, in the shape a report table needs.
-
-    One row per finding: what the flaw is, whether this code reaches it, where
-    exactly, and — when the answer does not live in the code at all — what has
-    to be checked elsewhere and by whom.
-    """
+    """What the dependency chain found, in the shape a report table needs."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -314,12 +264,15 @@ class SCASummary(BaseModel):
     trace: str = ""
     external: str = ""
     owner: str = ""
+    condition: str = ""
+    condition_state: str = ""
+    condition_hits: list[str] = Field(default_factory=list)
     exploitability: str = ""
-    # What checked the closure, and what it found. A closure by a mechanical fact
-    # never reaches the model, so without its own field the audit that verified
-    # it would be invisible in the report — a reviewer could not tell a checked
-    # closure from an unchecked one, which is the whole reason the audit exists.
     audit: str = ""
+    closure_kind: str = ""
+    audited: bool = False
+    route: str = ""
+    codeql_calls: list[str] = Field(default_factory=list)
     problems: list[str] = Field(default_factory=list)
 
 
@@ -334,6 +287,7 @@ class TriageRecord(BaseModel):
     kind: Literal["weakness", "dependency", "misconfiguration"] = "weakness"
     rule_id: str | None = None
     start_line: int | None = None
+    trace: list[TraceStep] = Field(default_factory=list)
     symbol_context: list[str] = Field(default_factory=list)
     reachability: str | None = None
     challenge_note: str | None = None
@@ -353,7 +307,5 @@ class TriageRecord(BaseModel):
     error: str | None = None
     fingerprint: str | None = None
     reused: bool = False
-    # What the dependency chain established, kept so the report can show it.
-    # Without this the chain's work exists only inside the prompt: the reviewer
-    # sees a verdict and no way to check where it came from.
-    sca: "SCASummary | None" = None
+    sca: SCASummary | None = None
+    code_questions: list[str] = Field(default_factory=list)

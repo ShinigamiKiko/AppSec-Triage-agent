@@ -1,15 +1,4 @@
-"""Turning the three checks into one statement about a dependency CVE.
-
-The rule the pipeline needs is short: the vulnerability is *actual* when the
-vulnerable symbol is called here, and — for weaknesses that require
-attacker-controlled input — when that input demonstrably reaches the call.
-
-Everything else is a degree of not-knowing, and the distinctions between those
-degrees are what makes the report usable. "The package does not ship this code"
-is a closure. "Nothing here calls it" is not: most vulnerable functions are
-library internals reached through public API, so absence of a direct call means
-the question moved, not that it was answered.
-"""
+"""Turning the three checks into one statement about a dependency CVE."""
 
 from __future__ import annotations
 
@@ -17,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .presence import PresenceResult, SymbolPresence
-from .reach import ReachResult, Reachability
+from .reach import Reachability, ReachResult
 from .resolve import VulnerableSymbol
 
 
@@ -29,12 +18,15 @@ class CVEVerdict(str, Enum):
     ACTUAL = "actual"
     PRESENT_UNPROVEN = "present"
     ONLY_IN_TESTS = "only_in_tests"
+    ONLY_TEST_IMPORT = "test_only_import"
     CALL_UNCONFIRMED = "call_unconfirmed"
     MENTIONED_ONLY = "mentioned"
     NOT_APPLICABLE = "not_applicable"
     NO_DIRECT_CALL = "no_direct_call"
     WRONG_RECEIVER = "wrong_receiver"
     NOT_REACHED = "not_reached"
+    NOT_CALLED = "not_called"
+    VERSION_UNAFFECTED = "version_unaffected"
     UNDECIDED = "undecided"
 
 
@@ -47,28 +39,62 @@ class CVEDecision:
 
     @property
     def closes(self) -> bool:
-        """Outcomes that rest on a fact, not on failing to find something.
-
-        Each of these is a positive statement: the package does not ship to
-        production, the repository never names it, the condition the flaw needs
-        is not met, the vulnerable path is not in the artifact. None of them is
-        "we looked and saw nothing".
-        """
+        """Outcomes that rest on a fact, not on failing to find something."""
         return self.verdict in (CVEVerdict.NOT_APPLICABLE, CVEVerdict.NOT_SHIPPED,
                                 CVEVerdict.UNUSED, CVEVerdict.CONDITION_ABSENT,
                                 CVEVerdict.INFRASTRUCTURE, CVEVerdict.WRONG_RECEIVER,
-                                CVEVerdict.NOT_REACHED)
+                                CVEVerdict.NOT_REACHED, CVEVerdict.ONLY_TEST_IMPORT,
+                                CVEVerdict.NOT_CALLED, CVEVerdict.VERSION_UNAFFECTED)
 
     @property
     def reassigned(self) -> bool:
-        """Closed for this service, and owned by somebody else.
-
-        For the application's queue this is a false positive — the service
-        cannot change an LDAP server's settings or TLS on a load balancer, and
-        the finding does not belong to it. The flag stays so a report can route
-        it rather than merely dismiss it.
-        """
+        """Closed for this service, and owned by somebody else."""
         return self.verdict is CVEVerdict.INFRASTRUCTURE
+
+
+def _audited(audit, kind: str) -> bool:
+    """Did the check aimed at this closure's blind spot actually run?"""
+    return audit is not None and getattr(audit, "checked", False) and audit.kind == kind
+
+
+def _unchecked(headline: str, audit, kind: str, *reasons: str) -> CVEDecision:
+    """A closure that could not be checked goes to a person, carrying why."""
+    detail = getattr(audit, "detail", "") if audit is not None else ""
+    return CVEDecision(
+        CVEVerdict.PRESENT_UNPROVEN,
+        headline,
+        [*[r for r in reasons if r],
+         detail or f"проверка закрытия «{kind}» не выполнялась",
+         "не закрыто: механическая проверка не прошла контроль своей слепой зоны"],
+    )
+
+
+def version_unaffected(check) -> CVEDecision:
+    """The installed version lies outside every range the advisory lists."""
+    return CVEDecision(
+        CVEVerdict.VERSION_UNAFFECTED,
+        f"не уязвимо: {check.detail}",
+        [check.detail,
+         "сверено с диапазонами advisory (introduced / fixed / last_affected), а не с одним номером фикса",
+         "закрыто по версии — поиск функции и достижимости не нужен"],
+    )
+
+
+def _lsp_checked(lsp_audit) -> bool:
+    """The model asked the language server, and it found no project caller."""
+    return _audited(lsp_audit, "not_called") and not lsp_audit.reopens
+
+
+def _not_called(lsp_audit, *reasons: str) -> CVEDecision:
+    """A false positive with a mark: the version is affected, nothing here calls the flaw."""
+    return CVEDecision(
+        CVEVerdict.NOT_CALLED,
+        "ложное срабатывание с пометкой: уязвимую функцию код проекта не вызывает",
+        [*[r for r in reasons if r], lsp_audit.render(),
+         "проверено языковым сервером от объявления в пакете, а не поиском по тексту",
+         "пометка: установленная версия уязвима — если вызов появится, находка вернётся",
+         "не покрыто: вызов через публичный API пакета, который модель не спросила"],
+    )
 
 
 def decide(
@@ -81,6 +107,7 @@ def decide(
     dev_only: bool | None = None,
     used: bool | None = None,
     used_detail: str = "",
+    test_only: bool = False,
     package_used: bool | None = None,
     package_used_detail: str = "",
     receiver_disproved: bool = False,
@@ -91,19 +118,19 @@ def decide(
     dataflow=None,
     direct: bool | None = None,
     condition=None,
+    lsp_audit=None,
 ) -> CVEDecision:
-    """Combine the steps. Facts that settle it are checked before anything else."""
-    # A real call graph outranks every approximation below it, in both
-    # directions: it names the frames when the flaw is reached, and it has read
-    # the whole program when it is not. Everything else here infers reachability
-    # from names, imports or a single call site.
+    """Combine the steps."""
     if reachability is not None:
         if reachability.reachable:
-            # The graph proved the path; the call site decides whether the flaw
-            # can fire along it. A quoted line saying it cannot — plain HTTP
-            # where the flaw needs HTTP/2, a link-local address where it needs
-            # an attacker — lowers this to a condition that is not met. Without
-            # a quote nothing moves: the graph's answer stands.
+            if dataflow is not None and dataflow is not False:
+                return CVEDecision(
+                    CVEVerdict.ACTUAL,
+                    "уязвимость актуальна: пользовательский ввод доходит до вызова",
+                    [dataflow.render(), "поток данных построен CodeQL по базе этого прогона"],
+                    [f"{dataflow.source_file}:{dataflow.source_line}",
+                     f"{dataflow.file}:{dataflow.line}"],
+                )
             if call_site is not None and call_site.lowers:
                 return CVEDecision(
                     CVEVerdict.CONDITION_ABSENT,
@@ -120,33 +147,26 @@ def decide(
                  *([call_site.render()] if call_site is not None else [])],
                 reachability.trace[:6],
             )
-        # The closure was checked for the calls the graph cannot resolve. A
-        # quoted hit there is not proof of a path — nothing traced one — but it
-        # is proof that the graph's silence does not settle this, so the finding
-        # goes back to a person rather than closing.
         if graph_audit is not None and graph_audit.reopens:
             return CVEDecision(
                 CVEVerdict.PRESENT_UNPROVEN,
                 "граф вызовов пути не нашёл, но в коде есть вызовы, которых он не видит",
                 [reachability.render(), graph_audit.render(),
-                 "не закрыто: закрытие графом не проходит проверку на "
-                 "рефлексию и подгружаемый код"],
+                 ("не закрыто: закрытие графом не проходит проверку на "
+                 "рефлексию и подгружаемый код")],
                 reachability.trace[:6],
             )
+        if not _audited(graph_audit, "not_reached"):
+            return _unchecked(
+                "граф вызовов пути не нашёл, но закрытие не проверено",
+                graph_audit, "not_reached", reachability.render())
         return CVEDecision(
             CVEVerdict.NOT_REACHED,
             "по графу вызовов уязвимая функция недостижима",
-            [reachability.render(),
-             (graph_audit.render() if graph_audit is not None
-              else "закрыто по статическому графу: вызовы через рефлексию или "
-                   "подгружаемые модули он не видит")],
+            [reachability.render(), graph_audit.render(),
+             "закрыто по статическому графу, проверенному на рефлексию, "
+             "подгружаемые модули и генерируемый код"],
         )
-    # One guard for every mechanical closure below, because they all fail the
-    # same way: the check was right about what it measured and wrong about what
-    # that meant. The audit found something the check could not see and quoted
-    # it, so the finding goes back to a person instead of closing. Placed here
-    # rather than repeated in each branch — a closure added later is covered
-    # without anyone remembering to cover it.
     if closure_audit is not None and closure_audit.reopens:
         return CVEDecision(
             CVEVerdict.PRESENT_UNPROVEN,
@@ -155,29 +175,33 @@ def decide(
              "не закрыто: механическая проверка была верна, но её вывод не следует"],
         )
 
-    # The language server resolved every matching call site and none of them
-    # lands in the flawed package: the name collided, the type did not. This is
-    # a resolver's answer about types, not an absence of text, so it closes.
     if receiver_disproved:
+        if not _audited(closure_audit, "wrong_receiver"):
+            return _unchecked(
+                "получатель другого типа, но закрытие не проверено",
+                closure_audit, "wrong_receiver",
+                (presence.detail if presence else ""))
         return CVEDecision(
             CVEVerdict.WRONG_RECEIVER,
             "совпало имя метода, но получатель другого типа",
             [(presence.detail if presence else "")
              or "языковой сервер разрешил все места вызова вне этого пакета",
+             closure_audit.render(),
              "закрыто по разрешению типов, а не по отсутствию имени в коде"],
         )
     if dev_only:
+        if not _audited(closure_audit, "not_shipped"):
+            return _unchecked(
+                "пакет помечен build-only, но закрытие не проверено",
+                closure_audit, "not_shipped",
+                "в SBOM помечен как build-only")
         return CVEDecision(
             CVEVerdict.NOT_SHIPPED,
             "не поставляется в продакшн: пакет только для сборки и тестов",
-            ["в SBOM помечен как build-only — в рантайме его нет"],
+            ["в SBOM помечен как build-only — в рантайме его нет",
+             closure_audit.render()],
         )
 
-    # CodeQL was asked whether attacker-controlled input reaches the call. A path
-    # found is the strongest positive there is — the call happens *and* the input
-    # arrives. A path absent closes only a weakness that needs input to begin
-    # with: "no user data reaches this" says nothing about a flaw that fires on
-    # any call, so without a CWE saying input is required it is doubt, not proof.
     if dataflow is not None and dataflow is not False:
         return CVEDecision(
             CVEVerdict.ACTUAL,
@@ -186,43 +210,55 @@ def decide(
             [f"{dataflow.source_file}:{dataflow.source_line}",
              f"{dataflow.file}:{dataflow.line}"],
         )
+    if used is False and test_only and direct:
+        if not _audited(closure_audit, "test_only"):
+            return _unchecked(
+                "импорты найдены только в тестах, но закрытие не проверено",
+                closure_audit, "test_only", used_detail)
+        return CVEDecision(
+            CVEVerdict.ONLY_TEST_IMPORT,
+            "библиотека подключается только в тестовом коде",
+            [used_detail or "импорты найдены только в тестовых путях",
+             "тестовые пути заданы в prompts/training-context.md, тот же список видит модель",
+             closure_audit.render(),
+             "рабочий код пакет не импортирует — в поставляемом приложении он не вызывается"],
+        )
     if dataflow is False and input_driven:
+        audited = (closure_audit is not None and closure_audit.checked
+                   and closure_audit.kind == "no_input_path")
+        if not audited:
+            return CVEDecision(
+                CVEVerdict.PRESENT_UNPROVEN,
+                "CodeQL не нашёл пути от пользовательского ввода, но закрытие не проверено",
+                ["CodeQL: путь от известных ему источников к этому вызову не найден",
+                 (closure_audit.render() if closure_audit is not None
+                  else "проверка источников, которых CodeQL не моделирует, не выполнялась"),
+                 "не закрыто: отсутствие пути от смоделированных источников не доказательство"],
+            )
         return CVEDecision(
             CVEVerdict.CONDITION_ABSENT,
             "пользовательский ввод до уязвимого вызова не доходит",
             ["CodeQL: путь от источника пользовательских данных к этому вызову не найден",
              "уязвимость этого класса без управляемого ввода не срабатывает",
+             closure_audit.render(),
              "закрыто по потоку данных, а не по отсутствию имени в коде"],
         )
 
-    # The advisory names the import paths its flaw lives in, and none of them is
-    # imported by code the project owns. For a direct dependency that settles it:
-    # the vulnerable file is never loaded, so no name found in the repository can
-    # be a call into it.
-    #
-    # This is what separates a real call from a collision on a common name, and
-    # it was measured: a project importing only `x/crypto/bcrypt` was told three
-    # `x/crypto/ssh` flaws were "actual" because it calls `ldap.DialURL` and the
-    # advisories name `Dial`. govulncheck, reading a real call graph, agreed the
-    # ssh code is never reached.
-    #
-    # Only for a direct dependency. For a transitive one the application is not
-    # expected to import the path at all — its parent does, and absence there
-    # means nothing (see the bridge).
     if symbol is not None and symbol.package_paths and package_used is False and direct:
         paths = min(symbol.package_paths, key=len)
+        if not _audited(closure_audit, "unused"):
+            return _unchecked(
+                f"путь {paths} в коде не найден, но закрытие не проверено",
+                closure_audit, "unused", package_used_detail)
         return CVEDecision(
             CVEVerdict.UNUSED,
             f"уязвимый пакет {paths} не импортируется",
             [symbol.note or "advisory называет уязвимые пути импорта",
              package_used_detail or "путь пакета не встречается в коде проекта",
+             closure_audit.render(),
              "имя функции могло совпасть с чужим — без импорта вызова быть не может"],
         )
 
-    # A package-level advisory — the whole package is unsafe, with no vulnerable
-    # function to search for. There is no call to find, so the verdict rests on
-    # one fact: is the flagged import path used. Decided here, before the generic
-    # symbol logic sends a functionless finding to manual review.
     if symbol is not None and not symbol.usable and symbol.package_paths \
             and package_used:
         paths = min(symbol.package_paths, key=len)
@@ -236,11 +272,16 @@ def decide(
 
     if used is False:
         if direct:
+            if not _audited(closure_audit, "unused"):
+                return _unchecked(
+                    "имя пакета в коде не найдено, но закрытие не проверено",
+                    closure_audit, "unused", used_detail)
             return CVEDecision(
                 CVEVerdict.UNUSED,
                 "библиотека не используется в коде проекта",
                 [used_detail or "имя пакета не встречается ни в одном файле",
                  "пакет объявлен прямой зависимостью, но в коде не упоминается",
+                 closure_audit.render(),
                  "остаётся путь через контейнер или автозагрузку — но следов нет"],
             )
         return CVEDecision(
@@ -254,6 +295,14 @@ def decide(
         from .conditions import ConditionState
 
         if condition.state is ConditionState.ABSENT:
+            if getattr(condition, "source", "") == "text":
+                if _lsp_checked(lsp_audit):
+                    return _not_called(lsp_audit, condition.render())
+                return _unchecked(
+                    "условие эксплуатации не найдено текстовым поиском, но закрытие не проверено",
+                    lsp_audit, "condition_absent", condition.render(),
+                    "отсутствие имён в файлах — не доказательство: вызов может идти через "
+                    "обёртку, настройка — собираться во время работы")
             return CVEDecision(
                 CVEVerdict.CONDITION_ABSENT,
                 f"условие эксплуатации не выполняется: {condition.statement}",
@@ -289,12 +338,14 @@ def decide(
     reasons = [f"уязвимый символ: {symbol} — {symbol.strength}"]
 
     if presence.presence is SymbolPresence.ABSENT:
+        if _lsp_checked(lsp_audit):
+            return _not_called(lsp_audit, *reasons, presence.detail)
         return CVEDecision(
             CVEVerdict.NO_DIRECT_CALL,
             f"прямого вызова {symbol} в коде нет",
             [*reasons, presence.detail,
-             "закрывать нельзя: функция может вызываться внутри библиотеки "
-             "из публичного API, который вы вызываете"],
+             ("закрывать нельзя: функция может вызываться внутри библиотеки "
+             "из публичного API, который вы вызываете")],
         )
 
     if presence.presence is SymbolPresence.CALL_UNCONFIRMED:
@@ -307,6 +358,8 @@ def decide(
         )
 
     if presence.presence is SymbolPresence.REFERENCED:
+        if _lsp_checked(lsp_audit):
+            return _not_called(lsp_audit, *reasons, presence.detail)
         return CVEDecision(
             CVEVerdict.MENTIONED_ONLY,
             f"{symbol} не вызывается — класс только упомянут",
@@ -336,8 +389,8 @@ def decide(
         return CVEDecision(
             CVEVerdict.ACTUAL,
             f"уязвимость актуальна: {symbol} вызывается в коде",
-            [*reasons, "эксплуатация не требует пользовательского ввода — "
-                       "достаточно самого вызова"],
+            [*reasons, ("эксплуатация не требует пользовательского ввода — "
+                       "достаточно самого вызова")],
             evidence,
         )
 

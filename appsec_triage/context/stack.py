@@ -1,16 +1,4 @@
-"""Detect the frameworks in play, so the model can reason with their conventions.
-
-The gap this closes is real and was measured: on a Symfony project six of
-fifteen `unknown` verdicts were `%env(resolve:DB_PASSWORD)%` — a placeholder the
-container resolves at compile time, with no secret anywhere in the repository.
-Deterministic signals can flag that pattern, but a signal only says "this is a
-template". A model that understands *why* Symfony works that way can also judge
-the cases nobody wrote a regex for.
-
-Detection is deliberately dumb: marker files plus a substring. Guessing a stack
-wrong is worse than not guessing, so the checks are narrow and a miss simply
-means no stack section is added.
-"""
+"""Detect the frameworks in play, so the model can reason with their conventions."""
 
 from __future__ import annotations
 
@@ -26,7 +14,7 @@ from ..config import REPO_ROOT
 log = logging.getLogger(__name__)
 
 STACKS_ROOT = REPO_ROOT / "prompts" / "stacks"
-_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+_FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 _MAX_MARKER_BYTES = 400_000
 
@@ -100,27 +88,21 @@ def detect(roots: list[Path]) -> list[StackProfile]:
 
 
 def render(profiles: list[StackProfile]) -> str:
-    """The section appended to the system prompt.
-
-    The framing matters as much as the content: conventions are *context*, and a
-    convention must never outrank what the code plainly shows. Without that line
-    a stack profile becomes an excuse generator — "Twig escapes by default" would
-    start closing findings where the template clearly uses `|raw`.
-    """
+    """The section appended to the system prompt."""
     if not profiles:
         return ""
     parts = [
         "## Stack conventions",
         "",
-        "The following describes frameworks detected in this repository. Treat it as "
-        "**context, not permission**:",
+        ("The following describes frameworks detected in this repository. Treat it as "
+        "**context, not permission**:"),
         "",
-        "- A convention may *explain* evidence you can see — why a placeholder is not a secret, "
-        "why a query is parameterised.",
-        "- A convention may never *outrank* evidence. If the code plainly does the dangerous thing, "
-        "the convention is being violated, and that is a finding, not a false positive.",
-        "- A deterministic HEURISTIC SIGNAL always wins over a convention. Signals are computed from "
-        "this exact code; conventions are general.",
+        ("- A convention may *explain* evidence you can see — why a placeholder is not a secret, "
+        "why a query is parameterised."),
+        ("- A convention may never *outrank* evidence. If the code plainly does the dangerous thing, "
+        "the convention is being violated, and that is a finding, not a false positive."),
+        ("- A deterministic HEURISTIC SIGNAL always wins over a convention. Signals are computed from "
+        "this exact code; conventions are general."),
         "",
     ]
     for p in profiles:

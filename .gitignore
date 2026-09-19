@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+# Seeded projects install their dependencies locally; only the lockfiles belong in git.
+samples/**/vendor/
+samples/**/node_modules/
 
 # Корпуса, собранные из реального кода, в репозиторий инструмента не попадают.
 # Один такой уже был собран по ошибке: 44 записи, 26 файлов, 26 КБ исходников

@@ -1,25 +1,4 @@
-"""Given one confirmed weakness, find the same construct elsewhere.
-
-The agent's structural blind spot: it looks only where a scanner pointed. If a
-rule fired in one of eleven places, the other ten are invisible — not judged
-safe, simply never seen. Measured on a real project, seven high-entropy keys in
-one committed `.env` were never reported at all, and no amount of triage quality
-recovers a finding nobody sent.
-
-So this works the other way round. Take a weakness the pipeline *confirmed*,
-reduce the flagged line to its shape, and look for that shape across the tree.
-The seed is known-real, which is what makes the search worth doing.
-
-**Normalisation here is not the clustering normalisation.** That one strips
-identifiers, because two firings of one rule differ only in names. This one
-keeps them: in a security defect the call is the defect. `sha1(`, `===`,
-`md5(`, `new Random()` — strip those and every line looks alike. What gets
-normalised is what genuinely varies: variable names, string contents, numbers.
-
-The output is **candidates, not findings**. Nothing here has been triaged and no
-scanner reported it; presenting these as verdicts would be inventing them. They
-are places to look, seeded by something already known to be wrong.
-"""
+"""Given one confirmed weakness, find the same construct elsewhere."""
 
 from __future__ import annotations
 
@@ -58,13 +37,7 @@ def shape(line: str) -> str:
 
 
 def is_distinctive(text: str) -> bool:
-    """Would this shape find something, or everything?
-
-    Two conditions, and both are needed. Length alone lets a long but ordinary
-    assignment through; a call alone lets `$V->get()` through. A pattern worth
-    searching for has a call or a comparison *and* enough around it to mean
-    something.
-    """
+    """Would this shape find something, or everything?"""
     if len(text) < _MIN_SHAPE:
         return False
     return bool(re.search(r"\w\s*\(", text) or re.search(r"[=!]==|===|!==", text))
@@ -91,12 +64,7 @@ class Variant:
 
 
 def _reported(findings) -> set[tuple[str, int]]:
-    """Places a scanner already flagged, by (filename, line).
-
-    Matched on the basename because scanner paths are container-relative and the
-    search walks the real tree; comparing full paths would make every variant
-    look new.
-    """
+    """Places a scanner already flagged, by (filename, line)."""
     out = set()
     for f in findings:
         name = Path(f.code_context.file_path.replace("\\", "/")).name
@@ -106,17 +74,7 @@ def _reported(findings) -> set[tuple[str, int]]:
 
 
 def seed_is_trustworthy(record) -> tuple[bool, str]:
-    """May this confirmation be used to search for more like it?
-
-    Variant analysis multiplies its seed. One wrong confirmation does not cost
-    one wrong item — it produces a list of them, each carrying the authority of
-    "we already found this bug elsewhere". So the bar for seeding is higher than
-    the bar for reporting, and it is checked here rather than assumed.
-
-    Two rejections. A verdict the checks had to rewrite is not settled enough to
-    generalise from, and a `low` certainty band means the evidence behind it did
-    not hold up — searching outward from either spreads a mistake.
-    """
+    """May this confirmation be used to search for more like it?"""
     verdict = record.verdict
     if verdict.confidence_band == "low":
         return False, "measured certainty is low — the evidence behind it did not hold up"
@@ -128,11 +86,7 @@ def seed_is_trustworthy(record) -> tuple[bool, str]:
 
 
 def search(seeds, findings, roots: list[Path], *, max_per_seed: int = 20) -> list[Variant]:
-    """Find each seed's shape elsewhere in the tree.
-
-    A seed contributes nothing if its shape is not distinctive — better to
-    return no variants for it than to return the whole codebase.
-    """
+    """Find each seed's shape elsewhere in the tree."""
     wanted: dict[str, list] = {}
     for record, snippet in seeds:
         flagged = (snippet or "").strip().splitlines()

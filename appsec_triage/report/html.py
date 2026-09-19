@@ -1,14 +1,9 @@
-"""Self-contained HTML report — the artifact an AppSec engineer actually opens.
-
-Ordered by what needs a human first: confirmed, then unknown, then the closed
-pile last. No external assets so it can be attached to a ticket or emailed.
-"""
+"""Self-contained HTML report — the artifact an AppSec engineer actually opens."""
 
 from __future__ import annotations
 
 import html
-import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import review
@@ -31,6 +26,12 @@ table.findings .trace,table.findings .why{color:#3d444d;font-size:12px}
 table.findings .ext-cell{font-size:12px}
 span.ext{display:inline-block;padding:1px 6px;border-radius:3px;background:#ddf4ff;
   color:#0969da;font-weight:600;font-size:11px}
+table.findings .cond-cell{font-size:12px;max-width:26rem}
+span.cond{display:inline-block;padding:1px 6px;border-radius:3px;font-weight:600;font-size:11px}
+span.cond.holds{background:#ffebe9;color:#b32020}
+span.cond.absent{background:#dafbe1;color:#1a7f37}
+span.cond.outside{background:#fff8c5;color:#9a6700}
+table.findings .cond-hits{color:#57606a;font-size:11px}
 """
 
 _COV_CSS = """
@@ -106,6 +107,34 @@ background:rgba(43,108,176,.06)}
 .questions{padding-left:1.2rem}
 .questions>li{margin-bottom:.8rem}
 .warn{font-size:.68rem;color:var(--unknown);border:1px dashed currentColor;padding:.05rem .4rem;border-radius:999px}
+ol.why{list-style:none;margin:.4rem 0 0;padding:0;counter-reset:st}
+ol.why>li{counter-increment:st;position:relative;padding:.1rem 0 .7rem 1.7rem;
+border-left:2px solid var(--line);margin-left:.45rem}
+ol.why>li:last-child{border-left-color:transparent;padding-bottom:.1rem}
+ol.why>li::before{content:counter(st);position:absolute;left:-.62rem;top:0;width:1.15rem;height:1.15rem;
+border-radius:999px;background:var(--card);border:1px solid var(--line);color:var(--muted);
+font-size:.62rem;display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}
+ol.why li.analyzer::before{border-color:var(--accent);color:var(--accent)}
+ol.why li.audit::before{border-color:var(--fp);color:var(--fp)}
+ol.why li.checks::before{border-color:var(--unknown);color:var(--unknown)}
+ol.why .steptitle{display:block;font-size:.69rem;text-transform:uppercase;letter-spacing:.05em;
+color:var(--muted);margin-bottom:.15rem}
+ol.why p{margin:.15rem 0;font-size:.87rem}
+ol.why ul{margin:.25rem 0;padding-left:1.1rem}
+ol.why li ul li{font-size:.83rem;margin:.12rem 0}
+ol.why .journal li{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.75rem;
+color:var(--muted);margin:.18rem 0}
+.conf-block{display:grid;gap:.3rem;margin:.35rem 0 .45rem;max-width:32rem}
+.confrow{display:grid;grid-template-columns:8rem 1fr 2.6rem;gap:.5rem;align-items:center}
+.conflabel{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.confbar{height:.55rem;background:rgba(127,127,127,.16);border-radius:999px;overflow:hidden}
+.confbar i{display:block;height:100%;background:var(--accent);border-radius:999px}
+.confbar i.high{background:var(--fp)}
+.confbar i.medium{background:var(--unknown)}
+.confbar i.low{background:var(--confirmed)}
+.confbar.model i{background:repeating-linear-gradient(90deg,var(--muted) 0 3px,transparent 3px 6px)}
+.confnum{font-variant-numeric:tabular-nums;font-size:.8rem;text-align:right}
+.confsaid{font-size:.72rem;color:var(--muted);font-variant-numeric:tabular-nums}
 """
 
 
@@ -163,10 +192,35 @@ def _where(r: TriageRecord) -> str:
     return "<br>".join(_e(p) if not p.startswith("<code>") else p for p in parts) or "—"
 
 
+_ROUTES = {
+    "excluded": "вне платформы — факт среды, без поиска и CodeQL",
+    "callgraph": "граф вызовов",
+    "codeql": "CodeQL",
+    "psalm": "Psalm (типы и taint, PHP)",
+    "text": "поиск по тексту, без CodeQL",
+    "package": "факт импорта пакета",
+    "condition": "условие эксплуатации",
+    "unknown": "не определён",
+}
+
+
 def _trace(r: TriageRecord) -> str:
+    """What was followed, and which route the dependency chain took to get there."""
+    body = _trace_body(r)
+    route = r.sca.route if r.sca else ""
+    calls = r.sca.codeql_calls if r.sca else []
+    parts = []
+    if route:
+        parts.append(f"<em>маршрут: {_e(_ROUTES.get(route, route))}</em>")
+    if body != "—":
+        parts.append(body)
+    if calls:
+        parts.append("<small>" + "<br>".join(_e(call[:240]) for call in calls[:4]) + "</small>")
+    return "<br>".join(parts) or "—"
+
+
+def _trace_body(r: TriageRecord) -> str:
     """What was actually followed, not what might exist."""
-    # The audit line first, when there is one: it says how the closure was
-    # checked, and a reviewer reading a closed row wants that before the trace.
     audit = r.sca.audit if r.sca else ""
     if r.sca and r.sca.trace:
         return f"{_e(audit)}<br>{_e(r.sca.trace)}" if audit else _e(r.sca.trace)
@@ -182,12 +236,7 @@ def _trace(r: TriageRecord) -> str:
 
 
 def _external_cell(r: TriageRecord) -> str:
-    """What has to be checked outside the code, and by whom.
-
-    Kept in its own column because it is a different kind of answer: not "we
-    looked and found nothing" but "the answer is not here". A reviewer who sees
-    it should know where to go, not merely that the tool gave up.
-    """
+    """What has to be checked outside the code, and by whom."""
     if not r.sca:
         return "—"
     if r.sca.owner:
@@ -196,6 +245,27 @@ def _external_cell(r: TriageRecord) -> str:
     if r.sca.external:
         return f'<span class="ext">EXTERNAL</span><br>{_e(r.sca.external)}'
     return "—"
+
+
+_CONDITION_LABEL = {
+    "holds": ("условие выполнено", "holds"),
+    "absent": ("условия нет в коде", "absent"),
+    "external": ("решается вне репозитория", "outside"),
+    "infrastructure": ("чужая инфраструктура", "outside"),
+}
+
+
+def _condition_cell(r: TriageRecord) -> str:
+    """What the flaw needs besides the vulnerable function, and what the repository answered."""
+    sca = r.sca
+    if not sca or not sca.condition:
+        return "—"
+    label, css = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", "outside"))
+    parts = [f'<span class="cond {css}">{_e(label)}</span>', _e(sca.condition[:300])]
+    if sca.condition_hits:
+        found = "<br>".join(_e(hit) for hit in sca.condition_hits[:3])
+        parts.append(f'<span class="cond-hits">в коде: {found}</span>')
+    return "<br>".join(parts)
 
 
 def _summary_table(run: TriageRun) -> str:
@@ -223,14 +293,159 @@ def _summary_table(run: TriageRun) -> str:
             f"<td class='trace'>{_trace(r)}</td>"
             f"<td class='ext-cell'>{_external_cell(r)}</td>"
             f"<td class='why'>{note[:400]}</td>"
+            f"<td class='cond-cell'>{_condition_cell(r)}</td>"
             f"</tr>"
         )
     return (
         '<h2>Находки</h2><table class="findings"><thead><tr>'
         "<th>Что</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
-        "<th>Вне кода</th><th>Почему</th>"
+        "<th>Вне кода</th><th>Почему</th><th>Условие уязвимости</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
     )
+
+
+_DECIDED_BY = {
+    "llm": "модель",
+    "heuristics": "детерминированная проверка, без модели",
+    "post_validation": "пост-валидация",
+    "scope": "фильтр области",
+    "challenged": "второй проход",
+    "error": "ошибка",
+}
+
+_OUTCOMES = {
+    "actual": "вызов есть и до него доходит пользовательский ввод",
+    "not_reached": "граф вызовов до уязвимой функции не доходит",
+    "unused": "путь импорта не найден в дереве проекта",
+    "test_only_import": "пакет импортируется только тестами",
+    "not_shipped": "пакет нужен только для сборки и тестов",
+    "no_direct_call": "прямого вызова уязвимой функции нет",
+    "condition_absent": "условие эксплуатации не выполнено",
+    "wrong_receiver": "вызовы этого имени ведут в другой класс",
+    "not_applicable": "уязвимого пути нет в поставляемом пакете",
+    "present": "вызов есть, путь от ввода не доказан",
+    "call_unconfirmed": "вызов есть, получатель не подтверждён",
+    "mentioned": "имя только упоминается, вызова нет",
+    "only_in_tests": "вызовы есть только в тестовом коде",
+    "infrastructure": "решается на чужой инфраструктуре",
+    "undecided": "цепочка не определила",
+}
+
+
+def _confidence_html(v) -> str:
+    """Measured confidence beside the number the model gave itself, so the gap is visible."""
+    band = v.confidence_band or "—"
+    pct = max(0, min(100, round((v.confidence or 0) * 100)))
+    rows = [
+        '<div class="confrow"><span class="conflabel">по проверкам</span>'
+        f'<span class="confbar"><i class="{_e(band)}" style="width:{pct}%"></i></span>'
+        f'<span class="confnum">{v.confidence:.2f}</span></div>'
+    ]
+    said = v.self_reported_confidence
+    note = ""
+    if said is not None:
+        spct = max(0, min(100, round(said * 100)))
+        rows.append(
+            '<div class="confrow"><span class="conflabel">модель о себе</span>'
+            f'<span class="confbar model"><i style="width:{spct}%"></i></span>'
+            f'<span class="confnum">{said:.2f}</span></div>'
+        )
+        if abs(said - v.confidence) >= 0.05:
+            where = "выше" if said > v.confidence else "ниже"
+            note = (
+                f'<p class="note">Модель оценила себя на {abs(said - v.confidence):.2f} {where} '
+                "измеренного. Решает измеренное: оно считается из выживших цитат, подтверждения "
+                "вторым сканером и трассы резолвера.</p>"
+            )
+    rationale = f"<p>{_e(v.confidence_rationale)}</p>" if v.confidence_rationale else ""
+    return (
+        f"<h4>Уверенность: {_e(band)}</h4>"
+        f'<div class="conf-block">{"".join(rows)}</div>{note}{rationale}'
+    )
+
+
+def _why_html(r: TriageRecord) -> str:
+    """The trail that produced this verdict, in the order it actually happened."""
+    v = r.verdict
+    steps: list[str] = []
+
+    def step(title: str, body: str, kind: str = "") -> None:
+        steps.append(
+            f'<li class="step {kind}"><span class="steptitle">{_e(title)}</span>{body}</li>'
+        )
+
+    source = f"правило <code>{_e(r.rule_id or '—')}</code>"
+    if r.sca and r.sca.package:
+        source += f" · пакет <code>{_e(r.sca.package)}@{_e(r.sca.installed_version)}</code>"
+        if r.sca.placement:
+            source += f" · {_e(r.sca.placement)}"
+    step("Сканер сообщил", f"<p>{source}</p>")
+
+    if r.reachability:
+        step("Граф вызовов", f"<p>{_e(r.reachability)}</p>")
+
+    sca = r.sca
+    if sca:
+        bits = []
+        if sca.route:
+            bits.append(f"маршрут: <b>{_e(_ROUTES.get(sca.route, sca.route))}</b>")
+        if sca.symbol:
+            bits.append(f"уязвимая функция: <code>{_e(sca.symbol)}</code>")
+        body = f"<p>{' · '.join(bits)}</p>" if bits else ""
+        if sca.outcome:
+            body += f"<p><b>{_e(_OUTCOMES.get(sca.outcome, sca.outcome))}</b></p>"
+        if sca.outcome_note:
+            body += f'<p class="note">{_e(sca.outcome_note)}</p>'
+        if sca.call_sites:
+            sites = "".join(f"<li><code>{_e(s)}</code></li>" for s in sca.call_sites[:6])
+            body += f"<ul>{sites}</ul>"
+        if body:
+            step("Цепочка зависимости", body)
+        if sca.codeql_calls:
+            asked = "".join(f"<li>{_e(c)}</li>" for c in sca.codeql_calls)
+            step("Что спросили у анализатора", f'<ul class="journal">{asked}</ul>', "analyzer")
+        if sca.audit:
+            step("Проверка закрытия", f"<p>{_e(sca.audit)}</p>", "audit")
+        if sca.condition and sca.condition_state in ("holds", "absent"):
+            label = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", ""))[0]
+            body = f"<p><b>{_e(label)}</b></p><p>{_e(sca.condition)}</p>"
+            if sca.condition_hits:
+                hits = "".join(f"<li><code>{_e(hit)}</code></li>" for hit in sca.condition_hits[:4])
+                body += f"<ul>{hits}</ul>"
+            step("Условие уязвимости", body, "audit")
+        if sca.external:
+            step("Решается вне репозитория", f"<p>{_e(sca.external)}</p>")
+        if sca.problems:
+            issues = "".join(f"<li>{_e(p)}</li>" for p in sca.problems[:5])
+            step("Что не удалось проверить", f"<ul>{issues}</ul>", "checks")
+
+    if v.reason:
+        by_model = r.decided_by in ("llm", "challenged") or bool(r.overrides)
+        step("Модель рассудила" if by_model else "Основание", f"<p>{_e(v.reason)}</p>")
+
+    if r.overrides:
+        original = _e(r.original_verdict.verdict.value) if r.original_verdict else "—"
+        items = "".join(f"<li>{_e(o)}</li>" for o in r.overrides)
+        step(
+            "Пост-валидация вмешалась",
+            f'<p class="note">модель говорила: <b>{original}</b></p><ul>{items}</ul>',
+            "checks",
+        )
+
+    if r.challenge_note:
+        step("Второй проход возразил", f"<p>{_e(r.challenge_note)}</p>", "checks")
+
+    decided = _DECIDED_BY.get(r.decided_by, r.decided_by)
+    step(
+        "Итог",
+        f'<p><span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
+        f" — решил: <b>{_e(decided)}</b>"
+        + (" · нужен человек" if v.requires_human_review else "")
+        + "</p>",
+        "final",
+    )
+
+    return f'<h4>Как получен вердикт</h4><ol class="why">{"".join(steps)}</ol>'
 
 
 def _record_html(r: TriageRecord) -> str:
@@ -238,15 +453,21 @@ def _record_html(r: TriageRecord) -> str:
     sym = v.vulnerable_symbol
     sym_summary = f'<span class="sym">{_e(sym.name)}</span>' if sym else ""
     parts = [
-        f'<details><summary>'
+        (f'<details><summary>'
         f'<span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
         f'<span class="cwe">{_e(r.cwe or "—")}</span>'
         f"{sym_summary}"
         f'<span class="path" title="{_e(r.file_path)}">{_e(r.file_path)}</span>'
         f'<span class="conf" title="{_e(v.confidence_rationale)}">'
         f'{_e(v.confidence_band or "—")} · {v.confidence:.2f}</span>'
-        f'</summary><div class="body">',
-        f"<h4>Verdict rationale</h4><p>{_e(v.reason)}</p>",
+        + (
+            f'<span class="confsaid" title="уверенность, которую заявила сама модель">'
+            f"ЛЛМ {v.self_reported_confidence:.2f}</span>"
+            if v.self_reported_confidence is not None
+            else ""
+        )
+        + f'</summary><div class="body">'),
+        _why_html(r),
     ]
 
     brief = review.build(r)
@@ -284,11 +505,7 @@ def _record_html(r: TriageRecord) -> str:
 
     parts.append(_dataflow_html(v))
 
-    if v.confidence_rationale:
-        parts.append(
-            f"<h4>Certainty: {_e(v.confidence_band or '—')} ({v.confidence:.2f})</h4>"
-            f"<p>{_e(v.confidence_rationale)}</p>"
-        )
+    parts.append(_confidence_html(v))
     if v.verdict.value == "unknown" and v.blocking_question:
         parts.append(
             f'<h4>What would settle this</h4><p class="blocking">{_e(v.blocking_question)}</p>'
@@ -299,10 +516,6 @@ def _record_html(r: TriageRecord) -> str:
     if v.missing_information:
         items = "".join(f"<li>{_e(m)}</li>" for m in v.missing_information)
         parts.append(f"<h4>Missing information</h4><ul>{items}</ul>")
-    if r.overrides:
-        blocks = "".join(f'<div class="override">{_e(o)}</div>' for o in r.overrides)
-        original = _e(r.original_verdict.verdict.value) if r.original_verdict else "—"
-        parts.append(f"<h4>Post-validation overrides (model said: {original})</h4>{blocks}")
     if r.error:
         parts.append(f"<h4>Error</h4><pre>{_e(r.error)}</pre>")
 
@@ -324,13 +537,7 @@ def _record_html(r: TriageRecord) -> str:
 
 
 def _coverage_html(run: TriageRun) -> str:
-    """A banner above the numbers when a scanner did not run.
-
-    Placed before the counts on purpose: it changes what they mean. Twenty
-    findings from a complete scan and twenty from a scan that lost its
-    dependency layer are not the same report, and nothing else on the page
-    distinguishes them.
-    """
+    """A banner above the numbers when a scanner did not run."""
     cov = getattr(run, "coverage", None)
     if cov is None:
         return (
@@ -384,7 +591,7 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
     findings_html = "".join(_record_html(r) for r in ordered)
 
     coverage_html = _coverage_html(run)
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

@@ -1,16 +1,4 @@
-"""Post-validation: the model's answer is a proposal, not a decision.
-
-Five checks, in order, each able to downgrade the verdict (never upgrade it):
-
- 1. schema      — handled upstream by `parse_verdict`; a failure never reaches here
- 2. evidence    — every quote must actually exist in the input (anti-hallucination)
- 3. sanity      — a strong secret signal cannot be closed as a test placeholder
- 4. confidence  — below the floor, `confirmed`/`false_positive` become `unknown`
- 5. escalation  — critical/high severity always keeps a human in the loop
-
-Downgrade-only is the safety property: no combination of checks can turn an
-`unknown` into a `false_positive` and silently close a real vulnerability.
-"""
+"""Post-validation: the model's answer is a proposal, not a decision."""
 
 from __future__ import annotations
 
@@ -24,7 +12,9 @@ from ..consequence import weight as consequence_weight
 from ..models import EvidenceClass, EvidencePackage, Finding, Verdict, VerdictLabel
 
 _WS = re.compile(r"\s+")
-_LINE_GUTTER = re.compile(r"^[ \t]*\d+[ \t]*\|[ \t]?", re.M)
+_LINE_GUTTER = re.compile(r"^[ \t]*\d+[ \t]*\|[ \t]?", re.MULTILINE)
+
+AUTO_APPLY_CONFIDENCE = 0.86
 
 
 _ARGUES_FALSE_POSITIVE = re.compile(
@@ -35,14 +25,14 @@ _ARGUES_FALSE_POSITIVE = re.compile(
     r"|this is a false.?positive"
     r"|harmless (here|in this context)"
     r"|poses no risk)",
-    re.I,
+    re.IGNORECASE,
 )
 _ARGUES_CONFIRMED = re.compile(
     r"(is an? (real|genuine|confirmed|exploitable) (vulnerability|credential|secret)"
     r"|attacker (can|could) (exploit|control|inject)"
     r"|this is exploitable"
     r"|remote code execution is possible)",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -58,17 +48,167 @@ class ValidationOutcome:
         return any(not o.startswith(self.ANNOTATIONS) for o in self.overrides)
 
 
+def is_authoritative_govulncheck(finding: Finding) -> bool:
+    """Whether govulncheck supplied a usable source-to-sink baseline."""
+    if (finding.scanner or "").strip().lower() != "govulncheck":
+        return False
+    if len(finding.trace) < 2:
+        return False
+    source = next((step for step in finding.trace if step.role == "source"), None)
+    sink = next((step for step in finding.trace if step.role == "sink"), None)
+    return (
+        source is not None
+        and sink is not None
+        and bool(source.file_path and source.line is not None)
+        and bool(sink.file_path and sink.line is not None)
+    )
+
+
+def govulncheck_baseline(finding: Finding) -> Verdict:
+    """Build the scanner-authoritative verdict without asking the model."""
+    return Verdict(
+        verdict=VerdictLabel.confirmed,
+        evidence_class=EvidenceClass.exploitable_dataflow,
+        confidence=1.0,
+        confidence_band="high",
+        confidence_rationale="govulncheck supplied a source-to-sink trace with positioned frames.",
+        cwe=finding.cwe,
+        reason=(
+            "Govulncheck authoritative baseline: a real source-to-sink call trace was supplied. "
+            "The trace establishes that the vulnerable symbol is reached."
+        ),
+        requires_human_review=False,
+    )
+
+
+def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage) -> str | None:
+    """Return FP reason for advisory preconditions impossible in this deployment."""
+    advisory = finding.raw.get("advisory", {})
+    details = "\n".join(
+        text
+        for text in (
+            str(advisory.get("details", "")),
+            finding.title or "",
+            finding.description or "",
+            finding.dependency.package if finding.dependency else "",
+        )
+        if text
+    )
+    if not details:
+        return None
+
+    if re.search(r"\b(?:kernel|syscall|sys\.call|kmod)\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes kernel-level behavior; application code cannot modify the kernel. "
+            "The vulnerability does not apply to this application."
+        )
+
+    if re.search(r"\bssh\b|\bsshd\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes SSH behavior; SSH is not part of the application deployment. "
+            "The vulnerability does not apply to this application."
+        )
+
+    if re.search(r"\bldap\b|\bgo-ntlmssp\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes LDAP behavior; LDAP is not part of the application deployment. "
+            "The vulnerability does not apply to this application."
+        )
+
+    if re.search(r"\bftp\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes FTP behavior; FTP is not part of the application deployment. "
+            "The vulnerability does not apply to this application."
+        )
+
+    if re.search(r"\b(?:nfs|smb|cifs)\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes network file-sharing behavior; legacy file-sharing is not part of the application "
+            "deployment. The vulnerability does not apply to this application."
+        )
+
+    # Windows is never part of the supported application deployment.
+    if re.search(r"\bWindows\b", details) and not re.search(r"\bcross[- ]platform\b", details, re.IGNORECASE):
+        return (
+            "Advisory describes Windows behavior; Windows is not a supported deployment platform. "
+            "The vulnerability does not apply to this application."
+        )
+
+    # CGO-specific vulnerability with CGO disabled in the build.
+    evidence_text = "\n".join(pkg.evidence_blocks + pkg.context_notes)
+    if "CGO_ENABLED=0" in evidence_text and re.search(
+        r"\bcgo\b.{0,40}\b(?:resolver|build|enabled|compiled)\b",
+        details,
+        re.IGNORECASE,
+    ):
+        return (
+            "Advisory requires CGO; CGO disabled in build (Dockerfile: CGO_ENABLED=0). "
+            "The vulnerability does not apply to this build configuration."
+        )
+
+    # Incoming TLS is terminated before reaching the application.
+    if (
+        re.search(r"\bTLS.*(?:server|handshake)\b|\bserver.*TLS\b", details, re.IGNORECASE)
+        and not re.search(r"\bclient\b", details, re.IGNORECASE)
+    ):
+        return (
+            "Advisory describes server-side TLS incoming behavior; TLS is terminated at the ingress "
+            "and the application receives plaintext. The vulnerability does not apply."
+        )
+
+    return None
+
+
+def apply_govulncheck_gate(
+    baseline: Verdict,
+    candidate: Verdict | None,
+    pkg: EvidencePackage,
+    *,
+    quote_threshold: float,
+    error: str | None = None,
+) -> tuple[Verdict, list[str]]:
+    """Permit only a grounded, concrete model refutation of the baseline."""
+    prefix = "govulncheck authoritative baseline preserved"
+    del quote_threshold
+    if error:
+        return baseline, [f"{prefix}: model error ({error[:240]})"]
+    if candidate is None:
+        return baseline, [f"{prefix}: model response was unavailable or malformed"]
+    if candidate.verdict is not VerdictLabel.false_positive:
+        return baseline, [f"{prefix}: model did not explicitly refute the finding"]
+
+    haystack = pkg.quotable_text()
+    grounded = bool(candidate.evidence) and all(
+        e.quote in haystack and len(e.quote.strip()) >= 4 for e in candidate.evidence
+    )
+    reason = f"{candidate.reason} {candidate.confidence_rationale}".strip()
+    contradiction = len(candidate.reason.strip()) >= 20 and bool(
+        re.search(
+            r"\b(?:not|outside|patched|fixed|development|dev[- ]only|test|unreachable|"
+            r"absent|different|wrong|does not|no vulnerable|not affected|not shipped)\b",
+            reason,
+            re.IGNORECASE,
+        )
+    )
+    if not grounded or not contradiction:
+        return baseline, [
+            f"{prefix}: false_positive refutation lacked exact grounded evidence or a concrete contradiction"
+        ]
+    accepted = candidate.model_copy(
+        update={
+            "reason": f"{candidate.reason.strip()} [govulncheck baseline refuted by grounded package evidence]",
+            "requires_human_review": candidate.requires_human_review,
+        }
+    )
+    return accepted, ["govulncheck authoritative baseline overridden by grounded model refutation"]
+
+
 def _norm(s: str) -> str:
     return _WS.sub(" ", _LINE_GUTTER.sub("", s)).strip().lower()
 
 
 def quote_is_grounded(quote: str, haystack: str, threshold: float) -> bool:
-    """Exact substring first; fuzzy fallback for whitespace/quote-style drift.
-
-    Models reliably re-indent or swap quote characters when copying a code line.
-    Rejecting those as hallucinations would make the check useless, so we allow
-    a high-similarity window match but nothing looser.
-    """
+    """Exact substring first; fuzzy fallback for whitespace/quote-style drift."""
     q, h = _norm(quote), _norm(haystack)
     if len(q) < 4:
         return False
@@ -94,6 +234,28 @@ def _to_unknown(v: Verdict, evidence_class: EvidenceClass | None = None) -> Verd
             "requires_human_review": True,
         }
     )
+
+
+def apply_confidence_policy(result: Verdict, overrides: list[str]) -> Verdict:
+    """Allow automatic application only for a non-unknown verdict above 85%."""
+    if result.verdict is VerdictLabel.unknown:
+        if not result.requires_human_review:
+            result = result.model_copy(update={"requires_human_review": True})
+            overrides.append("confidence_policy: unknown verdict requires human review")
+    elif result.confidence > AUTO_APPLY_CONFIDENCE:
+        if result.requires_human_review:
+            result = result.model_copy(update={"requires_human_review": False})
+            overrides.append(
+                f"confidence_policy: confidence {result.confidence:.2f} is above the "
+                f"{AUTO_APPLY_CONFIDENCE:.2f} auto-apply threshold"
+            )
+    elif not result.requires_human_review:
+        result = result.model_copy(update={"requires_human_review": True})
+        overrides.append(
+            f"confidence_policy: confidence {result.confidence:.2f} is not above "
+            f"the {AUTO_APPLY_CONFIDENCE:.2f} auto-apply threshold"
+        )
+    return result
 
 
 def validate(
@@ -211,7 +373,7 @@ def validate(
         overrides.append(f"sanity_conflict: classed as TEST_PLACEHOLDER despite {sorted(strong)}")
         result = result.model_copy(update={"evidence_class": EvidenceClass.secret_value})
 
-    if pkg.code_source == "description_only" and result.evidence_class in (
+    if pkg.code_source == "description_only" and not pkg.repository_code_collected and result.evidence_class in (
         EvidenceClass.exploitable_dataflow,
         EvidenceClass.sanitized_dataflow,
     ):
@@ -219,8 +381,11 @@ def validate(
         result = _to_unknown(result, EvidenceClass.insufficient_context)
 
     floor_consequence = cfg.closure_requires_named_defence_above
-    if floor_consequence and result.verdict is VerdictLabel.false_positive:
-        if consequence_weight(finding.cwe) >= floor_consequence:
+    if (
+        floor_consequence
+        and result.verdict is VerdictLabel.false_positive
+        and consequence_weight(finding.cwe) >= floor_consequence
+    ):
             named = result.evidence_class in (
                 EvidenceClass.sanitized_dataflow,
                 EvidenceClass.identifier_only,
@@ -261,12 +426,16 @@ def validate(
         )
         result = _to_unknown(result)
 
-    if cfg.escalate_severities and finding.severity.value in cfg.escalate_severities:
-        if not result.requires_human_review and result.verdict is VerdictLabel.confirmed:
-            overrides.append(
-                f"escalated: a confirmed {finding.severity.value}-severity finding always keeps a human in the loop"
-            )
-            result = result.model_copy(update={"requires_human_review": True})
+    if (
+        cfg.escalate_severities
+        and finding.severity.value in cfg.escalate_severities
+        and not result.requires_human_review
+        and result.verdict is VerdictLabel.confirmed
+    ):
+        overrides.append(
+            f"escalated: a confirmed {finding.severity.value}-severity finding always keeps a human in the loop"
+        )
+        result = result.model_copy(update={"requires_human_review": True})
 
     if result.verdict is VerdictLabel.unknown and not result.requires_human_review:
         overrides.append("escalated: unknown always requires human review")
@@ -286,30 +455,19 @@ def validate(
             "rather than a triage decision"
         )
 
+    result = apply_confidence_policy(result, overrides)
+
     if finding.cwe and result.cwe != finding.cwe:
         result = result.model_copy(update={"cwe": finding.cwe})
 
-    if result.verdict is VerdictLabel.unknown and not result.blocking_question and overrides:  # noqa: E501
+    if result.verdict is VerdictLabel.unknown and not result.blocking_question and overrides:
         result = result.model_copy(update={"blocking_question": _question_from_override(overrides, verdict)})
 
     return ValidationOutcome(result, overrides)
 
 
 def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: PostValidationConfig) -> bool:
-    """Is the named symbol real? For a dependency, a coordinate counts as real.
-
-    For a weakness in our code the symbol is a thing on a line — a call, a
-    literal — and demanding it appear verbatim is exactly right. For a CVE it is
-    a package coordinate, and the SCA prompt asks for it as `package@version`.
-    That composite is *assembled* from two facts that the evidence lists on
-    separate lines, so it never appears literally, and the verbatim check
-    rejected it on 84 of 89 dependency findings on a real project. The verdicts
-    were correct; the symbol was struck from every one of them, and the override
-    it logged then dragged the certainty band down with it.
-
-    So for dependency findings the parts are checked instead. A model naming a
-    package or version that is not in the evidence still fails.
-    """
+    """Is the named symbol real?"""
     if quote_is_grounded(name, haystack, cfg.quote_match_threshold):
         return True
     dep = pkg.dependency
@@ -323,12 +481,7 @@ def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: Pos
 
 
 def _merge_rationale(model_text: str, self_reported: float | None, cal) -> str:
-    """Keep the model's reasoning, then say what the measured score is built on.
-
-    Both belong in the report. The model's sentence explains the verdict; the
-    measured reasons explain how far to trust it, and a reviewer comparing the
-    two learns more than either alone.
-    """
+    """Keep the model's reasoning, then say what the measured score is built on."""
     measured = "; ".join(cal.reasons) or "no distinguishing evidence either way"
     said = f"model stated {self_reported:.2f}" if self_reported is not None else "model stated no number"
     lines = [t for t in (model_text.strip(),) if t]

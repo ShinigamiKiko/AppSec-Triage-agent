@@ -1,0 +1,7 @@
+# Wolfee provides SCA findings and source-aware reachability. Set WOLFEE_BIN to
+# an explicit binary path in CI when it is not already on PATH.
+mode: native
+binary:
+  - ${WOLFEE_BIN:-../wolfee-cli/bin/wolfee}
+  - wolfee
+timeout_s: 1800

@@ -1,0 +1,28 @@
+# Dependency triage for a PHP project in GitLab CI — without the agent's Docker image.
+#
+# The agent does not install dependencies. Psalm proves calls and input paths into
+# a vulnerable PHP method only when vendor/autoload.php exists, so build the
+# project and install its dependencies in before_script. Without vendor/ the
+# analysis still runs, with a text search instead of Psalm.
+#
+# Variables in Settings → CI/CD → Variables (masked):
+#   DEEPSEEK_API_KEY   provider key
+#   COMPOSER_AUTH      JSON for private Composer repositories, if any
+#
+# The runner needs the agent's tools on PATH: python3 with the agent installed,
+# php, composer, psalm, codeql, cdxgen, wolfee.
+
+appsec-triage:
+  stage: test
+  before_script:
+    # The project's own build, whatever it needs before composer can resolve.
+    - ./build.sh
+    # Vulnerable versions must install: they are what is being analysed.
+    - composer config --no-interaction audit.block-insecure false
+    - composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist
+  script:
+    - appsec-triage run "$CI_PROJECT_DIR" --resolve-symbols -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
+  artifacts:
+    when: always
+    paths: [appsec-out/]
+    expire_in: 14 days

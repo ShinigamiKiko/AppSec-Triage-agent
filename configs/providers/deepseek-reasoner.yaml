@@ -1,0 +1,23 @@
+# Opt-in reasoning profile. Credentials remain in the environment.
+kind: deepseek
+model: deepseek-reasoner
+base_url: https://api.deepseek.com/v1
+api_key: ${DEEPSEEK_API_KEY}
+temperature: 0.0
+# Includes reasoning tokens; a small completion budget can produce empty content.
+max_tokens: 32000
+json_mode: json_object
+timeout_s: 240
+connect_timeout_s: 10
+max_retries: 1
+concurrency: 2
+budget_usd: 5.0
+keep_raw_response: false
+# Conservative planning estimates, NOT a quotation of current provider tariffs.
+# Replace with your account's rates for accurate cost reporting. This makes the
+# optional-work budget effective instead of treating unpriced requests as free.
+pricing:
+  input_usd_per_mtok: 2.0
+  output_usd_per_mtok: 8.0
+# deepseek-reasoner не принимает `tools` — шаги с анализатором идут по JSON-протоколу.
+tool_calling: false

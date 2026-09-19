@@ -1,18 +1,4 @@
-"""Turning an undecided finding into a short, answerable review task.
-
-A verdict is not always the most useful output. When the pipeline cannot settle
-a finding, the expensive part for a human is not the judgement — it is the
-legwork: tracing the value, finding the route, working out whether the endpoint
-is even exposed. All of that we have already done.
-
-So an undecided finding ships as: what we established, the specific question
-whose answer decides it, exactly where to look, and what each answer implies.
-The reviewer supplies one fact instead of reconstructing a trace.
-
-Questions are derived from resolved facts, not invented. Every one names a real
-location, because "check whether the input is sanitised" sends someone hunting,
-while "line 158 concatenates `name`; is `sql_lab` behind auth?" does not.
-"""
+"""Turning an undecided finding into a short, answerable review task."""
 
 from __future__ import annotations
 
@@ -58,7 +44,7 @@ _ROUTE = re.compile(
     r"""|@app\.route\s*\(\s*["']([^"']*)["']"""
     r"""|Route::\w+\s*\(\s*["']([^"']*)["']"""
     r"""|@(?:Get|Post|Put|Delete|Request)Mapping\s*\(\s*["']?([^"')]*)""",
-    re.I,
+    re.IGNORECASE,
 )
 
 

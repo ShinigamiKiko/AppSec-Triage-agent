@@ -17,7 +17,21 @@
 # scanners. That is the cost of "full analysis" in one artifact. Every heavy
 # component is pinned via ARG below — bump these deliberately.
 
-FROM python:3.12-slim-bookworm
+# --- Wolfee build stage -------------------------------------------------------
+# Build from a release tag so the image contains the same scanner version on
+# every rebuild. Only the resulting binary is copied into the runtime image.
+FROM golang:1.26-alpine AS wolfee-builder
+
+ARG WOLFEE_VERSION=1.6
+ARG WOLFEE_REPO=https://github.com/ShinigamiKiko/wolfee-cli.git
+
+RUN apk add --no-cache git make
+WORKDIR /build/wolfee
+RUN git clone --depth=1 --branch="${WOLFEE_VERSION}" "${WOLFEE_REPO}" . \
+    && make build \
+    && ./bin/wolfee version
+
+FROM python:3.12-slim-bookworm AS main
 
 # --- versions: bump deliberately, each is checked at build time ---------------
 # CodeQL: the *bundle* (CLI + precompiled standard query packs) so analysis works
@@ -27,10 +41,6 @@ ARG CODEQL_BUNDLE_TAG=codeql-bundle-v2.25.6
 # Go >= 1.26, and with GOTOOLCHAIN=local the build fails outright instead of
 # quietly pulling a newer toolchain. Bump this when gopls raises its floor.
 ARG GO_VERSION=1.26.5
-ARG GITLEAKS_VERSION=8.21.2
-ARG TRIVY_VERSION=0.70.0
-ARG SEMGREP_VERSION=1.168.0
-ARG BANDIT_VERSION=1.9.4
 ARG PYLSP_VERSION=1.15.0
 # phpactor is pulled as the "latest" phar; pin by swapping the URL below if a
 # reproducible build is required.
@@ -78,6 +88,10 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
 ARG GOPLS_VERSION=v0.23.0
 RUN go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" && gopls version
 
+# govulncheck powers Wolfee's Go call-graph reachability analysis.
+RUN go install golang.org/x/vuln/cmd/govulncheck@latest \
+    && govulncheck -version
+
 # typescript-language-server (+ the tsserver it wraps) for .ts/.tsx/.js/.jsx.
 RUN npm install -g typescript typescript-language-server \
     && typescript-language-server --version
@@ -98,28 +112,12 @@ RUN curl -fsSL https://github.com/phpactor/phpactor/releases/latest/download/php
 RUN composer global require "vimeo/psalm:^6" --no-interaction --no-progress \
     && psalm --version
 
-# --- scanners -----------------------------------------------------------------
-# Python scanners + pylsp share the image's Python. pylsp is a *language server*
-# (invoked as the `pylsp` console script, matching configs/lsp.yaml).
+# --- language-server support ---------------------------------------------------
+# pylsp is a *language server* (invoked as the `pylsp` console script, matching
+# configs/lsp.yaml).
 RUN pip install \
-        "semgrep==${SEMGREP_VERSION}" \
-        "bandit==${BANDIT_VERSION}" \
         "python-lsp-server==${PYLSP_VERSION}" \
-    && semgrep --version && bandit --version && pylsp --help >/dev/null
-
-# gitleaks (secrets) — static binary.
-RUN curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-        -o /tmp/gitleaks.tgz \
-    && tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks && rm /tmp/gitleaks.tgz \
-    && gitleaks version
-
-# trivy (SCA/misconfig) — official installer, pinned.
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-        | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}" \
-    && trivy --version
-# NOTE: trivy downloads its vulnerability DB on first run. In an air-gapped CI,
-# pre-warm it in a build layer (`trivy fs --download-db-only /`) or mount a cache
-# volume — otherwise the first job needs egress to ghcr.io.
+    && pylsp --help >/dev/null
 
 # CodeQL bundle (CLI + standard query packs). Large layer.
 RUN curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODEQL_BUNDLE_TAG}/codeql-bundle-linux64.tar.gz" \
@@ -127,6 +125,10 @@ RUN curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODE
     && tar -xzf /tmp/codeql.tgz -C /opt && rm /tmp/codeql.tgz \
     && ln -s /opt/codeql/codeql /usr/local/bin/codeql \
     && codeql version --format terse
+
+# Wolfee provides SCA inventory and Go reachability traces for the triage run.
+COPY --from=wolfee-builder /build/wolfee/bin/wolfee /usr/local/bin/wolfee
+RUN wolfee version
 
 # --- the agent itself ---------------------------------------------------------
 # Editable install on purpose: config.py derives REPO_ROOT from the package's

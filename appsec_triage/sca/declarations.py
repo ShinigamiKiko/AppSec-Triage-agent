@@ -1,22 +1,4 @@
-"""Where a function is declared, and whether anything outside can call it.
-
-Both questions are needed to bridge from a flaw inside a library to something an
-application could plausibly write, and every language answers them differently
-enough that one regex cannot serve:
-
-- **PHP** states visibility in a keyword, and a name with no keyword is public.
-- **JavaScript and TypeScript** have four spellings of a declaration and no
-  visibility keyword at all in JS — what is reachable from outside is what the
-  module exports, so export is the visibility.
-- **Python** has no keyword either; the convention is the leading underscore,
-  and `__all__` overrides it when present.
-- **Go** puts it in the case of the first letter, and hangs methods off a
-  receiver rather than a class.
-
-Getting this wrong is not a crash but a silent one: an unrecognised declaration
-means the bridge finds no caller, which reads exactly like a library that never
-calls the flaw — the one outcome allowed to close a finding.
-"""
+"""Where a function is declared, and whether anything outside can call it."""
 
 from __future__ import annotations
 
@@ -57,12 +39,11 @@ class Declaration:
         return f"{self.owner}::{self.name}" if self.owner else self.name
 
 
-
 _PHP_DECL = re.compile(
     r"^[ \t]*(?:(public|protected|private)\s+)?(?:static\s+|final\s+|abstract\s+)*"
-    r"function\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
+    r"function\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
 _PHP_OWNER = re.compile(
-    r"^[ \t]*(?:final\s+|abstract\s+)*(?:class|trait|interface)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+    r"^[ \t]*(?:final\s+|abstract\s+)*(?:class|trait|interface)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 
 _JS_DECL = re.compile(
     r"^[ \t]*(?P<exp>export\s+(?:default\s+)?)?"
@@ -71,15 +52,15 @@ _JS_DECL = re.compile(
     r"(?:function\s*\*?\s*(?P<fn>[A-Za-z_$][\w$]*)"
     r"|(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?"
     r"(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
-    r"|(?P<meth>[A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{)", re.M)
-_JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)", re.M)
+    r"|(?P<meth>[A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{)", re.MULTILINE)
+_JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
 _JS_KEYWORD = {"if", "for", "while", "switch", "catch", "return", "do", "else", "function"}
 
-_PY_DECL = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)\s*\(", re.M)
-_PY_OWNER = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z_]\w*)", re.M)
+_PY_DECL = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_OWNER = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z_]\w*)", re.MULTILINE)
 
 _GO_DECL = re.compile(
-    r"^func\s*(?:\(\s*\w+\s+\*?(?P<recv>[A-Za-z_]\w*)\s*\)\s*)?(?P<fn>[A-Za-z_]\w*)\s*\(", re.M)
+    r"^func\s*(?:\(\s*\w+\s+\*?(?P<recv>[A-Za-z_]\w*)\s*\)\s*)?(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
 
 
 def _php(text: str) -> list[Declaration]:
@@ -128,7 +109,7 @@ def _js(text: str) -> list[Declaration]:
 
 def _python(text: str) -> list[Declaration]:
     exported = set()
-    for block in re.findall(r"__all__\s*=\s*[\[(](.*?)[\])]", text, re.S):
+    for block in re.findall(r"__all__\s*=\s*[\[(](.*?)[\])]", text, re.DOTALL):
         exported |= {m.group(1) for m in re.finditer(r"[\"']([^\"']+)[\"']", block)}
 
     owners = [(m.start(), len(m.group("indent")), m.group(2)) for m in _PY_OWNER.finditer(text)]
@@ -173,12 +154,7 @@ def declarations(path: str, text: str) -> list[Declaration]:
 
 
 def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
-    """The declaration containing `offset`, from an already-parsed file.
-
-    Split out so a caller with many offsets in one file parses it once: parsing
-    is a full-text regex pass, and `enclosing` per match is quadratic on a file
-    with many call sites.
-    """
+    """The declaration containing `offset`, from an already-parsed file."""
     best = None
     for declaration in parsed:
         if declaration.offset < offset:
@@ -189,13 +165,7 @@ def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
 
 
 def enclosing(path: str, text: str, offset: int) -> Declaration | None:
-    """The declaration containing `offset` — the nearest one before it.
-
-    The same rule git uses for hunk headers, and wrong in the same case: a
-    position after a function's end is attributed to it. Accepted because the
-    alternative is four parsers, and the cost is a widened search rather than a
-    wrong verdict.
-    """
+    """The declaration containing `offset` — the nearest one before it."""
     return enclosing_in(declarations(path, text), offset)
 
 
@@ -204,5 +174,5 @@ def call_pattern(function: str, language: str | None = None) -> re.Pattern[str]:
     name = re.escape(function)
     return re.compile(
         rf"(?:->|::|\.|\$)\s*{name}\s*\(" rf"|(?<![\w$.>:]){name}\s*\(",
-        re.I if language == PHP else 0,
+        re.IGNORECASE if language == PHP else 0,
     )

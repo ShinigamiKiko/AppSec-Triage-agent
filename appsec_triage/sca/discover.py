@@ -1,14 +1,4 @@
-"""Dependency findings without a scanner: cdxgen names the packages, OSV the flaws.
-
-Until now the finding list came from Trivy. That works on a workstation and not
-in a sealed image: drop the scanner and the SCA half has nothing to triage, even
-though everything it needs — the SBOM and the advisory databases — is already
-wired in. A container that can build the graph but cannot start the pipeline is
-a container that does not work.
-
-The same rule as everywhere else holds here: a database that fails to answer is
-recorded as a failure, never as "this package is clean".
-"""
+"""Dependency findings without a scanner: cdxgen names the packages, OSV the flaws."""
 
 from __future__ import annotations
 
@@ -40,30 +30,13 @@ _VERSION = re.compile(r"^[vV]?\d[\w.+~:-]*$")
 
 
 def _is_a_version(value: str) -> bool:
-    """Could this string be a version a database can match a range against?
-
-    Deliberately narrow: it must start with a digit (after an optional `v`) and
-    carry nothing a version never contains. Everything an ecosystem really uses
-    passes — `1.2.3`, `v0.10.0`, `2:1.4-1`, `4.17.15-beta.1`, a Go pseudo-version
-    — while a build directive, a comparison operator or a range does not.
-
-    The point is not to validate semver. It is that a query built on a string
-    like `=>` still returns advisories, and those advisories are about nothing.
-    """
+    """Could this string be a version a database can match a range against?"""
     value = (value or "").strip()
     return bool(value) and bool(_VERSION.match(value))
 
 
 def _one_per_flaw(found: list) -> list:
-    """One finding per vulnerability, not one per database that described it.
-
-    OSV answers with the ecosystem's own record *and* its GHSA mirror, tied
-    together by `aliases`. Emitting both was measured on a Go project: twenty
-    seven findings for thirteen flaws, each reported twice under different ids,
-    and an engineer reading the report has no way to tell that the two lines are
-    one problem. The surviving copy is the one that states its symbols, since
-    that is the copy the rest of the chain can act on.
-    """
+    """One finding per vulnerability, not one per database that described it."""
     groups: dict[str, list] = {}
     for entry in found:
         names = {entry.advisory_id.upper(), *(a.upper() for a in entry.aliases)}
@@ -106,13 +79,6 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
         if not version or (name, version) in seen:
             continue
         if not _is_a_version(version):
-            # Asking a database "what affects this package at version `=>`" gets
-            # an answer, and the answer is not about anything. Measured on a Go
-            # project whose go.mod uses `replace`: cdxgen put the directive's
-            # arrow in the purl, forty-one findings of a hundred carried it, and
-            # one advisory that does not apply to the real version was reported
-            # as actual. Better to say the version is unknown than to report
-            # findings drawn against it.
             out.problems.append(
                 f"{name}: версия не определена ({version!r}) — пакет пропущен. "
                 "У Go это обычно директива `replace` в go.mod, чью стрелку "
@@ -127,8 +93,6 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
         try:
             found = adv.from_osv(name, item["ecosystem"], version)
         except adv.DatabaseUnavailable as exc:
-            # Not a clean package — an unanswered question, and the difference
-            # is the whole point of raising here rather than returning [].
             out.problems.append(f"{name}@{version}: {exc}")
             continue
 
@@ -144,6 +108,7 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
                     package=name,
                     ecosystem=item["ecosystem"],
                     installed_version=version,
+                    fixed_versions=entry.fixed_versions,
                     advisory_url=f"https://osv.dev/vulnerability/{entry.advisory_id}",
                     dev_only=item["dev"] or None,
                 ),
@@ -162,5 +127,5 @@ _MANIFESTS = {
 
 
 def _manifest_for(ecosystem: str) -> str:
-    """A file path the report can show. The flaw is in a package, not a line."""
+    """A file path the report can show."""
     return _MANIFESTS.get((ecosystem or "").strip().lower(), "dependencies")

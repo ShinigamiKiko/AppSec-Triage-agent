@@ -1,17 +1,12 @@
-"""Govulncheck JSON protocol adapter.
-
-The SARIF export is useful to generic consumers, but it drops the installed and
-fixed module versions that make an SCA verdict actionable.  The JSON protocol
-keeps those facts and emits one object after another, so this adapter groups all
-symbol traces for one OSV advisory into one normalized finding.
-"""
+"""Govulncheck JSON protocol adapter."""
 
 from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..models import CodeContext, DependencyInfo, Finding, Severity, TraceStep
 
@@ -157,5 +152,8 @@ def parse(path: Path) -> Iterator[Finding]:
                 advisory_url=f"https://pkg.go.dev/vuln/{advisory_id}",
                 imported=True,
             ),
-            raw={"advisory": advisory, "findings": occurrences},
+            raw={
+                "advisory": advisory,
+                "findings": occurrences,
+            },
         )

@@ -1,9 +1,4 @@
-"""Provider-agnostic LLM interface.
-
-Everything above this module knows only `LLMClient.complete()`. The differences
-between Ollama, OpenAI and DeepSeek — JSON-mode syntax, auth, token accounting,
-which knobs even exist — stay inside the concrete clients and their YAML config.
-"""
+"""Provider-agnostic LLM interface."""
 
 from __future__ import annotations
 
@@ -26,11 +21,7 @@ class LLMRetryableError(LLMError):
 
 
 class _UnparsableReply(LLMRetryableError):
-    """The reply was delivered but is not the JSON the schema asked for.
-
-    Retryable like a transport failure, and distinguished from one so the next
-    attempt can tell the model what was wrong instead of sending the identical
-    prompt and inviting the identical malformed answer."""
+    """The reply was delivered but is not the JSON the schema asked for."""
 
 
 @dataclass(slots=True)
@@ -42,6 +33,41 @@ class LLMResponse:
     latency_ms: int = 0
     attempts: int = 1
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+@dataclass(slots=True)
+class ToolCall:
+    """One tool invocation the model asked for."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ToolTurn:
+    """One model turn in a native tool-calling conversation."""
+
+    text: str
+    tool_calls: list[ToolCall]
+    message: dict[str, Any]
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    latency_ms: int = 0
+    attempts: int = 1
+
+
+def tool_arguments(raw: Any) -> dict[str, Any]:
+    """A tool call's arguments as a dict, however the provider encoded them."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
 
 
 @runtime_checkable
@@ -59,27 +85,18 @@ class LLMClient(Protocol):
 
 
 class BaseHTTPClient(ABC):
-    """Shared transport: one httpx client, bounded retries, exponential backoff.
+    """Shared transport: one httpx client, bounded retries, exponential backoff."""
 
-    Retry policy lives here rather than in each provider because the failure
-    modes are identical over HTTP; only the request/response shape differs.
-    """
-
-    def __init__(self, cfg: "ProviderConfig") -> None:  # noqa: F821 - forward ref, see config.py
+    def __init__(self, cfg: ProviderConfig) -> None:  # noqa: F821 - forward ref, see config.py
         self.cfg = cfg
         self.name = cfg.name
         self.model = cfg.model
-        # Every call the run makes passes through `complete`, so this is the only
-        # place that sees all of them. Counting per verdict record instead missed
-        # everything the dependency chain spends — symbol resolution, call-site
-        # judgement, conditions, the audit of a call-graph closure — and those
-        # findings never reach the model for a verdict at all, so they reported a
-        # cost of zero while actually costing several calls each.
         self._spend_lock = threading.Lock()
         self.calls = 0
         self.prompt_tokens_total = 0
         self.completion_tokens_total = 0
         self.spend_usd = 0.0
+        self._native_tools_rejected = False
         self._client = httpx.Client(
             base_url=cfg.base_url,
             timeout=httpx.Timeout(cfg.timeout_s, connect=cfg.connect_timeout_s),
@@ -107,9 +124,6 @@ class BaseHTTPClient(ABC):
         for attempt in range(1, self.cfg.max_retries + 2):
             try:
                 if isinstance(last_exc, _UnparsableReply):
-                    # Resending the identical prompt invites the identical bad
-                    # reply. The retry says what was wrong with the last one, so
-                    # the model has something to correct rather than repeat.
                     path, payload = self._build_payload(
                         system,
                         f"{user}\n\n=== CORRECTION ===\n"
@@ -126,13 +140,6 @@ class BaseHTTPClient(ABC):
                 if resp.status_code >= 400:
                     raise LLMError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:500]}")
                 text, ptok, ctok = self._parse(resp.json())
-                # A schema was asked for, so a reply that will not parse is a
-                # failed attempt, not an answer. Measured: a PHP namespace came
-                # back with an unescaped backslash, `json.loads` raised at the
-                # call site, and the whole extraction was thrown away — the
-                # caller degraded to a weaker source with nothing retried. The
-                # retry belongs here, where every caller gets it, rather than in
-                # each of the five places that parse a model reply.
                 if json_schema is not None and text:
                     try:
                         json.loads(text)
@@ -157,24 +164,67 @@ class BaseHTTPClient(ABC):
 
         raise LLMRetryableError(f"{self.name}: exhausted {self.cfg.max_retries} retries: {last_exc}") from last_exc
 
+    #: Set by providers whose API carries native tool calls.
+    _NATIVE_TOOLS = False
+
+    @property
+    def supports_tools(self) -> bool:
+        """Whether this client can hold a native tool-calling conversation."""
+        return (self._NATIVE_TOOLS and bool(getattr(self.cfg, "tool_calling", True))
+                and not self._native_tools_rejected)
+
+    def _tool_payload(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        raise NotImplementedError
+
+    def _tool_parse(self, body: dict[str, Any]) -> ToolTurn:
+        raise NotImplementedError
+
+    def tool_result_message(self, call: ToolCall, content: str) -> dict[str, Any]:
+        """The message that hands a tool's output back to the model."""
+        raise NotImplementedError
+
+    def chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ToolTurn:
+        """One turn of a native tool-calling conversation, with the usual retries."""
+        if not self.supports_tools:
+            raise LLMError(f"{self.name}: tool calling is not enabled for this provider")
+        path, payload = self._tool_payload(messages, tools)
+        started = time.monotonic()
+        last_exc: Exception | None = None
+        for attempt in range(1, self.cfg.max_retries + 2):
+            try:
+                resp = self._client.post(path, json=payload)
+                if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
+                    raise LLMRetryableError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:300]}")
+                if resp.status_code >= 400:
+                    # HTTP 400 with tools often means the model doesn't support them
+                    error_text = resp.text[:500]
+                    if resp.status_code == 400 and ("tool" in error_text.lower() or "function" in error_text.lower()):
+                        self._native_tools_rejected = True
+                        raise LLMError(f"{self.name}: HTTP 400 tool rejection: {error_text}")
+                    raise LLMError(f"{self.name}: HTTP {resp.status_code}: {error_text}")
+                turn = self._tool_parse(resp.json())
+                turn.latency_ms = int((time.monotonic() - started) * 1000)
+                turn.attempts = attempt
+                self._record_spend(turn.prompt_tokens, turn.completion_tokens)
+                return turn
+            except (httpx.TimeoutException, httpx.TransportError, LLMRetryableError) as exc:
+                last_exc = exc
+                if attempt > self.cfg.max_retries:
+                    break
+                time.sleep(min(self.cfg.backoff_base_s * (2 ** (attempt - 1)), self.cfg.backoff_max_s))
+        raise LLMRetryableError(f"{self.name}: exhausted {self.cfg.max_retries} retries: {last_exc}") from last_exc
+
     @property
     def budget_left_usd(self) -> float | None:
-        """What is left of the run's ceiling, or None when no ceiling is set.
-
-        The optional steps ask this before spending. They are worth several calls
-        each and a run is allowed a dollar, so in practice the answer is always
-        yes — the point is that a pathological project cannot turn "ask the model
-        more" into an unbounded bill, and that when the ceiling is reached the
-        run says so rather than quietly answering on less evidence.
-        """
+        """What is left of the run's ceiling, or None when no ceiling is set."""
         ceiling = getattr(self.cfg, "budget_usd", None)
-        if not ceiling:
+        if ceiling is None:
             return None
         with self._spend_lock:
             return max(0.0, float(ceiling) - self.spend_usd)
 
     def _record_spend(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
-        """Add one answered call to the run total. Called once per reply, retries included."""
+        """Add one answered call to the run total."""
         cost = self.estimate_cost(prompt_tokens, completion_tokens) or 0.0
         with self._spend_lock:  # findings are triaged in parallel
             self.calls += 1

@@ -1,21 +1,4 @@
-"""What has to be true for the flaw to be exploitable here — checked, or handed over.
-
-Many advisories only bite under a configuration. A twig sandbox escape needs the
-application to render templates it did not write; an XXE needs external entity
-loading left on; a deserialisation flaw needs untrusted input to be
-deserialised. Where that condition is decidable from the repository it decides
-the finding as firmly as a missing call does.
-
-Where it is not — the setting lives in an environment variable, a deployment
-manifest, a runtime default, another team's service — the honest output is not a
-guess and not `unknown`. It is a statement that this is external, with enough
-detail for a person to settle it in a minute: what has to be true, which symbol
-or setting expresses it, and where to look.
-
-The tokens are supplied by the model from the advisory text; the search for them
-is deterministic. So the model decides what question to ask, and the repository
-decides the answer.
-"""
+"""What has to be true for the flaw to be exploitable here — checked, or handed over."""
 
 from __future__ import annotations
 
@@ -25,15 +8,14 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
 from ..prompts import registry
 
 log = logging.getLogger(__name__)
 
 _SKIP_DIRS = {".git", "vendor", "node_modules", "venv", ".venv", "target",
               "build", "dist", "__pycache__"}
-_SUFFIXES = {".php", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go",
-             ".rb", ".java", ".kt", ".cs",
-             ".yaml", ".yml", ".xml", ".ini", ".json", ".neon", ".toml", ".env"}
 _MAX_FILES = 8000
 _MAX_BYTES = 600_000
 
@@ -56,6 +38,7 @@ class Condition:
     where: str = ""
     hits: list[str] = field(default_factory=list)
     reason: str = ""
+    source: str = ""
 
     @property
     def needs_a_person(self) -> bool:
@@ -99,14 +82,7 @@ _DEPLOY_SCHEMA = {
 
 
 def check_against_deployment(condition: Condition, deployment, client) -> Condition:
-    """Offer an undecidable condition to the declared deployment facts.
-
-    A precondition the repository cannot answer is not always a question for a
-    person: "reachable from the internet" is answered by the ingress, "listens
-    on a privileged port" by the pod spec. Only conditions already marked
-    EXTERNAL come here — one the code settled stays settled — and the answer is
-    held to the same quoting rule as everything else.
-    """
+    """Offer an undecidable condition to the declared deployment facts."""
     if client is None or condition.state is not ConditionState.EXTERNAL:
         return condition
 
@@ -133,26 +109,27 @@ def check_against_deployment(condition: Condition, deployment, client) -> Condit
     if verdict == "absent":
         return Condition(ConditionState.ABSENT, condition.statement, condition.tokens,
                          condition.where, hits=[f"деплой: {quote[:100]}"],
-                         reason=f"по описанию среды: {why}")
+                         reason=f"по описанию среды: {why}", source="deployment")
     if verdict == "holds":
         return Condition(ConditionState.HOLDS, condition.statement, condition.tokens,
                          condition.where, hits=[f"деплой: {quote[:100]}"],
-                         reason=f"по описанию среды: {why}")
+                         reason=f"по описанию среды: {why}", source="deployment")
     if verdict == "infrastructure":
         return Condition(ConditionState.INFRASTRUCTURE, condition.statement,
                          condition.tokens, condition.where,
-                         hits=[f"деплой: {quote[:100]}"], reason=why)
+                         hits=[f"деплой: {quote[:100]}"], reason=why, source="deployment")
     return condition
 
 
-def _files(root: Path):
+def _files(root: Path, suffixes: set[str]):
     out = []
     for path in root.rglob("*"):
         if len(out) >= _MAX_FILES:
             break
-        if not path.is_file() or path.suffix.lower() not in _SUFFIXES:
+        if not path.is_file() or path.suffix.lower() not in suffixes:
             continue
-        if _SKIP_DIRS.intersection(path.parts):
+        if (_SKIP_DIRS.intersection(path.parts)
+                or any(part.lower().startswith("appsec-out") for part in path.parts)):
             continue
         out.append(path)
     return out
@@ -166,13 +143,7 @@ def check(
     *,
     decidable: bool = True,
 ) -> Condition:
-    """Look for `tokens` in the project, or say why the answer is not here.
-
-    `decidable` is the model's judgement that the repository could settle this
-    at all. When it says no, no amount of searching turns that into an answer,
-    and the finding is handed to a person with instructions rather than being
-    silently downgraded.
-    """
+    """Look for `tokens` in the project, or say why the answer is not here."""
     tokens = [t.strip() for t in tokens if t and t.strip()][:12]
     if not statement:
         return Condition(ConditionState.NONE)
@@ -187,12 +158,27 @@ def check(
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="не задан ни один корень исходников — искать негде")
 
-    patterns = [(token, re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", re.I))
-                for token in tokens]  # noqa: E501 - kept flat for readability
+    from .framework_detectors import detect_framework_condition
+
+    detected = detect_framework_condition([Path(root) for root in roots], tokens)
+    if detected is not None:
+        return Condition(
+            ConditionState(detected.state), statement, tokens, where,
+            hits=[detected.evidence] if detected.evidence else [],
+            reason=detected.reason, source="detector",
+        )
+
+    try:
+        suffixes = get_source_suffixes(roots, include_configs=True)
+    except DetectionError:
+        suffixes = DEFAULT_SOURCE_SUFFIXES
+
+    patterns = [(token, re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", re.IGNORECASE))
+                for token in tokens]
     hits: list[str] = []
     scanned = 0
     for root in roots:
-        for path in _files(Path(root)):
+        for path in _files(Path(root), suffixes):
             try:
                 if path.stat().st_size > _MAX_BYTES:
                     continue
@@ -209,9 +195,9 @@ def check(
             if len(hits) >= 5:
                 break
     if hits:
-        return Condition(ConditionState.HOLDS, statement, tokens, where, hits)
+        return Condition(ConditionState.HOLDS, statement, tokens, where, hits, source="text")
     if not scanned:
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="в корнях исходников не оказалось файлов для поиска")
     return Condition(ConditionState.ABSENT, statement, tokens, where,
-                     reason=f"просмотрено {scanned} файлов")
+                     reason=f"просмотрено {scanned} файлов", source="text")
