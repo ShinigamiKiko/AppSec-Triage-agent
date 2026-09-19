@@ -283,6 +283,8 @@ def from_ghsa(advisory_id: str) -> Advisory | None:
     """The maintainer's write-up, which usually names the symbol."""
     if not advisory_id.upper().startswith("GHSA-"):
         return None
+    # OSV ids are case-sensitive: GHSA-4qpc-3hr4-r2p4 resolves, GHSA-4QPC-3HR4-R2P4 is a 404.
+    advisory_id = "GHSA-" + advisory_id[5:].lower()
     data = _get_json(f"https://api.osv.dev/v1/vulns/{advisory_id}")
     if not data:
         return None

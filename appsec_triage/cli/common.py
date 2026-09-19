@@ -62,6 +62,9 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     provider_cfg = load_provider_config(cfg.provider)
     if provider_cfg.leaves_the_perimeter: cfg.redact_secrets = True
     findings = ingest.load(findings_path)
+    from ..ingest.dependency import qualify_composer_names
+    if qualified := qualify_composer_names(findings, source_roots):
+        print(f"→ {qualified} Composer package name(s) completed from composer.lock", file=sys.stderr)
     if govuln_path := getattr(args, "govulncheck", None):
         from ..ingest import govulncheck as govulncheck_ingest
         try:

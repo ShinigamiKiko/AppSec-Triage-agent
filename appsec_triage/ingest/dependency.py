@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from ..models import DependencyInfo
@@ -118,3 +121,52 @@ def parse(text: str, properties: dict[str, Any] | None = None) -> DependencyInfo
         call_site=call_site if isinstance(call_site, str) else None,
         call_line=call_line if isinstance(call_line, str) else None,
     )
+
+
+log = logging.getLogger(__name__)
+
+
+def _composer_packages(root: Path) -> list[tuple[str, str]]:
+    """(name, version) of every package composer.lock or vendor/composer/installed.json lists."""
+    out: list[tuple[str, str]] = []
+    for rel, keys in (("composer.lock", ("packages", "packages-dev")),
+                      ("vendor/composer/installed.json", ("packages",))):
+        path = Path(root) / rel
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        items = data if isinstance(data, list) else [p for k in keys for p in (data.get(k) or [])]
+        out += [(str(p.get("name") or ""), str(p.get("version") or "")) for p in items if isinstance(p, dict)]
+    return out
+
+
+def qualify_composer_names(findings, roots) -> int:
+    """Restore `vendor/name` for Composer packages a scanner reported by the bare name.
+
+    An older wolfee wrote `packagist/yaml@v7.3.0` for symfony/yaml, and no
+    vulnerability database knows a Composer package called `yaml`. The project's
+    own lock file does; the name is taken only when it is unambiguous.
+    """
+    packages: list[tuple[str, str]] = []
+    for root in roots or []:
+        packages += _composer_packages(Path(root))
+    if not packages:
+        return 0
+    fixed = 0
+    for finding in findings:
+        dep = getattr(finding, "dependency", None)
+        if dep is None or (dep.ecosystem or "") != "packagist" or not dep.package or "/" in dep.package:
+            continue
+        short = dep.package.lower()
+        matches = {name for name, _ in packages if name.lower().endswith("/" + short)}
+        if len(matches) > 1:
+            version = (dep.installed_version or "").lstrip("vV")
+            matches = {name for name, v in packages
+                       if name.lower().endswith("/" + short) and v.lstrip("vV") == version}
+        if len(matches) == 1:
+            full = matches.pop()
+            log.info("composer package %s qualified as %s from the lock file", dep.package, full)
+            dep.package = full
+            fixed += 1
+    return fixed

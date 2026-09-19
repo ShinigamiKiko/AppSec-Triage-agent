@@ -22,7 +22,7 @@
 # every rebuild. Only the resulting binary is copied into the runtime image.
 FROM golang:1.26-alpine AS wolfee-builder
 
-ARG WOLFEE_VERSION=1.6
+ARG WOLFEE_VERSION=1.7
 ARG WOLFEE_REPO=https://github.com/ShinigamiKiko/wolfee-cli.git
 
 RUN apk add --no-cache git make
@@ -93,8 +93,10 @@ RUN go install golang.org/x/vuln/cmd/govulncheck@latest \
     && govulncheck -version
 
 # typescript-language-server (+ the tsserver it wraps) for .ts/.tsx/.js/.jsx.
-RUN npm install -g typescript typescript-language-server \
-    && typescript-language-server --version
+# Pinned: TypeScript 7 (the Go port) ships no tsserver.js, and the server never answers `initialize`.
+RUN npm install -g typescript@5.9.3 typescript-language-server@5.3.0 \
+    && typescript-language-server --version \
+    && test -f "$(npm root -g)/typescript/lib/tsserver.js"
 
 # cdxgen — the only source of the dependency graph. Without it a scan cannot
 # tell a direct dependency from a transitive one, and the upgrade advice it
