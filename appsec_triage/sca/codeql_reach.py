@@ -1,46 +1,58 @@
-"""Does attacker-controlled input reach the line where a dependency is called.
-
-This is the question SARIF cannot answer. A SARIF report carries the paths
-CodeQL already judged to be flaws, and a call into a library is not one of them —
-`ldap.DialURL(url)` is ordinary code to a security suite. So the report is silent
-about exactly the lines a dependency triage cares about, and the only way to ask
-is to query the database directly.
-
-The database is the one the SAST phase built and no longer throws away. Building
-it costs minutes; querying it costs seconds, and both phases run in the same
-container against the same source tree, so the answer is about the code that was
-actually scanned.
-
-One query per run, not one per finding: every call site of every advisory goes
-into a single generated predicate, the query is evaluated once, and the reachable
-subset comes back. A project with sixty dependency findings would otherwise pay
-sixty query evaluations for one database.
-
-Go and JavaScript are implemented. The dataflow libraries name their sources
-differently in each language — `UntrustedFlowSource` in Go, `RemoteFlowSource`
-in JavaScript — and a guessed query compiles into either an error or, worse, an
-empty result that reads as "not reachable". So a language is added only after
-its query has been run against a real database and shown to separate a reachable
-call site from an unreachable one; a language without an entry here is reported
-as unsupported rather than answered with silence.
-"""
+"""Does attacker-controlled input reach the line where a dependency is called."""
 
 from __future__ import annotations
 
 import csv
 import io
 import logging
+import os
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+_THREADS = os.environ.get("APPSEC_CODEQL_THREADS", "0")
+_RAM_MB = os.environ.get("APPSEC_CODEQL_RAM_MB", "6000")
+
+
+def query_flags() -> list[str]:
+    """What an evaluating command may use."""
+    return [f"--threads={_THREADS}", f"--ram={_RAM_MB}"]
+
+
+_DATABASE_LOCKS: dict[str, threading.Lock] = {}
+_DATABASE_LOCKS_GUARD = threading.Lock()
+
+
+def _database_of(argv: list[str]) -> str | None:
+    """The database an invocation opens, or None when it opens none (`bqrs decode`)."""
+    for index, arg in enumerate(argv):
+        if arg.startswith("--database="):
+            return arg.split("=", 1)[1]
+        if arg == "analyze" and index + 1 < len(argv) and argv[index - 1:index] == ["database"]:
+            return argv[index + 1]
+    return None
+
+
+def database_lock(database: str | Path) -> threading.Lock:
+    key = str(Path(database).resolve())
+    with _DATABASE_LOCKS_GUARD:
+        return _DATABASE_LOCKS.setdefault(key, threading.Lock())
+
+
+def run_codeql(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """`subprocess.run` for a CodeQL command, holding its database's lock while it runs."""
+    database = _database_of(argv)
+    if database is None:
+        return subprocess.run(argv, **kwargs)
+    with database_lock(database):
+        return subprocess.run(argv, **kwargs)
+
 _TIMEOUT_S = 1800
 
-# Per language: the imports and the two expressions that differ. Absent means
-# the language is not supported, which is reported rather than guessed at.
 _DIALECTS = {
     "go": {
         "imports": "import go\nimport semmle.go.security.FlowSources",
@@ -49,18 +61,6 @@ _DIALECTS = {
         "call": "CallExpr",
         "argument": "n.asExpr() = c.getAnArgument()",
     },
-    # Checked against a real database rather than assumed to mirror Go: the
-    # source class has a different name, and the taint had to survive a closure
-    # and an event handler — `req.on('data') -> body -> JSON.parse -> merge` —
-    # which it does.
-    #
-    # The argument shape does not mirror Go. JavaScript libraries take their
-    # dangerous input as an options object, and taint stored into a property of
-    # an object literal does not taint the literal: on a seeded project,
-    # `_.template(tpl, { variable: req.body.variable })` came back "no path".
-    # So the values inside object and array literals count as the argument too —
-    # the literal's structure only, never an arbitrary subexpression, which would
-    # let `f(sanitize(req.body))` match on the unsanitized `req.body` inside it.
     "javascript": {
         "imports": "import javascript",
         "helpers": (
@@ -145,9 +145,6 @@ class Reached:
     source_file: str = ""
     source_line: int = 0
     steps: list[str] = field(default_factory=list)
-    """The engine's own path, source first, one `file:line expression` per node.
-
-    Empty for the site query, which reports the two ends only."""
     engine: str = "CodeQL"
 
     @property
@@ -164,13 +161,7 @@ class Reached:
 
 @dataclass(slots=True)
 class Answer:
-    """What the query established for the whole batch of call sites.
-
-    `asked` is what went in and `reached` is what came back; a site in `asked`
-    and absent from `reached` was examined and no path was found. `problem` being
-    set means the query did not run at all — then nothing was examined, and the
-    difference between those two states is the whole point of this class.
-    """
+    """What the query established for the whole batch of call sites."""
 
     asked: set[tuple[str, int]] = field(default_factory=set)
     evaluated: set[tuple[str, int]] = field(default_factory=set)
@@ -182,8 +173,7 @@ class Answer:
         return not self.problem
 
     def verdict(self, sites: list[tuple[str, int]]) -> Reached | None | bool:
-        """`Reached` when input arrives, False when it provably does not, None
-        when this batch never asked about these sites."""
+        """`Reached` when input arrives, False when it provably does not, None when this batch never asked about these sites."""
         if self.problem:
             return None
         hit = next((self.reached[s] for s in sites if s in self.reached), None)
@@ -235,10 +225,10 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         results = pack / "results.bqrs"
         evaluated_results = pack / "evaluated.bqrs"
 
-        argv = [binary, "query", "run", f"--database={database}",
+        argv = [binary, "query", "run", *query_flags(), f"--database={database}",
                 f"--output={results}", str(query_file)]
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True,
+            proc = run_codeql(argv, capture_output=True, text=True,
                                   timeout=timeout_s, encoding="utf-8", errors="replace", check=False)
         except subprocess.TimeoutExpired:
             return Answer(problem=f"запрос CodeQL не уложился в {timeout_s}с")
@@ -249,8 +239,8 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
             return Answer(problem=f"запрос CodeQL не выполнился: {tail[:300]}")
 
         try:
-            evaluated_proc = subprocess.run(
-                [binary, "query", "run", f"--database={database}",
+            evaluated_proc = run_codeql(
+                [binary, "query", "run", *query_flags(), f"--database={database}",
                  f"--output={evaluated_results}", str(evaluated_file)],
                 capture_output=True, text=True, timeout=timeout_s,
                 encoding="utf-8", errors="replace", check=False,
@@ -265,14 +255,14 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
 
         decode = [binary, "bqrs", "decode", "--format=csv", "--no-titles", str(results)]
         try:
-            decoded = subprocess.run(decode, capture_output=True, text=True,
+            decoded = run_codeql(decode, capture_output=True, text=True,
                 timeout=180, encoding="utf-8", errors="replace", check=False)
         except (subprocess.TimeoutExpired, OSError) as exc:
             return Answer(problem=f"результат CodeQL не прочитан: {exc}")
         if decoded.returncode != 0:
             return Answer(problem="результат CodeQL не прочитан: bqrs decode отказал")
 
-        evaluated_decode = subprocess.run(
+        evaluated_decode = run_codeql(
             [binary, "bqrs", "decode", "--format=csv", "--no-titles", str(evaluated_results)],
             capture_output=True, text=True, timeout=180,
             encoding="utf-8", errors="replace", check=False,

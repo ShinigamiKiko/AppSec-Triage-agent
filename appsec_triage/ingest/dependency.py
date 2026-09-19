@@ -1,20 +1,4 @@
-"""Pull the dependency facts out of an SCA report.
-
-Every SCA scanner emits the same handful of facts — package, installed version,
-fixed version, advisory link — and every one of them emits it as prose in a
-`help` blob rather than as fields. Left unparsed the model receives one long
-sentence and cannot weigh anything: on a real project all 89 dependency
-findings arrived that way and every one landed in `unknown`.
-
-Three formats are handled because three scanners were in play:
-
-    Wolfee   "GHSA-… in packagist/security-http@v5.4.22 - fixed=5.4.53"
-    wolfee   "GHSA-… in packagist/security-http@v5.4.22 - fixed=5.4.53"
-    Grype    "…" plus proper `properties`, which are preferred when present
-
-Parsing is best-effort and never fatal: a finding whose package cannot be read
-stays a normal finding and reaches the model as before.
-"""
+"""Pull the dependency facts out of an SCA report."""
 
 from __future__ import annotations
 
@@ -82,7 +66,7 @@ def looks_like_dependency(file_path: str, rule_id: str | None, text: str) -> boo
 
 
 def parse(text: str, properties: dict[str, Any] | None = None) -> DependencyInfo | None:
-    """Best-effort extraction. Returns None when there is no package to name."""
+    """Best-effort extraction."""
     text = text or ""
     props = properties or {}
 

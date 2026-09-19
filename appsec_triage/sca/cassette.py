@@ -1,17 +1,4 @@
-"""Record and replay of the chain's HTTP lookups, so a bench measures the pipeline.
-
-The dependency chain asks live sources — OSV, GHSA, NVD, EPSS, KEV, fix commits,
-package archives — and their answers move: an advisory gains a symbol, a query
-times out. A benchmark run on Monday and rerun on Friday then measures the
-internet as much as the triage. A cassette pins those answers: record once
-against the network, replay every later run from disk.
-
-Off unless `APPSEC_HTTP_CASSETTE` names a directory. `APPSEC_HTTP_MODE` is
-`replay` (the default) or `record`. A replay miss raises a network error, so the
-caller's existing "database unavailable" path applies — never an empty answer,
-for the same reason a timeout is never "no advisories". Only a 404 is recorded
-as a failure, because it is the one failure every caller treats as an answer.
-"""
+"""Record and replay of the chain's HTTP lookups, so a bench measures the pipeline."""
 
 from __future__ import annotations
 

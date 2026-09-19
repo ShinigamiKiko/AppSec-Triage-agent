@@ -1,23 +1,4 @@
-"""Second pass: try to break the verdict.
-
-Repeating the same question does not help. Measured on this setup the model's
-errors are systematic, not random — it believed "quoting a variable inside SQL
-is parameterisation" every single time it saw one. Three independent votes would
-have produced three identical mistakes at three times the cost. Majority voting
-fixes noise; this model's problem is bias.
-
-So the second pass asks a *different* question: not "is this a vulnerability"
-but "what is wrong with this verdict". That reframing is what breaks the shared
-prior, and it aims at the measured weak spot — on real code the model's
-`confirmed` label was wrong five times out of five, and each of those would have
-struggled against one honest attempt at refutation.
-
-The merge rule is the same invariant as everywhere else in this pipeline:
-**a challenge can only move a verdict toward `unknown`.** A successful refutation
-does not flip `confirmed` into `false_positive` — that would let a second guess
-overwrite a first one. It sends the finding to a human, which is what a genuine
-disagreement between two passes means.
-"""
+"""Second pass: try to break the verdict."""
 
 from __future__ import annotations
 
@@ -80,12 +61,7 @@ class ChallengeResult:
 
 
 def should_challenge(record: TriageRecord, cfg: VerificationConfig) -> bool:
-    """Second passes cost as much as first ones, so spend them where they pay.
-
-    A universal second pass doubles a run — an hour becomes two on 165 findings.
-    The default targets the measured weakness (`confirmed` precision) plus the
-    cases where the checks already saw something odd.
-    """
+    """Second passes cost as much as first ones, so spend them where they pay."""
     if not cfg.enabled or record.decided_by in ("scope", "heuristics", "error"):
         return False
     if record.verdict.verdict.value in cfg.challenge_verdicts:
@@ -108,15 +84,7 @@ def _render_prompt(
     pack: str = "default",
     stack_section: str = "",
 ) -> tuple[str, str]:
-    """The challenger gets the *same* knowledge as the pass it audits.
-
-    Measured the hard way. Built on `base` alone the challenger lacked the CWE
-    specialization and the shared fragments, and proceeded to overturn eleven
-    correct command-injection verdicts on the grounds that "a blacklist filter
-    removes dangerous shell metacharacters" — precisely the argument the
-    sanitiser fragment declares invalid. A reviewer who knows less than the
-    author does not review; it second-guesses.
-    """
+    """The challenger gets the *same* knowledge as the pass it audits."""
     system, _ = registry.render_system(pkg.cwe, pack, stack_section, "dependency" if pkg.dependency else None)
     challenge = registry.load_pack(pack)["_challenge"]
     system = f"{system}\n\n---\n\n{challenge.body}"
@@ -193,14 +161,7 @@ def challenge(
 def apply(
     verdict: Verdict, result: ChallengeResult, mode: str = "advisory"
 ) -> tuple[Verdict, list[str], str | None]:
-    """Merge the second pass into the first.
-
-    Advisory is the default because it was measured: letting the challenge
-    override took correct verdicts from 20 to 17 on a labelled corpus, while
-    dangerous misses stayed at zero in both modes. The objection has value —
-    just not as a decision. It goes to the reviewer, who has the context the
-    challenger lacked.
-    """
+    """Merge the second pass into the first."""
     if result.error:
         return verdict, [f"challenge_skipped: {result.error[:120]}"], None
     if result.survives:

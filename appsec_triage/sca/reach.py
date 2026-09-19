@@ -1,25 +1,4 @@
-"""Step 4: does untrusted input actually reach the call?
-
-Presence answers "this code calls the vulnerable function". For a whole class of
-flaws — injection, XSS, traversal, deserialisation — that is not yet the
-vulnerability: it matters only if an attacker controls what flows in. Answering
-that needs two different things, and neither is sufficient alone.
-
-*The language server* knows the call graph. From a call site it walks incoming
-calls outwards and asks whether any of them is an entry point — a controller
-action, a route handler. That establishes the call is reachable from outside,
-and nothing about what flows into it.
-
-*CodeQL and Psalm* model dataflow. Their taint queries carry a path from an untrusted source
-to a sink. If a path ends at one of our call sites, an attacker's value arrives
-there. That establishes the flow, and nothing about whether the query modelled
-this particular library correctly.
-
-So a positive verdict requires both: an entry point above the call, and a taint
-path into it. Anything less is `UNKNOWN` with the reason recorded — a missing
-tool is never allowed to read as "not reachable", because that is the failure
-that closes a real vulnerability.
-"""
+"""Step 4: does untrusted input actually reach the call?"""
 
 from __future__ import annotations
 
@@ -42,6 +21,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .presence import Hit
 
 log = logging.getLogger(__name__)
+
+
+def _count(lsp, key: str) -> None:
+    """Tally an LSP question the chain asked, for the run's language-server line."""
+    stats = getattr(lsp, "stats", None)
+    if isinstance(stats, dict):
+        stats[key] = stats.get(key, 0) + 1
 
 _MAX_HOPS = 4
 
@@ -85,7 +71,6 @@ def needs_input_path(cwe: str | None) -> bool:
         return False
     digits = "".join(ch for ch in str(cwe) if ch.isdigit())
     return digits in _INPUT_DRIVEN_CWES
-
 
 
 def _entrypoint_above(
@@ -138,7 +123,6 @@ def _entrypoint_above(
     return "", f"за {_MAX_HOPS} переходов точка входа не найдена"
 
 
-
 def _trace_file(file: str, root: Path, *, psalm: bool = False) -> str | None:
     """Repository-relative identity, including scanner-specific virtual roots."""
     file = file.replace("\\", "/")
@@ -156,9 +140,6 @@ def _trace_file(file: str, root: Path, *, psalm: bool = False) -> str | None:
         return None
     file = posixpath.normpath(file)
     if psalm and file.startswith("../"):
-        # An autonomous Psalm config is rooted in the output directory, so its
-        # SARIF can name project files as ../src/Foo.php. Only accept the
-        # stripped path when it resolves inside the actual scanned root.
         candidate = file
         while candidate.startswith("../"):
             candidate = candidate[3:]
@@ -206,7 +187,6 @@ def _taint_into(
     return "", "no matching CodeQL/Psalm source-to-sink trace supplied; coverage unknown", ""
 
 
-
 TAINT_SYSTEM = registry.step("taint")
 
 _TAINT_SCHEMA = {
@@ -223,14 +203,7 @@ _TAINT_CONTEXT_LINES = 25
 
 
 def _taint_by_model(hits, root: Path, client, symbol: str) -> tuple[str, str, str]:
-    """(verdict, quote, why) for whether untrusted input reaches the call.
-
-    Scanner traces and the language server answer this only where their models
-    cover the code. CodeQL has no PHP
-    extractor. Reading the file is what a reviewer does when traces are missing,
-    and it is held to the same rule as every other model answer here — quote
-    the material or be discarded.
-    """
+    """(verdict, quote, why) for whether untrusted input reaches the call."""
     if client is None:
         return "unknown", "", "модель не подключена"
 
@@ -276,11 +249,7 @@ def assess(
     codeql_findings: Iterable[Finding] = (),
     client=None,
 ) -> ReachResult:
-    """Both halves, or `UNKNOWN`. Never "safe" from a missing tool.
-
-    codeql_findings contains CodeQL and Psalm traces; retain the keyword used by
-    callers while reporting the actual scanner that supplied evidence.
-    """
+    """Both halves, or `UNKNOWN`."""
     if not hits:
         return ReachResult(Reachability.UNKNOWN, detail="нет мест вызова для проверки")
 
@@ -294,6 +263,9 @@ def assess(
             entry, entry_problem = _entrypoint_above(lsp, routes, hit, root)
             if entry:
                 break
+        _count(lsp, "sca_asked")
+        if entry:
+            _count(lsp, "sca_answered")
     if entry:
         used.append("lsp")
     else:

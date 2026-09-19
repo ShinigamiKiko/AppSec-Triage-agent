@@ -1,10 +1,4 @@
-"""Govulncheck JSON protocol adapter.
-
-The SARIF export is useful to generic consumers, but it drops the installed and
-fixed module versions that make an SCA verdict actionable.  The JSON protocol
-keeps those facts and emits one object after another, so this adapter groups all
-symbol traces for one OSV advisory into one normalized finding.
-"""
+"""Govulncheck JSON protocol adapter."""
 
 from __future__ import annotations
 

@@ -1,22 +1,4 @@
-"""What triage asks a language server, and what it does with the answers.
-
-Two questions, chosen because each maps onto a measured failure:
-
-1. **Where does this value come from?** On a real Symfony project every CWE-89
-   finding landed in `unknown` for one reason: the model saw the query being
-   assembled and could not see where the interpolated fragment came from. A
-   `definition` lookup answers that in milliseconds.
-
-2. **Is this code reachable from outside?** CodeQL says a tainted path exists;
-   it does not say whether anything calls the function containing it. A path
-   inside a helper that only tests invoke is hygiene, not a vulnerability. This
-   is the one question neither the scanner nor the model can answer, and it is
-   where CodeQL and LSP genuinely compose rather than overlap.
-
-Everything here is best-effort. A language server is a large, slow, stateful
-dependency; when it is missing or unhappy, triage carries on with less context
-and says so, exactly like the source resolver does.
-"""
+"""What triage asks a language server, and what it does with the answers."""
 
 from __future__ import annotations
 
@@ -70,6 +52,30 @@ _ENTRYPOINT_CALL = re.compile(
 )
 
 
+_ECOSYSTEM_LANGUAGE = {"npm": "typescript", "composer": "php", "go": "go",
+                       "golang": "go", "pypi": "python"}
+
+
+def required_languages(findings, cfg: LSPConfig, only_ecosystems=()) -> list[str]:
+    """Mandatory languages these findings bring in, including SCA ones."""
+    from ..scope import _ecosystem
+
+    allowed = {_ecosystem(e) for e in only_ecosystems if e and str(e).strip()}
+    wanted: set[str] = set()
+    for finding in findings:
+        dependency = getattr(finding, "dependency", None)
+        if dependency is not None and dependency.ecosystem:
+            ecosystem = _ecosystem(dependency.ecosystem)
+            if allowed and ecosystem not in allowed:
+                continue
+            language = _ECOSYSTEM_LANGUAGE.get(ecosystem)
+        else:
+            language = cfg.language_for(finding.code_context.file_path)
+        if language and language in cfg.required_languages:
+            wanted.add(language)
+    return sorted(wanted)
+
+
 @dataclass(slots=True)
 class SymbolContext:
     """What the server could tell us about one finding."""
@@ -91,19 +97,15 @@ class LSPService:
         self.roots = [Path(r).resolve() for r in roots if Path(r).exists()]
         self._clients: dict[str, LSPClient | None] = {}
         self._lines: dict[Path, list[str]] = {}
-        self.stats = {"resolved": 0, "no_server": 0, "no_answer": 0, "definitions": 0, "callers": 0}
+        self.stats = {"resolved": 0, "no_server": 0, "no_answer": 0, "definitions": 0, "callers": 0,
+                      "sca_asked": 0, "sca_answered": 0}
 
 
     def _language_for(self, path: str) -> str | None:
         return self.cfg.language_for(path)
 
     def ensure_ready(self, language: str) -> str | None:
-        """Start the server for `language` now, before any finding is triaged.
-
-        Exists for languages where the resolver is mandatory: discovering a dead
-        server on finding 1 of 300 after an hour of inference is the expensive
-        way to learn it. Returns a human-readable problem, or None when ready.
-        """
+        """Start the server for `language` now, before any finding is triaged."""
         if not self.roots:
             return "none of the configured source roots exist on disk"
         spec = self.cfg.servers.get(language) or {}
@@ -130,6 +132,7 @@ class LSPService:
             init_timeout_s=self.cfg.startup_timeout_s,
             index_timeout_s=self.cfg.index_timeout_s,
             path_map=dict(spec.get("path_map") or {}),
+            warmup=self._warmup_file(language, spec),
         )
         if not client.start():
             log.warning("language server for %s unavailable: %s", language, client.error)
@@ -138,6 +141,21 @@ class LSPService:
         log.info("language server for %s ready (%s)", language, " ".join(command[:2]))
         self._clients[language] = client
         return client
+
+    def _warmup_file(self, language: str, spec: dict) -> tuple[Path, str] | None:
+        """One project file of this language, opened before the index probe."""
+        import os
+
+        suffixes = tuple(s.lower() for s in spec.get("extensions") or [])
+        if not suffixes or not self.roots:
+            return None
+        skip = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv"}
+        for parent, dirnames, filenames in os.walk(self.roots[0]):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip and not d.startswith("."))
+            for name in sorted(filenames):
+                if name.lower().endswith(suffixes):
+                    return Path(parent) / name, spec.get("language_id", language)
+        return None
 
     def _resolve_path(self, file_path: str) -> Path | None:
         rel = Path(file_path.replace("\\", "/"))
@@ -148,14 +166,7 @@ class LSPService:
         return None
 
     def _raw_line(self, path: Path, line: int) -> str:
-        """The line exactly as it is on disk — indentation included.
-
-        Character offsets are computed against this. `_line_text` strips for
-        display, and using the stripped form for positions shifts every column
-        by the indent: on a real project that put the cursor inside the wrong
-        identifier and the server answered nothing, which looked like a server
-        that could not resolve local variables.
-        """
+        """The line exactly as it is on disk — indentation included."""
         if path not in self._lines:
             try:
                 self._lines[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -165,20 +176,14 @@ class LSPService:
         return lines[line - 1] if 0 < line <= len(lines) else ""
 
     def _line_text(self, path: Path, line: int) -> str:
-        """Display form: stripped. Never use this to compute a column."""
+        """Display form: stripped."""
         return self._raw_line(path, line).strip()
 
     def _path_map_for(self, language: str) -> dict[str, str]:
         return dict((self.cfg.servers.get(language) or {}).get("path_map") or {})
 
     def _to_location(self, item: dict, path_map: dict[str, str] | None = None) -> Location | None:
-        """Workspace-relative, or dropped.
-
-        A definition in the standard library or in `site-packages` says nothing
-        about this codebase — `subprocess.Popen` is defined in CPython, which
-        the reviewer already knows. Left unfiltered these consumed the whole
-        definition budget on the first real test.
-        """
+        """Workspace-relative, or dropped."""
         try:
             path = uri_to_path(item["uri"], path_map)
             line = int(item["range"]["start"]["line"]) + 1
@@ -241,12 +246,7 @@ class LSPService:
         return ctx
 
     def _definitions_in(self, client: LSPClient, path: Path, line_no: int, source_line: str) -> list[Location]:
-        """Resolve the identifiers on the flagged line, nearest-first.
-
-        Bounded by `max_definitions`: a dense line can hold a dozen names, and
-        the point is to answer "where did this value come from", not to paste
-        the module into the prompt.
-        """
+        """Resolve the identifiers on the flagged line, nearest-first."""
         found: list[Location] = []
         seen: set[tuple[str, int]] = set()
 
@@ -273,13 +273,7 @@ class LSPService:
         return found
 
     def _callers_of(self, client: LSPClient, path: Path, line_no: int, source_line: str) -> list[Location]:
-        """Callers via callHierarchy, or references as the fallback.
-
-        `callHierarchy` is optional in LSP and plenty of servers skip it —
-        python-lsp-server announces no `callHierarchyProvider` at all. References
-        are weaker (they include reads, not just calls) but they answer the
-        question that matters here: does anything outside this file touch it.
-        """
+        """Callers via callHierarchy, or references as the fallback."""
         items = client.incoming_calls(path, line_no, 0)
         via = "callHierarchy"
         if not items:
@@ -314,14 +308,7 @@ class LSPService:
 
     @staticmethod
     def _judge_reachability(ctx: SymbolContext) -> None:
-        """Two facts worth stating, and nothing beyond what the callers show.
-
-        Absence of callers is deliberately *not* treated as "unreachable": a
-        server that failed to index, a framework that wires routes by
-        annotation, or dynamic dispatch all produce an empty list. Concluding
-        "nothing calls this, so it is safe" from that would be the exact kind of
-        silent false negative this pipeline exists to prevent.
-        """
+        """Two facts worth stating, and nothing beyond what the callers show."""
         if not ctx.callers:
             return
         non_production = [c for c in ctx.callers if _NON_PRODUCTION.search(c.file_path)]

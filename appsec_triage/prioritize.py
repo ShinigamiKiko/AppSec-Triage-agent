@@ -1,26 +1,4 @@
-"""Turning verdicts into a review queue an engineer can actually finish.
-
-Triage answers "is this real". Prioritisation answers "what do I open first, and
-what can wait" — a different question, and the one that decides whether the tool
-saves anyone time.
-
-Three mechanisms, in order of how much work they remove:
-
-1. **Clustering.** 59 of one rule firing across a codebase is one decision, not
-   59. Reviewing a representative and applying the call to its cluster is by far
-   the biggest lever — bigger than any model improvement.
-2. **Scoring.** Rank by *risk*, not by the scanner's severity field. A weak hash
-   guarding a cache key and a weak hash guarding a signature can both be flagged
-   by a scanner and are not remotely the same thing.
-3. **Budget.** Take the top N% and mark the rest deferred.
-
-The safety rule that makes the budget honest: **nothing is deleted or hidden.**
-Deferred items stay in the report and in the audit log, and a small set of
-conditions is exempt from the budget entirely — a live-credential shape or a
-self-contradicting verdict is cheap to check and expensive to miss. If those
-exemptions alone exceed the budget, the queue overflows and says so rather than
-quietly dropping them.
-"""
+"""Turning verdicts into a review queue an engineer can actually finish."""
 
 from __future__ import annotations
 
@@ -85,12 +63,7 @@ class QueueItem:
 
 
 def cluster_key(record: TriageRecord, finding: Finding | None = None) -> tuple:
-    """Same rule + same code shape = one decision.
-
-    Deliberately ignores the file path: the whole point is that forty copies of
-    one pattern are one call. Verdict is part of the key so a cluster never mixes
-    a `confirmed` with a `false_positive`.
-    """
+    """Same rule + same code shape = one decision."""
     if finding is not None and finding.dependency is not None:
         return ("dependency", finding.dependency.package, record.verdict.verdict.value)
 
@@ -103,7 +76,7 @@ def cluster_key(record: TriageRecord, finding: Finding | None = None) -> tuple:
 
 
 def score(record: TriageRecord, finding: Finding | None = None) -> tuple[int, list[str]]:
-    """0-100. Higher means "open this sooner"."""
+    """0-100."""
     reasons: list[str] = []
     verdict = record.verdict
 
@@ -193,24 +166,13 @@ class Queue:
 
     @property
     def to_decide(self) -> list[QueueItem]:
-        """Items where a human still has to work something out.
-
-        `unknown` means the pipeline could not settle it, and a `confirmed`
-        finding with no named remediation still needs someone to work out what
-        to do about it. These are the ones that cost thinking time.
-        """
+        """Items where a human still has to work something out."""
         return [i for i in self.to_review if i.record.verdict.verdict is not VerdictLabel.confirmed
                 or i.record.verdict.requires_human_review]
 
     @property
     def to_do(self) -> list[QueueItem]:
-        """Confirmed with the remediation already named — work, not judgement.
-
-        Mostly dependency upgrades. Reporting these together with the undecided
-        ones made "20% manual review" read as 20% of *triage*, when the triage
-        load behind it was a fraction of that: on four real projects, 50 queue
-        items of which 7 actually needed a decision.
-        """
+        """Confirmed with the remediation already named — work, not judgement."""
         return [i for i in self.to_review if i not in self.to_decide]
 
     def summary(self) -> dict:

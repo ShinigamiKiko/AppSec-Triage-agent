@@ -1,21 +1,4 @@
-"""Reuse verdicts from a previous run instead of paying for them again.
-
-A full pass over a real project is an hour of GPU. Between two runs most
-findings are byte-identical and were already settled — re-judging them buys
-nothing and makes the tool unusable in CI, where the answer has to arrive before
-anyone loses interest.
-
-The unit of identity is a **fingerprint** over the things that decide a verdict:
-rule, CWE, path, and the code itself. Line numbers are excluded on purpose — a
-finding that merely shifted down because someone added an import is the same
-finding. The snippet is included for the opposite reason: if the code changed,
-the old verdict is about code that no longer exists, and reusing it would be
-worse than useless.
-
-What gets re-judged is a policy choice, so it is explicit rather than clever.
-The default answers the question people actually ask: *redo the ones that were
-unresolved or unreliable, keep the ones that were cleanly settled.*
-"""
+"""Reuse verdicts from a previous run instead of paying for them again."""
 
 from __future__ import annotations
 

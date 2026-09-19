@@ -1,22 +1,4 @@
-"""Where a function is declared, and whether anything outside can call it.
-
-Both questions are needed to bridge from a flaw inside a library to something an
-application could plausibly write, and every language answers them differently
-enough that one regex cannot serve:
-
-- **PHP** states visibility in a keyword, and a name with no keyword is public.
-- **JavaScript and TypeScript** have four spellings of a declaration and no
-  visibility keyword at all in JS — what is reachable from outside is what the
-  module exports, so export is the visibility.
-- **Python** has no keyword either; the convention is the leading underscore,
-  and `__all__` overrides it when present.
-- **Go** puts it in the case of the first letter, and hangs methods off a
-  receiver rather than a class.
-
-Getting this wrong is not a crash but a silent one: an unrecognised declaration
-means the bridge finds no caller, which reads exactly like a library that never
-calls the flaw — the one outcome allowed to close a finding.
-"""
+"""Where a function is declared, and whether anything outside can call it."""
 
 from __future__ import annotations
 
@@ -55,7 +37,6 @@ class Declaration:
 
     def __str__(self) -> str:
         return f"{self.owner}::{self.name}" if self.owner else self.name
-
 
 
 _PHP_DECL = re.compile(
@@ -173,12 +154,7 @@ def declarations(path: str, text: str) -> list[Declaration]:
 
 
 def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
-    """The declaration containing `offset`, from an already-parsed file.
-
-    Split out so a caller with many offsets in one file parses it once: parsing
-    is a full-text regex pass, and `enclosing` per match is quadratic on a file
-    with many call sites.
-    """
+    """The declaration containing `offset`, from an already-parsed file."""
     best = None
     for declaration in parsed:
         if declaration.offset < offset:
@@ -189,13 +165,7 @@ def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
 
 
 def enclosing(path: str, text: str, offset: int) -> Declaration | None:
-    """The declaration containing `offset` — the nearest one before it.
-
-    The same rule git uses for hunk headers, and wrong in the same case: a
-    position after a function's end is attributed to it. Accepted because the
-    alternative is four parsers, and the cost is a widened search rather than a
-    wrong verdict.
-    """
+    """The declaration containing `offset` — the nearest one before it."""
     return enclosing_in(declarations(path, text), offset)
 
 

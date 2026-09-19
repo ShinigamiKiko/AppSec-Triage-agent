@@ -1,9 +1,4 @@
-"""The JSON contract, and a tolerant parser for models that don't honour it.
-
-`VERDICT_SCHEMA` is handed to the provider for constrained decoding where the
-provider supports it (Ollama `format`, OpenAI `json_schema`). DeepSeek only gets
-`json_object`, so the salvage path below matters there in practice.
-"""
+"""The JSON contract, and a tolerant parser for models that don't honour it."""
 
 from __future__ import annotations
 

@@ -1,17 +1,4 @@
-"""What counts as test code — one list, kept in the file every prompt carries.
-
-The model is told which paths are tests by `prompts/training-context.md`, and the
-code decided the same question with regular expressions of its own — two lists,
-in two modules, that had already drifted apart. A finding the model was told to
-treat as test scope could be counted as production by the chain, and the reverse.
-
-So the list lives in one place: the "Test And Non-Production Paths" section of
-that file, as backticked bullets. The model reads them as prose; this module
-reads them as patterns.
-
-- a pattern ending in `/` is a directory: any path segment with that name;
-- anything else is a file-name glob, matched against the base name.
-"""
+"""What counts as test code — one list, kept in the file every prompt carries."""
 
 from __future__ import annotations
 

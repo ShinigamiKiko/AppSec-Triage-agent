@@ -1,9 +1,4 @@
-"""Which scanners to run against a tree, decided by the languages in it.
-
-Lives with the scanners rather than in the CLI: the routing rule is a fact
-about the tools, not about how a command line is parsed. The CLI asks the
-question; this answers it.
-"""
+"""Which scanners to run against a tree, decided by the languages in it."""
 
 from __future__ import annotations
 
@@ -38,13 +33,7 @@ _SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "vendor", "target", "buil
 
 
 def scanners_for_target(target: Path) -> list[str]:
-    """Pick scanners by the languages actually present, then keep only usable ones.
-
-    This is what makes a PHP target run Psalm and a Go target run
-    CodeQL, without the operator having to know which tool covers which
-    language. Falls back to every usable scanner when nothing is recognised —
-    a strange tree should still get looked at, not silently skipped.
-    """
+    """Pick scanners by the languages actually present, then keep only usable ones."""
     wanted: list[str] = []
     seen_ext: set[str] = set()
     for path in Path(target).rglob("*"):

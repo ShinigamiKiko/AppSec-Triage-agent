@@ -1,4 +1,4 @@
-"""Bounded, static repository evidence. No config evaluation or shared caches."""
+"""Bounded, static repository evidence."""
 
 from __future__ import annotations
 
@@ -380,7 +380,8 @@ class RepositoryEvidence:
         if len(requests) > 6:
             self._note(pkg, "Retrieval truncated to six requests per round.")
         added = False
-        remaining = MAX_TOTAL_BYTES
+        # Use cumulative byte counter from pkg to enforce budget across tool calls
+        remaining = MAX_TOTAL_BYTES - getattr(pkg, "repository_bytes_read", 0)
         cache = {}
 
         def load(path):
@@ -389,6 +390,9 @@ class RepositoryEvidence:
             if path not in cache:
                 cache[path], used = self._load(pkg, path, remaining)
                 remaining = max(0, remaining - used)
+                # Track cumulative bytes read
+                if hasattr(pkg, "repository_bytes_read"):
+                    pkg.repository_bytes_read += used
             return cache[path]
 
         # Explicit locations take precedence over speculative repository searches.
@@ -420,7 +424,12 @@ class RepositoryEvidence:
                     self._note(pkg, "Search rejected: expected a nonempty literal of at most 512 characters.")
                     continue
                 matches = 0
+                skip = tuple(s.lower() for s in (request.get("skip_suffixes") or []))
+                skipped = 0
                 for path in self._paths(pkg):
+                    if skip and path.name.lower().endswith(skip):
+                        skipped += 1
+                        continue
                     lines = load(path)
                     if lines is not None:
                         for n, text in enumerate(lines, 1):
@@ -432,6 +441,11 @@ class RepositoryEvidence:
                     if matches >= MAX_LOCATIONS:
                         self._note(pkg, "Search windows truncated at match limit.")
                         break
+                if skipped:
+                    # Never a silent "nothing found" over code the search did not read.
+                    self._note(pkg, f"search_code did not read {skipped} source file(s) a language server "
+                                    "covers; for code use lsp_find_usages / lsp_find_symbol — no match here "
+                                    "says nothing about them.")
             else:
                 self._note(pkg, "Unknown repository evidence action; only read and literal search are supported.")
         return added

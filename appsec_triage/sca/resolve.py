@@ -1,32 +1,4 @@
-"""Step 2, live: the advisory's vulnerable symbol, extracted by the model.
-
-Nothing is prepared in advance. For a package the scanner reports, the databases
-are queried, the fix the advisory points at is fetched, and the model reads both
-to name the one function whose code was wrong. The answer is then checked
-against the published source of the affected version, which is the part that
-makes it usable: a name that is not declared in the code the project installs
-cannot be found in that project either.
-
-Three failure modes were measured while building this, and each is handled here
-rather than left to the prompt:
-
-*The bypassed validator.* Advisory prose names the check that was evaded far
-more often than the caller that misused it. Naming the validator detects
-nothing — the patched version calls it too — so the rule is stated explicitly
-and was verified to change the answer on the Twig path-traversal advisory.
-
-*The symbol introduced by the fix.* A new helper cannot exist in the vulnerable
-version, so it is worthless for detection. This is caught by the source check,
-not by asking the model to be careful: `findCharSet` passed every textual test
-and is absent from the affected release.
-
-*The library's own naming convention.* An advisory says the `column` filter; the
-release declares `twig_array_column`. The model cannot guess that. Offering the
-real declarations back for it to choose from was tried and is gone: the ordering
-now runs the ecosystem's own symbol list, then the advisory's prose, then the
-model — three sources that name the function outright — and the one that was
-left over never ran on any measured project.
-"""
+"""Step 2, live: the advisory's vulnerable symbol, extracted by the model."""
 
 from __future__ import annotations
 
@@ -86,11 +58,6 @@ class VulnerableSymbol:
     grounded_in_fix: bool = False
     listed_in_advisory: bool = False
     named_by_model: bool = False
-    """Named by the model when every deterministic source came up empty.
-
-    A lead for the search, never a fact. Nothing corroborates it — no diff, no
-    database — so a hit on it opens the finding for examination and a miss
-    closes nothing."""
     candidates: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     package_paths: tuple[str, ...] = field(default_factory=tuple)
     what_changed: str = ""
@@ -127,11 +94,7 @@ class VulnerableSymbol:
     steps: int = 0
     precondition: str = ""
     precondition_quote: str = ""
-    """The advisory's own words for the condition, verified against its text."""
     precondition_problem: str = ""
-    """Why a condition the model stated was not kept — for the report, so a
-    reviewer sees that a condition was proposed and discarded rather than never
-    considered."""
     precondition_tokens: tuple[str, ...] = field(default_factory=tuple)
     precondition_where: str = ""
     precondition_decidable: bool = True
@@ -197,14 +160,7 @@ def fix_diff(advisory: Advisory) -> tuple[str, str]:
 
 
 def _declaration_pattern(name: str) -> re.Pattern[str]:
-    """How the languages we scan spell "this function is defined here".
-
-    Matching only `function name(` is a PHP habit, and it silently reported
-    every Python symbol as absent — `def urlize` is a declaration too, as are
-    the several forms JavaScript uses for the same thing. Case-insensitive
-    because PHP method names are; the other languages are not harmed by it,
-    since the name still has to match.
-    """
+    """How the languages we scan spell "this function is defined here"."""
     escaped = re.escape(name)
     return re.compile(
         rf"(?:function\s+&?\s*{escaped}\s*\()"
@@ -217,13 +173,7 @@ def _declaration_pattern(name: str) -> re.Pattern[str]:
 
 
 def _quotes_a_changed_line(evidence: str | None, diff: str) -> bool:
-    """Is the quote a line the fix added or removed, rather than context?
-
-    The distinction is the whole difference between the flaw and the check it
-    evaded: a bypassed validator appears in the diff untouched, so a quote from
-    an unchanged line is evidence of nothing. With no diff there is nothing to
-    hold the quote against, and the answer stands on the advisory text instead.
-    """
+    """Is the quote a line the fix added or removed, rather than context?"""
     quote = (evidence or "").strip()
     if not diff:
         return True
@@ -237,18 +187,7 @@ def _quotes_a_changed_line(evidence: str | None, diff: str) -> bool:
 
 
 def _quotes_the_advisory(quote: str | None, text: str) -> bool:
-    """Is this quote actually in the advisory, rather than a plausible summary?
-
-    A precondition closes findings, and it was the least reproducible closure
-    the tool made: the model writes the condition in its own words each run, the
-    wording decides whether the checker finds the condition met, and one finding
-    came back closed, then open, then open again with nothing changed but the
-    sentence. Holding the condition to a quote takes the wording out of the
-    model's hands — the advisory either says it or it does not.
-
-    Whitespace is normalised because a model reflows text and that is not what
-    is being tested; the words themselves have to match.
-    """
+    """Is this quote actually in the advisory, rather than a plausible summary?"""
     wanted = " ".join((quote or "").split())
     if not wanted:
         return False
@@ -256,17 +195,7 @@ def _quotes_the_advisory(quote: str | None, text: str) -> bool:
 
 
 def _existed_before_fix(name: str, diff: str) -> bool | None:
-    """Did this function exist before the fix, judged from the diff alone?
-
-    A diff carries both versions: removed lines and context lines are the file
-    as it was, added lines are the file as it became. So a name that appears
-    only on `+` lines was introduced by the fix and cannot be in the vulnerable
-    release — `findCharSet` was exactly that, and searching a project for it
-    could only ever come back empty.
-
-    This answers what reading the installed package answered, without the
-    package: the diff is already here, and it is the same for every project.
-    """
+    """Did this function exist before the fix, judged from the diff alone?"""
     if not name or not diff:
         return None
 
@@ -298,7 +227,6 @@ def _declared(name: str, files: dict[str, str]) -> list[str]:
         return []
     pattern = _declaration_pattern(name)
     return [path for path, text in files.items() if pattern.search(text)]
-
 
 
 _MAX_LISTED = 40
@@ -340,13 +268,7 @@ _DIFF_DECLARATIONS = {
 
 
 def _diff_symbols(diff: str, ecosystem: str) -> list[str]:
-    """Extract pre-existing function/class names from a fix diff.
-
-    This is deliberately narrower than extracting every identifier. Removed
-    lines and hunk headers describe the vulnerable version; added-only helper
-    names are excluded later by `_existed_before_fix`. The result is a search
-    candidate, not a verdict about the application.
-    """
+    """Extract pre-existing function/class names from a fix diff."""
     pattern = _DIFF_DECLARATIONS.get((ecosystem or "").strip().lower())
     if not diff or pattern is None:
         return []
@@ -397,17 +319,7 @@ _LAST_RESORT_SCHEMA = {
 
 
 def _carry_context(base: VulnerableSymbol, fallback: VulnerableSymbol) -> VulnerableSymbol:
-    """Move what the model established onto a symbol that replaced its name.
-
-    Only the *name* comes from the fallback. Everything else the extraction
-    produced still holds — above all the exploitation precondition, which is a
-    statement about the flaw and not about which function carries it.
-
-    Losing it was measured, and it made verdicts irreproducible: two runs of one
-    project closed six findings and then one, because whether the model's name
-    survived the corroboration checks decided whether the precondition survived
-    with it. A closure must not depend on that.
-    """
+    """Move what the model established onto a symbol that replaced its name."""
     fallback.precondition = base.precondition
     fallback.precondition_quote = base.precondition_quote
     fallback.precondition_problem = base.precondition_problem
@@ -426,13 +338,7 @@ def _carry_context(base: VulnerableSymbol, fallback: VulnerableSymbol) -> Vulner
 
 
 def _named_candidates(advisory: Advisory) -> VulnerableSymbol | None:
-    """The description's own function names, as things to search for.
-
-    Used where no database curated a symbol list — npm above all, where the name
-    is published in the prose or nowhere. These are candidates and are labelled
-    as such: the same backticks wrap option names and internals, so a hit is
-    worth something and a miss is worth nothing.
-    """
+    """The description's own function names, as things to search for."""
     names = [n for n in advisory.named_symbols if n]
     if not names or len(names) > _MAX_LISTED:
         return None
@@ -451,31 +357,11 @@ def _named_candidates(advisory: Advisory) -> VulnerableSymbol | None:
 
 
 def _listed_symbols(advisory: Advisory) -> VulnerableSymbol | None:
-    """The advisory's own symbol list, turned into things to search for.
-
-    `None` means the list is there but cannot be used, and the diff-reading path
-    should run instead. Three filters stand between the raw list and a search:
-
-    - **Symbols of other modules are dropped.** A flaw in `x/net/http2` is listed
-      together with the `net/http` entry points that reach it; those belong to
-      the standard library, and searching for `http.Client.Do` would match every
-      Go program ever written.
-    - **Unexported names are dropped.** `ssh.connection.serverAuthenticate` is
-      real and is genuinely vulnerable, but no code outside the module can name
-      it, so its presence in a repository is not a question worth asking.
-    - **A list that survives all that and is still enormous is refused.** One
-      advisory lists 262 symbols; a set that broad matches any project and would
-      turn "found" into a coin toss.
-
-    Nothing here calls the model or the network: the answer was published.
-    """
+    """The advisory's own symbol list, turned into things to search for."""
     prefix = (advisory.package or "").strip("/")
     candidates: list[tuple[str, str]] = []
     foreign = 0
     for entry in advisory.symbols:
-        # The import path ends at the first dot after the last slash: splitting
-        # on the last dot instead puts the receiver into the path, and every
-        # `github.com/...` package is then read as belonging to someone else.
         cut = entry.find(".", entry.rfind("/") + 1)
         path, name = (entry[:cut], entry[cut + 1:]) if cut > 0 else ("", entry)
         if prefix and not (path == prefix or path.startswith(prefix + "/")):
@@ -500,10 +386,6 @@ def _listed_symbols(advisory: Advisory) -> VulnerableSymbol | None:
         advisory_id=advisory.advisory_id, package=advisory.package,
         aliases=tuple(advisory.aliases), function=function, klass=klass,
         candidates=tuple(candidates), listed_in_advisory=True, grounded_in_fix=True,
-        # The import paths travel with the symbol: a named function still has to
-        # live in a package the project imports, and this early return is the
-        # path every Go advisory with listed symbols takes. Leaving them off made
-        # the check silently inapplicable exactly where it was needed.
         package_paths=tuple(advisory.import_paths),
         evidence=f"ecosystem_specific.imports: {', '.join(advisory.symbols[:8])}"[:300],
         source_stage="osv",
@@ -516,7 +398,7 @@ def _listed_symbols(advisory: Advisory) -> VulnerableSymbol | None:
 
 
 class SymbolResolver:
-    """Advisory in, symbol out. One model call, two when the name is not found."""
+    """Advisory in, symbol out."""
 
     def __init__(self, client, *, roots: list[Path] | None = None) -> None:
         self._client = client
@@ -524,13 +406,7 @@ class SymbolResolver:
         self._sources: dict[tuple[str, str, str], dict[str, str]] = {}
 
     def _source_for(self, ecosystem: str, package: str, version: str = "") -> dict[str, str]:
-        """The installed package, read once per run and only when it is there.
-
-        Held per process and thrown away with it: advisories cluster hard on a
-        few packages — 53 CVEs across 16 packages on one real project — and
-        re-reading the same directory once per CVE is pure waste. An empty
-        result is not remembered, so a tree that appears later is still seen.
-        """
+        """The installed package, read once per run and only when it is there."""
         key = (ecosystem.lower(), package.lower(), version)
         cached = self._sources.get(key)
         if cached:
@@ -560,20 +436,7 @@ class SymbolResolver:
         return (answer.get("vulnerable_function") or "").split("::")[-1].strip().rstrip("()")
 
     def _last_resort(self, advisory: Advisory, version: str) -> VulnerableSymbol | None:
-        """Ask the model to name the package's public entry points.
-
-        The step of last resort, and deliberately a different question from the
-        one asked earlier: not "which function is the flaw" — every source for
-        that has already failed — but "which exported functions would reach it".
-        A private helper is the flaw often enough, and no application calls a
-        private helper, so its name would find nothing anyway.
-
-        What comes back is a **search candidate and nothing more**. It carries no
-        corroboration — no diff confirmed it, no database listed it — so it can
-        open a finding for examination but must never close one. The invariant
-        holds: a closure still needs a fact, and "the model named this" is not
-        one.
-        """
+        """Ask the model to name the package's public entry points."""
         if self._client is None:
             return None
         prompt = "\n".join([
@@ -614,13 +477,7 @@ class SymbolResolver:
     def _context_resort(
         self, advisory: Advisory, version: str, diff: str, diff_url: str,
     ) -> VulnerableSymbol | None:
-        """Ask the model to recover the advisory context when extraction stalled.
-
-        This is deliberately not a verdict prompt. It may say that the whole
-        package, a file, or a runtime action is affected; it must not say that
-        the current application is vulnerable. The returned search targets are
-        leads for the mechanical project search and are never closure evidence.
-        """
+        """Ask the model to recover the advisory context when extraction stalled."""
         if self._client is None:
             return None
         schema = {
@@ -697,8 +554,6 @@ class SymbolResolver:
         if not names and scope == "function":
             scope = "unknown"
         if names and scope == "package":
-            # A package-wide advisory has no narrower symbol. When the agent
-            # actually identified a function, retain the more useful scope.
             scope = "function"
         klass = (str(symbols[0].get("class") or "").split("\\")[-1].strip()
                  if symbols else "")
@@ -736,12 +591,6 @@ class SymbolResolver:
             if listed is not None:
                 return listed
         if advisory.import_paths and not advisory.symbols and not advisory.fix_refs:
-            # A package-level advisory: the whole package is unsafe, there is no
-            # vulnerable function and no fix to read one from. Nothing to ask the
-            # model for the normal deterministic path — the finding is decided
-            # downstream by whether the vulnerable import path is used, not by
-            # any call. The generic context fallback still gets a chance before
-            # this package-level result is returned.
             context = self._context_resort(advisory, version, "", "")
             if context is not None:
                 return context
@@ -792,10 +641,6 @@ class SymbolResolver:
             grounded = _in_text(name, diff) or _in_text(name, advisory.text)
             changed = _quotes_a_changed_line(answer.get("evidence"), diff)
 
-        # A file is not a function. Measured on lodash, whose whole package is
-        # one bundled `lodash.js`: asked for the vulnerable function against
-        # that diff, the model answered with the file name, the search looked
-        # for `lodash.js` in first-party code and of course found nothing.
         if name and _LOOKS_LIKE_A_FILE.search(name):
             answer["vulnerable_file"] = answer.get("vulnerable_file") or name
             name = ""
@@ -808,9 +653,6 @@ class SymbolResolver:
         base.file = path
         base.evidence = (answer.get("evidence") or "")[:300]
         if diff_names:
-            # npm advisories often fix several equivalent entry points. Keep the
-            # model's grounded answer first, but search every deterministic name
-            # extracted from the affected hunk as well.
             all_names = [name] + [candidate for candidate in diff_names if candidate != name]
             base.candidates = tuple((candidate, "") for candidate in all_names)
             base.source_stage = "diff"
@@ -826,11 +668,6 @@ class SymbolResolver:
         base.quotes_a_changed_line = bool(name) and changed
         base.declared_in_installed = declared
         base.existed_before_fix = existed
-        # A precondition is kept only when the advisory can be shown to state it.
-        # It is the one closure whose ground was written by the model rather than
-        # read from something, and it was measured to be the least reproducible:
-        # the same finding closed on one run and stayed open on the next two,
-        # with nothing different but how the sentence came out.
         condition = (answer.get("precondition") or "").strip()[:300]
         quote = (answer.get("precondition_quote") or "").strip()
         if condition and not _quotes_the_advisory(quote, advisory.text):
@@ -877,16 +714,6 @@ class SymbolResolver:
         if not name and not path:
             base.note = base.note or (answer.get("why") or "")[:200]
 
-        # Last, and only when nothing survived: the description's own names.
-        # Placed here rather than beside the model call because the checks above
-        # reject an answer *after* it is given — on lodash the model named a
-        # function the fix diff did not corroborate, the name was cleared, and
-        # what reached the search was the file `lodash.js`, which no first-party
-        # code calls. A rejected name and a missing name need the same fallback.
-        # The model has the complete advisory and fix material, so ask it to
-        # recover package/file/action context before asking the narrower public
-        # entry-point question. This is the npm escape hatch for package-level
-        # advisories and advisories whose symbol is only implicit in the diff.
         if not base.function and not base.not_distributed:
             context = self._context_resort(advisory, version, diff, diff_url)
             if context is not None and (context.function or context.file or context.scope != "unknown"):
@@ -901,10 +728,6 @@ class SymbolResolver:
             if named is not None:
                 return _carry_context(base, named)
 
-        # Nothing deterministic produced a name. Ask the model for the package's
-        # public entry points rather than leaving the finding with nothing to
-        # search for — an unsearched finding goes to a person, and a person with
-        # no name to look for is no better off than the tool was.
         if not base.function and not base.not_distributed:
             guessed = self._last_resort(advisory, version)
             if guessed is not None:

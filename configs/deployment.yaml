@@ -34,6 +34,18 @@ facts:
   # контейнеру только через kubectl exec. Решение владельца платформы: SSH внутри
   # сервиса — антипаттерн, SSH-уязвимости к сервисам не относятся.
   no_ssh_in_workloads: true
+  # Host kernel, firmware, hypervisor and node/container runtime are owned by
+  # the platform. These components are attached to the machine, not the pod.
+  host_platform_owned: true
+  # Workloads do not own desktop devices or host peripherals.
+  no_gui_or_hardware_in_workloads: true
+  # Фреймворки, на которых не написан ни один сервис. Ставьте true только за те,
+  # в которых уверены: факт здесь закрывает находки. Соответствующая запись в
+  # out_of_scope_components несёт markers — если фреймворк всё-таки окажется в
+  # коде или образе, закрытие останется, но в отчёт уйдёт пометка с файлом и
+  # строкой, и станет видно, что факт устарел.
+  no_laravel_in_projects: true
+  no_react_in_projects: true
 
 # Компоненты, которых в сервисах платформы нет по решению её владельца. CVE,
 # эксплуатируемая ТОЛЬКО через такой компонент, закрывается сразу — до поиска в
@@ -54,6 +66,54 @@ out_of_scope_components:
     keywords: [ssh, sshd, sftp]
     markers: ["golang.org/x/crypto/ssh", "NewServerConn", "ssh2", "paramiko", "openssh", "sshd", "containerPort: 22"]
     why: "SSH в подах Kubernetes не используется ни сервером, ни клиентом — антипаттерн, доступ к контейнеру только через kubectl exec"
+  - id: host_platform
+    requires: host_platform_owned
+    owner: platform-security
+    describe: >-
+      Host and node components: Linux kernel, kernel modules, eBPF, syscalls,
+      device drivers, firmware, BIOS/UEFI, bootloaders, hypervisors, VM/container
+      escape, systemd/udev, cgroups/namespaces, and the container runtime.
+      These are attached to the machine or node, not to the application pod.
+    keywords: [kernel, eBPF, syscall, firmware, BIOS, UEFI, bootloader, hypervisor, "VM escape", "container escape", systemd, udev, cgroup, namespace, runc, containerd, kubelet, etcd]
+    markers: ["/proc/", "/sys/", "CAP_SYS_ADMIN", "privileged: true", "hostPID: true", "hostNetwork: true"]
+    why: "уязвимость относится к машине, node или container runtime; это зона platform-security, а не приложения в pod"
+  - id: laravel
+    requires: no_laravel_in_projects
+    describe: >-
+      The Laravel framework and its Illuminate components: Laravel routing,
+      Eloquent, Blade templates, the artisan console, the service container,
+      queues and Horizon. Counts only when Laravel's own framework code is the
+      sole path to the flaw. A flaw in a general-purpose library that merely
+      mentions Laravel as one way to reach it does NOT count — that is a
+      precondition to check, not a framework this platform does not run.
+    keywords: [laravel, illuminate, blade, eloquent, artisan, horizon]
+    markers: ["laravel/framework", "Illuminate\\", "laravel/", "artisan", "config/app.php", "Blade::"]
+    why: "ни один сервис не написан на Laravel; уязвимость только во фреймворке Laravel к этим сервисам не относится"
+  - id: react
+    requires: no_react_in_projects
+    describe: >-
+      The React UI library and its immediate ecosystem: React DOM, React Native,
+      the JSX runtime, React server components. Counts only when React's own
+      rendering is the sole path to the flaw. A flaw in a general-purpose
+      JavaScript library that happens to be popular with React does NOT count.
+    keywords: [react, "react-dom", "react-native", jsx, preact]
+    markers: ["\"react\":", "from 'react'", "from \"react\"", "react-dom", "ReactDOM", ".jsx", ".tsx"]
+    why: "ни один сервис не рендерит React; уязвимость только в React к этим сервисам не относится"
+  # Добавляя фреймворк сюда, добавьте и факт выше — без факта запись неактивна.
+  # Шаблон: id, requires, describe (что именно считается этим фреймворком и что
+  # НЕ считается), keywords (дешёвый префильтр по тексту advisory), markers
+  # (признаки, что он всё же есть), why. Кандидаты, если они у вас не в ходу:
+  # angular, vue, nuxt, next, django, flask, rails, wordpress, drupal, magento.
+  - id: gui_or_hardware
+    requires: no_gui_or_hardware_in_workloads
+    owner: platform-security
+    describe: >-
+      Desktop GUI and physical peripherals such as X11/Wayland, GTK/Qt,
+      clipboard, printers, cameras, microphones, audio, and touchscreen are not
+      present in the workload.
+    keywords: [GUI, "graphical user interface", X11, Wayland, GTK, Qt, printer, CUPS, webcam, camera, microphone, audio, touchscreen]
+    markers: [DISPLAY, WAYLAND_DISPLAY, /dev/video, /dev/snd, /dev/dri]
+    why: "в pod нет desktop GUI и физических устройств; это не runtime приложения"
 
 # Правила сканеров, которые платформа закрывает по существу. Только те, где
 # проверка буквально не о приложении. Каждая запись обязана назвать факт выше,

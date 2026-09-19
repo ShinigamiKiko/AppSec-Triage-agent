@@ -31,11 +31,7 @@ class ChainSupport:
         self._reachability = reachability
         self._databases = {str(k).lower(): Path(v)
                            for k, v in (codeql_databases or {}).items()}
-        # Resolved the way the SAST scanner resolves it. A bare "codeql" worked
-        # only where the CLI is on PATH; elsewhere the database existed, the
-        # query never started, and every dataflow answer read "not checked".
         self._codeql_binary = codeql_binary
-        # PHP has no CodeQL; Psalm answers the same questions there, when it is installed.
         self._psalm_binary = psalm_binary
         self._dataflow: dict[tuple[str, tuple], codeql_reach.Answer] = {}
         self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
@@ -46,8 +42,11 @@ class ChainSupport:
         self._graphs: dict[str, DependencyGraph] = {}
         self._wirings: dict[str, container_mod.Wiring] = {}
         self._exploit = exploit_mod.ExploitabilityService()
+        self._symbols: dict[tuple[str, str], object] = {}
+        self._batched: dict[tuple[str, str], tuple[codeql_api.ApiAnswer, frozenset[str]]] = {}
         self.stats = {"resolved": 0, "called": 0, "absent": 0,
-                      "not_distributed": 0, "undecided": 0, "out_of_scope": 0}
+                      "not_distributed": 0, "undecided": 0, "out_of_scope": 0,
+                      "unaudited_closures": 0, "version_unaffected": 0}
 
     @staticmethod
     def _identifiers(finding) -> list[str]:
@@ -118,13 +117,7 @@ class ChainSupport:
         return _walk_as_bridge(walk), (_pairs(walk.targets) or default), through
 
     def _once(self, cache: dict, key, compute):
-        """(value, was_cached): run `compute` once per key without holding the lock while it runs.
-
-        The analysers take seconds to minutes per question. Holding one lock
-        across them serialised every finding in the run; now only the same
-        question waits for the thread already asking it, and different questions
-        run side by side.
-        """
+        """(value, was_cached): run `compute` once per key without holding the lock while it runs."""
         token = (id(cache), key)
         while True:
             with self._dataflow_lock:
@@ -147,18 +140,11 @@ class ChainSupport:
 
     def _package_usage(self, dependency, package: str, *,
                        record: list[str] | None = None) -> tuple[bool | None, str, bool]:
-        """(used, detail, test_only): is the package imported by production code, not only by tests.
-
-        CodeQL answers where a database exists: an import it resolved is a real
-        `require`/`import`, never a comment or a string. Its silence is checked
-        against the text search, because a dynamic `require` is invisible to it —
-        a use written in production code keeps the package counted as used.
-        """
+        """(used, detail, test_only): is the package imported by production code, not only by tests."""
         root = self._roots[0]
         ecosystem = dependency.ecosystem or ""
         text_used, text_detail, text_test_only = presence_mod.package_usage(root, ecosystem, package)
         language = _CODEQL_LANGUAGE.get(ecosystem.strip().lower())
-        # Only a CodeQL database lists imports; for PHP (Psalm) the text search above answers.
         if not package or language not in codeql_api.SUPPORTED or language not in self._databases:
             return text_used, text_detail, text_test_only
 
@@ -192,11 +178,7 @@ class ChainSupport:
                 and (self._roots[0] / "vendor" / "autoload.php").is_file())
 
     def _qualify_php_pairs(self, package: str, pairs) -> list[tuple[str, str]]:
-        """Give each bare or short PHP method name the fully qualified classes that declare it.
-
-        A name no installed class declares is kept as it came, so nothing that
-        was searched before stops being searched.
-        """
+        """Give each bare or short PHP method name the fully qualified classes that declare it."""
         pairs = list(pairs)
         bare = [function for function, klass in pairs if function and (not klass or "\\" not in klass)]
         declared = psalm_api.qualify(self._roots[0], package, bare) if bare and self._roots else {}
@@ -214,9 +196,14 @@ class ChainSupport:
     def _engine_name(self, dependency) -> str:
         return psalm_api.ENGINE if self._uses_psalm(dependency) else "CodeQL"
 
+    def _api_hint(self, dependency, package: str) -> str:
+        """The installed PHP package's public methods, for the model's choice of questions."""
+        if not self._uses_psalm(dependency) or not self._roots:
+            return ""
+        return psalm_api.public_api(self._roots[0], package)
+
     def _codeql_api_available(self, dependency) -> bool:
-        """Whether an engine this chain may query answers for the dependency's language:
-        a CodeQL database for JavaScript, Psalm with an installed vendor tree for PHP."""
+        """Whether an engine this chain may query answers for the dependency's language: a CodeQL database for JavaScript, Psalm with an installed vendor tree for PHP."""
         if self._uses_psalm(dependency):
             return True
         language = _CODEQL_LANGUAGE.get((dependency.ecosystem or "").strip().lower())
@@ -242,16 +229,35 @@ class ChainSupport:
             log.info("psalm call: %s", entry)
         return answer
 
+    def _advisory_for(self, finding, dependency):
+        """The advisory for this finding, fetched once per package and version."""
+        identifiers = self._identifiers(finding)
+        key = (identifiers[0] if identifiers else "", dependency.package or "",
+               dependency.ecosystem or "", dependency.installed_version or "")
+        advisory, _ = self._once(self._advisories, key,
+                                 lambda: adv.collect(*key, nvd_api_key=self._nvd_api_key))
+        return advisory
+
+    def _resolve_symbol(self, advisory, version: str):
+        """The vulnerable symbol for this advisory, resolved once per run."""
+        key = (str(getattr(advisory, "advisory_id", "") or ""), version or "")
+        symbol, _ = self._once(self._symbols, key, lambda: self._resolver.resolve(advisory, version))
+        return symbol
+
+    def _imports_absent(self, language: str, package: str) -> bool:
+        """CodeQL resolved no import of this package anywhere in the project."""
+        if not package or language not in codeql_api.SUPPORTED or language not in self._databases:
+            return False
+        answer, _ = self._once(self._import_answers, (language, package), lambda: codeql_api.run_imports(
+            self._databases[language], package, self._roots[0], binary=self._codeql_binary))
+        return answer.usable and not answer.sites
+
     def _codeql_api_for(self, dependency, package: str, pairs, *,
                         record: list[str] | None = None,
                         asked_by: str = "цепочка") -> codeql_api.ApiAnswer | None:
+        """CodeQL's answer for these functions of `package`, or None when it cannot be asked."""
         if self._uses_psalm(dependency):
             return self._psalm_api_for(dependency, package, pairs, record=record, asked_by=asked_by)
-        """CodeQL's answer for these functions of `package`, or None when it cannot be asked.
-
-        `record` collects one line per question, so the finding's record says
-        what CodeQL was asked and what it answered, not only the verdict built on it.
-        """
         language = _CODEQL_LANGUAGE.get((dependency.ecosystem or "").strip().lower())
         database = self._databases.get(language or "")
         if database is None or language not in codeql_api.SUPPORTED or not self._roots or not package:
@@ -261,6 +267,27 @@ class ChainSupport:
                                key=lambda t: (t.function, t.klass)))
         if not targets:
             return None
+        if self._imports_absent(language, package):
+            if record is not None:
+                entry = (f"{asked_by} → CodeQL API пакета {package} "
+                         f"({', '.join(t.label for t in targets)}): не запрошен — импортов пакета нет, "
+                         "вызову неоткуда взяться")
+                record.append(entry)
+                log.info("codeql call skipped: %s", entry)
+            return codeql_api.ApiAnswer()
+        batched = self._batched.get((language, package))
+        if batched is not None:
+            shared, covered = batched
+            labels = [t.label for t in targets]
+            if all(label in covered for label in labels):
+                if record is not None:
+                    entry = (f"{asked_by} → CodeQL API пакета {package} ({', '.join(labels)}): "
+                             + "; ".join(f"{label}: вызовов {len(shared.calls.get(label, []))}"
+                                         for label in labels)
+                             + " (из общего запроса прогона)")
+                    record.append(entry)
+                    log.info("codeql call: %s", entry)
+                return shared
         answer, cached = self._once(self._api_answers, (language, targets), lambda: codeql_api.run(
             database, list(targets), self._roots[0], binary=self._codeql_binary))
         if record is not None:

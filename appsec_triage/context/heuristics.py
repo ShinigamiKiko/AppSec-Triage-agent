@@ -1,14 +1,4 @@
-"""Pre-check layer: cheap, deterministic, runs before any token is spent.
-
-Two jobs:
- 1. Produce `HeuristicSignal`s that go *into* the evidence package, so the model
-    reasons over facts rather than re-deriving them from raw text.
- 2. Optionally short-circuit obvious garbage entirely (`hard_fp`), which is the
-    difference between paying for 746 findings and paying for 300.
-
-Every signal carries a direction, which post-validation later uses to catch a
-model that closed a high-entropy literal as a "test placeholder".
-"""
+"""Pre-check layer: cheap, deterministic, runs before any token is spent."""
 
 from __future__ import annotations
 
@@ -156,11 +146,7 @@ def _noisy_zone(path: str, patterns: list[str]) -> tuple[bool, str | None]:
 
 
 def _is_test_path(path: str) -> bool:
-    """Identify code that is not part of the production artifact.
-
-    The list is the one in prompts/training-context.md, shared with the prompts
-    and the dependency chain, so the three cannot disagree about what a test is.
-    """
+    """Identify code that is not part of the production artifact."""
     return is_test(path)
 
 

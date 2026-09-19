@@ -1,22 +1,4 @@
-"""A credential-shaped value is a fact, not a judgement.
-
-Two things make this class different from every other one the pipeline handles.
-
-**Reachability is irrelevant.** A key committed to a repository has leaked
-whether or not any code path reaches it. Asking "is it used" answers a question
-nobody needs: the remediation is rotation either way.
-
-**Being wrong is asymmetric.** Calling a live key a placeholder hides a leak
-until someone else finds it. Calling a placeholder live costs one glance. So the
-only judgement made here is the one that can be made deterministically — a
-dictionary word, a known template marker, a short low-entropy string is a
-placeholder; anything else is reported as what it is and handed to a human with
-the two questions that actually settle it.
-
-No model call. The value never leaves the process, which also means it cannot
-end up in a hosted provider's request log — the failure this whole class is
-about.
-"""
+"""A credential-shaped value is a fact, not a judgement."""
 
 from __future__ import annotations
 
@@ -39,12 +21,7 @@ _MIN_KEY_ENTROPY = 3.5
 
 
 def classify(value: str | None) -> tuple[str, str]:
-    """(verdict, why) for a flagged literal, decided without a model.
-
-    `placeholder` closes the finding. `credential` reports it. `unclear` is for
-    values that are neither obviously one nor the other — short but random, or
-    long but wordy — and goes to a human rather than being guessed at.
-    """
+    """(verdict, why) for a flagged literal, decided without a model."""
     if value is None:
         return "unclear", "the scanner reported no value to judge"
 
@@ -79,15 +56,7 @@ def classify(value: str | None) -> tuple[str, str]:
 
 
 def flagged_value(snippet: str | None, line_hint: str | None = None) -> str | None:
-    """The literal on the flagged line, if the line has the shape of an assignment.
-
-    Two forms, and the order matters. A quoted literal is taken as written. An
-    unquoted one is everything to the end of the line, which is what a config
-    file means — an earlier version stopped at the first bracket and read
-    `%env(MAILER_URL)%` as nothing at all, then reported "no value to judge"
-    about a line that plainly had one. The empty assignment is a real answer too:
-    `APP_SECRET=` holds no credential, and saying so closes the finding.
-    """
+    """The literal on the flagged line, if the line has the shape of an assignment."""
     if not snippet:
         return None
     for line in (line_hint or snippet).splitlines():
@@ -102,15 +71,7 @@ _SEGMENTS = re.compile(r"[._/\\@:-]+")
 
 
 def _looks_like_identifier(value: str) -> bool:
-    """Is this a name rather than a generated secret?
-
-    Entropy alone cannot tell them apart: `check_credentials` (17 chars) and
-    `c66P9yWptBX79edHcglIw7NFyse35be` (31 chars, a real hardcoded HMAC key)
-    score similarly. Structure can. A name is made of dictionary segments joined
-    by delimiters; a generated key has no such seams — measured on a real
-    project this rejected constant names, route paths, fully-qualified class
-    names and container references while keeping every actual key.
-    """
+    """Is this a name rather than a generated secret?"""
     if value.startswith(("/", "@", "\\", "./", "%", "$")) or "\\" in value:
         return True
     if re.search(r"\.(php|ya?ml|json|xml|twig|html?|js|ts|png|jpe?g|svg|sql|txt|md)$", value, re.IGNORECASE):
@@ -124,10 +85,5 @@ def _looks_like_identifier(value: str) -> bool:
 
 
 def _reads_as_a_word(value: str) -> bool:
-    """Letters, optionally with a trailing counter — `minio123`, `local`, `admin1`.
-
-    A generated credential interleaves case and digits (`Xk92mPqRs7`); a typed
-    default does not. That difference is what makes it safe to close the short
-    values, and unsafe to close them on length alone.
-    """
+    """Letters, optionally with a trailing counter — `minio123`, `local`, `admin1`."""
     return bool(re.fullmatch(r"[A-Za-z]+[0-9]{0,4}", value))

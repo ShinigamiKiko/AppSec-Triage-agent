@@ -1,9 +1,4 @@
-"""`doctor`: can this machine actually run a scan, and what is missing?
-
-Separate from the CLI because the answer is about the environment, not about
-argument parsing — and because it is the first thing to run in a container
-before anything is spent on inference.
-"""
+"""`doctor`: can this machine actually run a scan, and what is missing?"""
 
 from __future__ import annotations
 
@@ -66,12 +61,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
 
 def _doctor_sca() -> None:
-    """The dependency half, which has its own toolchain and its own failure.
-
-    cdxgen was load-bearing and unmentioned here: an operator could read a clean
-    `doctor`, run a scan, and get a report where every package looked direct
-    because the graph was never built.
-    """
+    """The dependency half, which has its own toolchain and its own failure."""
     from .sca import sbom
 
     print("зависимости (SCA):")
@@ -87,10 +77,7 @@ def _doctor_sca() -> None:
 
 
 def _doctor_php() -> None:
-    """PHP is the one language whose cross-function analysis lives entirely in the
-    toolchain checked here: no CodeQL, so phpactor (LSP) and Psalm (taint) are it.
-    A silent gap here is why every CWE-89 finding once landed in `unknown`, so the
-    diagnostics are explicit rather than folded into the generic scanner probe."""
+    """PHP is the one language whose cross-function analysis lives entirely in the toolchain checked here: no CodeQL, so phpactor (LSP) and Psalm (taint) are it."""
     print("php toolchain (for PHP targets — phpactor is load-bearing, PHP has no CodeQL):")
 
     php = shutil.which("php")

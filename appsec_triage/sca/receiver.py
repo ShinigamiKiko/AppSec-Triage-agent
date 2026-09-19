@@ -1,20 +1,4 @@
-"""Which class an unbound call actually lands on, asked of the language server.
-
-`$this->decorated->onAuthenticationFailure(...)` is a real call whose receiver is
-declared as an interface, and `$container->getParameter('roles')` is a real call
-to something entirely unrelated to the advisory. Textually the two are
-identical, and no list of common method names separates them — the list is never
-complete, and it was measured failing on exactly this pair.
-
-A language server answers it directly: ask where the method at this position is
-defined. If the definition is the advisory's class, the call is the vulnerable
-one. If it is a different class, the name collided and the finding drops.
-
-The honest limit, stated rather than hidden: without an installed dependency
-tree there is nothing for the server to index, so definitions inside libraries
-cannot be found. That leaves the question open — which is what it was — and the
-reason recorded says which of the two situations it is.
-"""
+"""Which class an unbound call actually lands on, asked of the language server."""
 
 from __future__ import annotations
 
@@ -34,6 +18,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger(__name__)
 
+
+def _count(lsp, key: str) -> None:
+    """Tally an LSP question the chain asked, for the run's language-server line."""
+    stats = getattr(lsp, "stats", None)
+    if isinstance(stats, dict):
+        stats[key] = stats.get(key, 0) + 1
+
 _MAX_HITS = 8
 
 
@@ -44,15 +35,7 @@ class Resolution:
     answered: int = 0
     detail: str = ""
     settled: bool = False
-    """This answer decides the question; nothing further should be consulted."""
     disproved: bool = False
-    """The server resolved every call site, and none lands in the flawed package.
-
-    A positive fact, not an absence: the receiver's type is known and it is a
-    different type. `json.NewDecoder(...).Decode(x)` matches an advisory about
-    `pgx.Bind.Decode` by name alone, and only a resolver can say the receiver is
-    `encoding/json`'s decoder — which settles the finding rather than doubting it.
-    """
 
 
 def _definition_class(location: dict, path_map: dict[str, str] | None = None) -> tuple[str, str]:
@@ -86,12 +69,7 @@ def _receiver_expression(text: str) -> str:
 def _by_configuration(
     result: PresenceResult, root: Path, klass: str, wiring
 ) -> Resolution | None:
-    """The container's own answer, where the application states it.
-
-    Tried before the language server because it is exact where it applies: the
-    configuration names the class, it does not infer it. The server was measured
-    answering two of five positions and one of those wrongly.
-    """
+    """The container's own answer, where the application states it."""
     if wiring is None or not wiring.usable:
         return None
 
@@ -177,13 +155,7 @@ def _context(root: Path, hit: Hit, klass: str, package: str, wiring) -> str:
 def _by_model(
     result: PresenceResult, root: Path, klass: str, package: str, wiring, client
 ) -> Resolution | None:
-    """Ask the model to read the call the way a reviewer would.
-
-    A type resolver answers syntactically and gives up on containers, factories
-    and magic accessors — measured at two answers out of five positions, one of
-    them wrong. Reading the file settles most of those, so the model is asked,
-    and every answer must quote the material verbatim or it is discarded.
-    """
+    """Ask the model to read the call the way a reviewer would."""
     if client is None:
         return None
 
@@ -241,19 +213,10 @@ def resolve(
     if settled is not None:
         return settled
 
-    # The language server before the model, not after. Both answer the same
-    # question — which class the receiver has — but the server reads the code and
-    # the model guesses, and a guess that runs first makes the answer change from
-    # run to run: measured on a Go project, the same finding came back `actual`
-    # in one run and `no_direct_call` in the next because the model, not gopls,
-    # was deciding. Deterministic evidence leads; the model only fills the gap
-    # the server leaves.
     answer = _by_lsp(result, lsp, Path(root), klass, package, package_dir)
     if answer.settled:
         return answer
 
-    # The server could not say; `answer` carries why, and stays the fallback so
-    # that reason reaches the report when the model cannot say either.
     return _by_model(result, Path(root), klass, package, wiring, client) or answer
 
 
@@ -272,19 +235,7 @@ def _by_lsp(
     result: PresenceResult, lsp: LSPService | None, root: Path, klass: str,
     package: str, package_dir: Path | None = None,
 ) -> Resolution:
-    """Resolve the receiver by asking the language server for the definition.
-
-    Where the definition *lands* is the test, not what the file is called. A
-    method name is shared across libraries — `Decode`, `Append`, `Receive` — so
-    the only question that separates them is whether the resolved definition sits
-    inside the flawed package's own tree. Measured: five call sites matching an
-    advisory about `pgx.Bind.Decode` all resolved into `encoding/json`, which the
-    file-stem comparison could only call "another class", and which the location
-    test calls what it is — a different library.
-
-    Always returns a `Resolution`; `settled` says whether it decides the question
-    or is merely the record of why the server could not answer.
-    """
+    """Resolve the receiver by asking the language server for the definition."""
     if lsp is None:
         return Resolution(result, detail="языковой сервер не подключён")
 
@@ -307,21 +258,17 @@ def _by_lsp(
         path = root / hit.file
         try:
             client.open_document(path, language)
-            # `definition` takes a 1-indexed line and converts it itself, the
-            # same as every other caller. Subtracting here as well asked the
-            # server about the line *above* the call, where the column usually
-            # lands on nothing — measured as "asked 8 times, zero definitions",
-            # which reads as a server that cannot resolve rather than a question
-            # about the wrong place.
             locations = client.definition(path, hit.line, max(hit.column, 0)) or []
         except Exception as exc:  # noqa: BLE001 - one dead request, not the run
             log.debug("definition failed at %s:%s: %s", hit.file, hit.line, exc)
             continue
 
         asked += 1
+        _count(lsp, "sca_asked")
         if not locations:
             continue
         answered += 1
+        _count(lsp, "sca_answered")
         path_map = lsp._path_map_for(language)
         landed_away = False
         for location in locations:
@@ -329,13 +276,7 @@ def _by_lsp(
             if not name:
                 continue
             if Path(where).resolve() == (root / hit.file).resolve():
-                # The server handed back the call site itself. Measured on
-                # symfony/demo: that is the shape of "could not resolve", not
-                # evidence about the type, so it must not count toward a closure.
                 continue
-            # A definition inside the flawed package proves the receiver's type;
-            # the class-name comparison stays as a fallback for the ecosystems
-            # where the file is named after the class it declares.
             if _inside(where, package_dir) or name.lower() == klass.lower():
                 matched.append(hit)
                 landed_away = False
@@ -353,10 +294,6 @@ def _by_lsp(
             asked, answered, settled=True,
             detail=f"разрешено определений: {answered} из {asked}")
 
-    # Disproved only when nothing was left unanswered: every call site the server
-    # was asked about resolved, and every one landed outside the flawed package.
-    # A single unresolved site keeps the finding open — a partial answer cannot
-    # rule out that the one site we could not read is the real call.
     complete = considered and asked == considered and answered == considered
     if elsewhere and complete and resolved_away == considered and package_dir is not None:
         return Resolution(

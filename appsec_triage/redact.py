@@ -1,23 +1,4 @@
-"""Send a secret's shape to the model, never the secret.
-
-Triaging a hardcoded credential means answering "is this a live key or a
-placeholder". That question is settled by the *shape* of the value — its length,
-its alphabet, how random it looks — together with its name and the file it sits
-in. The characters themselves add nothing to the judgement.
-
-They do add risk. On a real project the flagged lines held 32- and 64-character
-signing keys and OAuth secrets; sending those to a hosted model puts live
-credentials into a third party's request logs, which is the sort of thing a
-security tool should not do while looking for exactly that problem.
-
-So high-entropy values are replaced with a description of themselves before the
-package is rendered. Low-entropy ones are left alone on purpose: `toor`,
-`changeme` and `local` are *evidence of being a placeholder*, and hiding them
-would remove the very thing that closes the finding.
-
-Redaction happens in the evidence package, so grounding still works — the model
-quotes the redacted line, and that line is what the checker compares against.
-"""
+"""Send a secret's shape to the model, never the secret."""
 
 from __future__ import annotations
 
@@ -51,7 +32,7 @@ def _describe(value: str) -> str:
 
 
 def redact_secrets(text: str | None) -> tuple[str | None, int]:
-    """Replace high-entropy assigned values with a description. Returns the count."""
+    """Replace high-entropy assigned values with a description."""
     if not text:
         return text, 0
 

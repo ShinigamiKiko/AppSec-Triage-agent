@@ -1,16 +1,4 @@
-"""Detect the frameworks in play, so the model can reason with their conventions.
-
-The gap this closes is real and was measured: on a Symfony project six of
-fifteen `unknown` verdicts were `%env(resolve:DB_PASSWORD)%` — a placeholder the
-container resolves at compile time, with no secret anywhere in the repository.
-Deterministic signals can flag that pattern, but a signal only says "this is a
-template". A model that understands *why* Symfony works that way can also judge
-the cases nobody wrote a regex for.
-
-Detection is deliberately dumb: marker files plus a substring. Guessing a stack
-wrong is worse than not guessing, so the checks are narrow and a miss simply
-means no stack section is added.
-"""
+"""Detect the frameworks in play, so the model can reason with their conventions."""
 
 from __future__ import annotations
 
@@ -100,13 +88,7 @@ def detect(roots: list[Path]) -> list[StackProfile]:
 
 
 def render(profiles: list[StackProfile]) -> str:
-    """The section appended to the system prompt.
-
-    The framing matters as much as the content: conventions are *context*, and a
-    convention must never outrank what the code plainly shows. Without that line
-    a stack profile becomes an excuse generator — "Twig escapes by default" would
-    start closing findings where the template clearly uses `|raw`.
-    """
+    """The section appended to the system prompt."""
     if not profiles:
         return ""
     parts = [

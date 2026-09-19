@@ -1,24 +1,4 @@
-"""Scanner abstraction: the agent acquires its own findings.
-
-Two execution modes, because the tools genuinely differ in how they ship:
-
-* `native`  — a binary on PATH.
-* `docker`  — an optional isolated execution mode for scanners that support it.
-
-Safety rules that are not negotiable here:
-
-* **No shell.** Every invocation is an argv list. A repository path can contain
-  spaces, quotes, semicolons and `$(...)`; handing that to a shell is a command
-  injection in a security tool, which would be its own headline.
-* **Read-only mounts.** A scanner has no business writing to the tree it scans.
-* **Bounded.** Every run has a timeout; a hung scanner must not hang the agent.
-* **Recorded.** The exact argv and the scanner's own version go into the
-  manifest, because "which scanner version produced this verdict" is a question
-  that gets asked six months later.
-
-Running a scanner executes third-party code over the target tree. That is the
-point of the exercise, but it is a real trust decision and the CLI states it.
-"""
+"""Scanner abstraction: the agent acquires its own findings."""
 
 from __future__ import annotations
 
@@ -112,15 +92,7 @@ class Scanner(ABC):
         return Availability(usable=False, detail="; ".join(problems))
 
     def resolve_binary(self, default: str) -> str:
-        """The first configured candidate that exists, else PATH.
-
-        `binary:` accepts a list because one profile has to serve every machine
-        the agent runs on: CodeQL sits in `~/tools` on a workstation and in
-        `/usr/local/bin` in the image, and a single absolute path baked into the
-        config made the scanner unavailable on any host but the one it was
-        written on. A candidate that resolves to nothing is skipped rather than
-        returned, so the last word still belongs to PATH.
-        """
+        """The first configured candidate that exists, else PATH."""
         configured = self.cfg.binary
         if not configured:
             return default
@@ -130,8 +102,6 @@ class Scanner(ABC):
             path = Path(str(candidate)).expanduser()
             if path.is_file() or shutil.which(str(candidate)):
                 return str(path) if path.is_file() else str(candidate)
-        # Nothing on disk: hand back the first candidate so the probe reports it
-        # by name rather than silently falling through to something else.
         return str(Path(str(candidates[0])).expanduser())
 
     def _probe_native(self) -> Availability:
@@ -193,19 +163,7 @@ class Scanner(ABC):
         return frozenset({0, 1})
 
     def report_health(self, path: Path) -> str | None:
-        """Inspect the report itself. Returns a reason string when it is not trustworthy.
-
-        This exists because exit codes are a poor success signal. A scanner can return
-        2 after a completely successful scan if a single oversized file was
-        skipped, while a scan that died on an invalid ruleset still writes a
-        syntactically valid, *empty* SARIF. Reading that as "0 findings" would
-        make the agent report a clean codebase because its own rules failed to
-        parse — the worst failure this tool can have.
-
-        SARIF was designed for exactly this: `invocations[].executionSuccessful`.
-        Where a tool omits it, "zero rules ran" is the fallback tell, because a
-        scanner that ran no rules has told you nothing about the code.
-        """
+        """Inspect the report itself."""
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

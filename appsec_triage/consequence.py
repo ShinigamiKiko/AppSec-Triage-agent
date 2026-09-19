@@ -1,11 +1,4 @@
-"""How much it costs when a weakness class turns out to be real.
-
-Kept apart from both the queue and the checks because both need it and neither
-owns it. This is *consequence*, not likelihood and not the scanner's severity —
-risk severity was measured to be a poor signal, since scanners can record it on the rule
-rather than the result and 207 of 296 findings on a real project arrived as
-`unknown` severity.
-"""
+"""How much it costs when a weakness class turns out to be real."""
 
 from __future__ import annotations
 
@@ -26,6 +19,5 @@ DEFAULT_WEIGHT = 12
 
 
 def weight(cwe: str | None) -> int:
-    """Unclassified findings get the default rather than zero: an unknown class
-    is not a harmless one, and treating it as such is how things get skipped."""
+    """Unclassified findings get the default rather than zero: an unknown class is not a harmless one, and treating it as such is how things get skipped."""
     return CWE_WEIGHT.get((cwe or "").upper(), DEFAULT_WEIGHT)

@@ -58,9 +58,17 @@ shows our code does not call it, that is a genuine narrowing — quote both.
 |---|---|
 | Installed version outside the affected range | `false_positive`, `IDENTIFIER_ONLY` — quote the range |
 | `dev_dependency_only`, and the advisory is not about the build itself | `false_positive` — say "not shipped" |
+| A required exploitation condition is `ABSENT` | `false_positive` — quote the exact configuration or source evidence showing that the condition does not hold |
 | In range, ships, and imported | `confirmed` — name the upgrade target |
 | In range and ships, reachability unclear | `confirmed` — a shipped vulnerable version is a finding; reachability changes priority, not existence |
 | Range unclear, or the evidence does not name a version | `unknown` — say what is missing |
+
+For configuration preconditions, `HOLDS` means the condition is present and may
+support `confirmed`; `ABSENT` means the condition is disproved in repository
+code and is a `false_positive`. `EXTERNAL` means the value depends on runtime
+environment or deployment: do not treat it as `ABSENT` and do not close the
+finding on that basis. Preserve the shipped-version baseline and put the
+external check in `missing_information`.
 
 **Do not require proof of exploitability to confirm.** For a dependency the bar
 is "we ship an affected version", because the exploit is public and the fix is a

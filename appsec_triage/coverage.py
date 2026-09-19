@@ -1,15 +1,4 @@
-"""What did not run, and what that means the report is missing.
-
-A scan where a scanner failed still produces a clean-looking report: fewer
-findings, no errors, exit zero. The reader has no way to tell "we looked and
-found little" from "half the tools never ran". On a real project a scanner died on
-a single compiled artifact and the whole dependency layer vanished — more than
-half the findings — and it was noticed only because someone read the log.
-
-So the failure is translated into the thing a reader actually needs: not
-"psalm exited 1", but "PHP taint analysis did not run, so cross-function
-dataflow in PHP is not covered by this report".
-"""
+"""What did not run, and what that means the report is missing."""
 
 from __future__ import annotations
 
@@ -54,13 +43,7 @@ class Coverage:
 
 
 def read(scans_dir: Path) -> Coverage:
-    """Read the scan manifest beside the reports, if the scan wrote one.
-
-    An absent manifest is not a failure: `triage` can be pointed at reports
-    produced elsewhere. It is recorded as "unknown" rather than "complete",
-    because claiming full coverage on no evidence is the error this exists to
-    prevent.
-    """
+    """Read the scan manifest beside the reports, if the scan wrote one."""
     cov = Coverage()
     manifest = Path(scans_dir) / "scan-manifest.json"
     if not manifest.is_file():

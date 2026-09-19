@@ -1,16 +1,4 @@
-"""Post-validation: the model's answer is a proposal, not a decision.
-
-Five checks, in order, each able to downgrade the verdict (never upgrade it):
-
- 1. schema      — handled upstream by `parse_verdict`; a failure never reaches here
- 2. evidence    — every quote must actually exist in the input (anti-hallucination)
- 3. sanity      — a strong secret signal cannot be closed as a test placeholder
- 4. confidence  — below the floor, `confirmed`/`false_positive` become `unknown`
-  5. escalation  — unknown and low-confidence decisions stay with a human
-
-Downgrade-only is the safety property: no combination of checks can turn an
-`unknown` into a `false_positive` and silently close a real vulnerability.
-"""
+"""Post-validation: the model's answer is a proposal, not a decision."""
 
 from __future__ import annotations
 
@@ -26,9 +14,6 @@ from ..models import EvidenceClass, EvidencePackage, Finding, Verdict, VerdictLa
 _WS = re.compile(r"\s+")
 _LINE_GUTTER = re.compile(r"^[ \t]*\d+[ \t]*\|[ \t]?", re.MULTILINE)
 
-# Confidence is stored as a probability in the 0..1 range. Strictly above this
-# threshold is the only condition that permits an automated application of the
-# model's verdict; exactly 0.86 remains a human-review case.
 AUTO_APPLY_CONFIDENCE = 0.86
 
 
@@ -97,13 +82,7 @@ def govulncheck_baseline(finding: Finding) -> Verdict:
 
 
 def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage) -> str | None:
-    """Return FP reason for advisory preconditions impossible in this deployment.
-
-    The default categories are an operator decision for this platform: kernel,
-    SSH, LDAP, FTP, NFS/SMB and Windows never apply to a service in a Linux pod.
-    curl/wget, telnet, GUI and init-system words were removed on purpose — each
-    is a word an application advisory can contain, and a word closed it.
-    """
+    """Return FP reason for advisory preconditions impossible in this deployment."""
     advisory = finding.raw.get("advisory", {})
     details = "\n".join(
         text
@@ -118,8 +97,6 @@ def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage) -> str | N
     if not details:
         return None
 
-    # No bare "driver": "SQL injection in the PostgreSQL driver" is an application
-    # flaw, and the word alone closed it as kernel-level behaviour.
     if re.search(r"\b(?:kernel|syscall|sys\.call|kmod)\b", details, re.IGNORECASE):
         return (
             "Advisory describes kernel-level behavior; application code cannot modify the kernel. "
@@ -192,7 +169,7 @@ def apply_govulncheck_gate(
 ) -> tuple[Verdict, list[str]]:
     """Permit only a grounded, concrete model refutation of the baseline."""
     prefix = "govulncheck authoritative baseline preserved"
-    del quote_threshold  # The gate intentionally requires exact, not fuzzy, package text.
+    del quote_threshold
     if error:
         return baseline, [f"{prefix}: model error ({error[:240]})"]
     if candidate is None:
@@ -231,12 +208,7 @@ def _norm(s: str) -> str:
 
 
 def quote_is_grounded(quote: str, haystack: str, threshold: float) -> bool:
-    """Exact substring first; fuzzy fallback for whitespace/quote-style drift.
-
-    Models reliably re-indent or swap quote characters when copying a code line.
-    Rejecting those as hallucinations would make the check useless, so we allow
-    a high-similarity window match but nothing looser.
-    """
+    """Exact substring first; fuzzy fallback for whitespace/quote-style drift."""
     q, h = _norm(quote), _norm(haystack)
     if len(q) < 4:
         return False
@@ -495,20 +467,7 @@ def validate(
 
 
 def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: PostValidationConfig) -> bool:
-    """Is the named symbol real? For a dependency, a coordinate counts as real.
-
-    For a weakness in our code the symbol is a thing on a line — a call, a
-    literal — and demanding it appear verbatim is exactly right. For a CVE it is
-    a package coordinate, and the SCA prompt asks for it as `package@version`.
-    That composite is *assembled* from two facts that the evidence lists on
-    separate lines, so it never appears literally, and the verbatim check
-    rejected it on 84 of 89 dependency findings on a real project. The verdicts
-    were correct; the symbol was struck from every one of them, and the override
-    it logged then dragged the certainty band down with it.
-
-    So for dependency findings the parts are checked instead. A model naming a
-    package or version that is not in the evidence still fails.
-    """
+    """Is the named symbol real?"""
     if quote_is_grounded(name, haystack, cfg.quote_match_threshold):
         return True
     dep = pkg.dependency
@@ -522,12 +481,7 @@ def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: Pos
 
 
 def _merge_rationale(model_text: str, self_reported: float | None, cal) -> str:
-    """Keep the model's reasoning, then say what the measured score is built on.
-
-    Both belong in the report. The model's sentence explains the verdict; the
-    measured reasons explain how far to trust it, and a reviewer comparing the
-    two learns more than either alone.
-    """
+    """Keep the model's reasoning, then say what the measured score is built on."""
     measured = "; ".join(cal.reasons) or "no distinguishing evidence either way"
     said = f"model stated {self_reported:.2f}" if self_reported is not None else "model stated no number"
     lines = [t for t in (model_text.strip(),) if t]

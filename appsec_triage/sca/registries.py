@@ -1,18 +1,4 @@
-"""A package's own source, read from the installed tree and never fetched.
-
-Confirming a symbol and walking the bridge both need the library's code. There
-are two ways to get it and only one of them is allowed here: reading what the
-package manager already put on disk. Downloading a published archive — even
-read-only, even from the official registry — sends the project's dependency
-list to a third party and pulls foreign code into the scanning container, and
-the scanner is not the place for either.
-
-So this looks in `vendor/`, `node_modules/`, `site-packages/` and the Go module
-cache, and when the tree is not there it says so. "Not installed" is a real
-answer with real consequences — the symbol cannot be confirmed and the bridge
-cannot be walked — and those consequences are reported rather than worked
-around.
-"""
+"""A package's own source, read from the installed tree and never fetched."""
 
 from __future__ import annotations
 
@@ -29,12 +15,6 @@ _SKIP_PARTS = {"test", "tests", "spec", "specs", "fixtures", "__tests__", "docs"
 _MAX_FILES = 4000
 _MAX_BYTES = 400_000
 
-# Where each ecosystem puts an installed package. An entry is either a
-# root-relative pattern or a callable `(name, version) -> Path | None` for the
-# layouts a pattern cannot express: an absolute base outside the project, a
-# version in the path, or a name that has to be transformed. Go needs all three,
-# and it is the first of a family — pnpm's store, `~/.cargo/registry/src` and
-# pip's wheel cache have the same shape.
 _LAYOUTS: dict[str, tuple] = {
     "composer": ("vendor/{name}",),
     "packagist": ("vendor/{name}",),
@@ -65,23 +45,12 @@ def _interesting(path: Path) -> bool:
 
 
 def _escape_go_module(name: str) -> str:
-    """Go's module-cache spelling: an upper-case letter becomes `!` + its lower.
-
-    The cache cannot rely on a case-insensitive filesystem, so `github.com/Azure`
-    is stored as `github.com/!azure`. Locating a package by its manifest name
-    without this returns nothing on every module that has a capital in it.
-    """
+    """Go's module-cache spelling: an upper-case letter becomes `!` + its lower."""
     return re.sub(r"[A-Z]", lambda m: "!" + m.group(0).lower(), name)
 
 
 def _go_module_cache_dir(name: str, version: str) -> Path | None:
-    """The versioned source directory Go already unpacked, or None.
-
-    This reads the module cache; it never triggers `go mod download`. The cache
-    is versioned, so without the resolved version there is nothing to look up —
-    the same principle as vendor, just the location Go actually uses when a
-    project has no vendor directory.
-    """
+    """The versioned source directory Go already unpacked, or None."""
     if not version:
         return None
     cache = os.environ.get("GOMODCACHE") or str(Path.home() / "go" / "pkg" / "mod")
@@ -121,12 +90,7 @@ def locate(root: Path | str, ecosystem: str | None, name: str,
 def package_source(
     ecosystem: str | None, name: str, version: str = "", root: Path | str | None = None
 ) -> dict[str, str]:
-    """`{path: text}` for an installed package, or empty when it is not installed.
-
-    Empty is a normal outcome and must be treated as "could not check", never as
-    "the symbol is not there" — the difference is the whole point of reading the
-    tree rather than guessing at it.
-    """
+    """`{path: text}` for an installed package, or empty when it is not installed."""
     if root is None:
         return {}
     directory = locate(root, ecosystem, name, version)

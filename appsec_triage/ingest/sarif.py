@@ -1,9 +1,4 @@
-"""SARIF 2.1.0 adapter — covers CodeQL, Psalm, Wolfee, and Checkmarx exports.
-
-SARIF is verbose and every tool fills it slightly differently, so this adapter
-sticks to the fields all four actually populate, and reaches into
-`codeFlows`/`threadFlows` for the dataflow when the tool provides one.
-"""
+"""SARIF 2.1.0 adapter — covers CodeQL, Psalm, Wolfee, and Checkmarx exports."""
 
 from __future__ import annotations
 
@@ -55,12 +50,7 @@ _PSALM_TAINT_TO_CWE = {
 
 
 def _is_misconfiguration(rule: dict[str, Any], result: dict[str, Any]) -> bool:
-    """A parsed configuration fact, not a weakness to be traced.
-
-    Two conditions together, because either alone is too loose: the tool tagged
-    it `misconfiguration`, and the tool claims very-high precision — i.e. it read
-    the directive itself rather than pattern-matched around it.
-    """
+    """A parsed configuration fact, not a weakness to be traced."""
     props = {**(rule.get("properties") or {}), **(result.get("properties") or {})}
     tags = [str(t).lower() for t in props.get("tags", [])]
     return "misconfiguration" in tags and str(props.get("precision", "")).lower() == "very-high"

@@ -1,27 +1,4 @@
-"""Which concrete class sits behind an interface, according to the container.
-
-A language server cannot answer this, and on measurement it mostly did not try:
-asked at five call positions in a project with its dependencies installed, it
-returned nothing for three and pointed at the calling file for one. The reason
-is not a defect in phpactor — the answer genuinely is not in the source. In a
-Symfony application the wiring lives in configuration:
-
-    App\\Service\\ChatBotServiceInterface:
-        class: App\\Service\\ChatBotService
-
-    App\\Security\\AtsTokenAuthenticatorDecorator:
-        decorates: 'Ats.security.authenticator'
-        arguments:
-            $decorated: '@.inner'
-
-That is an exact statement, not an inference: `$this->decorated` in the
-decorator holds whatever `Ats.security.authenticator` is. Reading it turns a
-call through an interface into a call on a named class.
-
-What is deliberately not done here is guessing. A service id that no
-configuration file defines resolves to nothing and says so — many are declared
-by bundles inside `vendor/`, and a repository without one cannot know them.
-"""
+"""Which concrete class sits behind an interface, according to the container."""
 
 from __future__ import annotations
 
@@ -78,11 +55,7 @@ class Wiring:
         return current if _LOOKS_LIKE_CLASS.match(current or "") else ""
 
     def decorated_class(self, decorator: str, argument: str = "") -> str:
-        """The class behind a decorator's inner service, if configuration says.
-
-        `$decorated: '@.inner'` names no service of its own — `.inner` *is* the
-        decorated one — so the answer comes from the `decorates` key.
-        """
+        """The class behind a decorator's inner service, if configuration says."""
         target = ""
         if argument:
             declared = (self.arguments.get(decorator) or {}).get(argument.lstrip("$"), "")
@@ -104,15 +77,7 @@ def _service_id(value: str) -> str:
 if yaml is not None:  # pragma: no branch - trivial
 
     class _SymfonyLoader(yaml.SafeLoader):
-        """A safe loader that survives Symfony's own tags.
-
-        `!php/const`, `!tagged_iterator`, `!service` and friends are not YAML,
-        and `safe_load` refuses the whole document over one of them. Refusing
-        the document loses every service definition in it — measured: zero
-        configuration files read on a project with a fully wired container.
-        The tag's *value* is kept, which is all this needs; the tag itself never
-        names a class.
-        """
+        """A safe loader that survives Symfony's own tags."""
 
 
     def _ignore_tag(loader, suffix, node):
@@ -196,14 +161,8 @@ def load(root: Path | str) -> Wiring:
     return wiring
 
 
-
 def property_type(text: str, prop: str) -> str:
-    """The declared type of `$prop` in this file: typed property or constructor.
-
-    Both spellings occur in the same codebase and neither is optional to
-    support: `private AuthenticatorInterface $decorated;` was measured next to
-    promoted constructor properties in the same project.
-    """
+    """The declared type of `$prop` in this file: typed property or constructor."""
     name = re.escape(prop.lstrip("$"))
     patterns = (
         rf"(?:private|protected|public|readonly)\s+(?:readonly\s+)?\??([\w\\]+)\s+\${name}\b",

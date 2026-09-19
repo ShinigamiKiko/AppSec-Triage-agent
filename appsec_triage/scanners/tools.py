@@ -1,8 +1,4 @@
-"""Concrete scanners: CodeQL · Psalm · Wolfee.
-
-Each one is small; the interesting content is the per-tool quirks, which is
-exactly what a config file cannot express.
-"""
+"""Concrete scanners: CodeQL · Psalm · Wolfee."""
 
 from __future__ import annotations
 
@@ -30,14 +26,7 @@ _SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "target", "build", "dist"
 
 
 def exclude_directory(name: str) -> None:
-    """Keep the scanners out of a directory for the rest of this process.
-
-    Needed because the output directory usually sits *inside* the tree being
-    scanned — `appsec-triage run . -o appsec-out` is the ordinary CI shape, and
-    in CI the artefacts have to stay in the project. Left alone, the second
-    phase would extract the CodeQL database the first phase wrote, and every
-    read the SARIF as source, and every rerun would grow what it scans.
-    """
+    """Keep the scanners out of a directory for the rest of this process."""
     name = (name or "").strip().strip("/")
     if not name or "/" in name:
         return
@@ -54,10 +43,6 @@ class WolfeeScanner(Scanner):
 
     @property
     def success_exit_codes(self) -> frozenset[int]:
-        # Wolfee can finish the govulncheck phase and write a useful SARIF
-        # report even when optional OSV/EPSS enrichment times out. The report
-        # is validated separately by Scanner.scan; do not discard its traces
-        # because of the enrichment process exit code.
         return frozenset(range(256))
 
     def _native_version_argv(self) -> list[str] | None:
@@ -74,23 +59,7 @@ class WolfeeScanner(Scanner):
 
 
 class PsalmScanner(Scanner):
-    """Psalm interprocedural taint analysis for PHP.
-
-    Psalm follows calls across functions. Its SARIF carries `codeFlows`, which
-    the ingest layer preserves as the strongest evidence.
-
-    Two things make Psalm unlike the other scanners here:
-
-    * **It can run without the project's autoloader.** When a target has no
-      vendor tree, the wrapper supplies a temporary minimal config and scans
-      the source directly. Framework-specific symbols may then be unresolved,
-      but direct and inter-file PHP flows still produce useful evidence.
-    * **It writes its report to a file, not stdout** (`--report`), so
-      `writes_stdout` is False and the base class does not capture stdout.
-
-    Docker is deliberately not offered: a container has no access to the target's
-    installed dependencies, which is exactly what taint tracking needs.
-    """
+    """Psalm interprocedural taint analysis for PHP."""
 
     name = "psalm"
 
@@ -147,17 +116,7 @@ class PsalmScanner(Scanner):
         )
 
     def report_health(self, path: Path) -> str | None:
-        """Zero taint findings is a real clean result, not a broken run.
-
-        The base check treats a SARIF with no rules and no results as "the
-        scanner ran nothing. Taint analysis is different: a codebase with no
-        reachable source->sink flow legitimately yields zero results, and a
-        target where taint tracking cannot recognise framework sources (a Symfony
-        app without psalm/plugin-symfony) also yields zero. Rejecting those would
-        turn a clean taint pass into a scan failure. A genuinely broken Psalm
-        (missing autoloader) writes no report at all and is caught upstream by
-        the exit code and the "no report written" gate. We keep only the
-        authoritative signal — SARIF's own executionSuccessful flag."""
+        """Zero taint findings is a real clean result, not a broken run."""
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -192,17 +151,7 @@ class PsalmScanner(Scanner):
 
 
 class CodeQLScanner(Scanner):
-    """CodeQL — the only two-phase tool here.
-
-    `database create` compiles the source, then `database analyze` runs a query
-    suite against it. That first phase is the expensive one (minutes, and for
-    compiled languages it needs a working build), which is why CodeQL is not a
-    sensible default and gets its own timeout.
-
-    Docker is deliberately not offered: the official image is large and the
-    database directory has to survive between the two phases, which makes a
-    read-only mount pointless.
-    """
+    """CodeQL — the only two-phase tool here."""
 
     name = "codeql"
 
@@ -219,14 +168,7 @@ class CodeQLScanner(Scanner):
         raise NotImplementedError
 
     def detect_languages(self, target: Path) -> list[str]:
-        """Every CodeQL language present in the tree, most-frequent first.
-
-        `cfg.language` pins a single language and skips detection. Otherwise each
-        detected language gets its own database and analysis pass: CodeQL
-        compiles exactly one language per database, so a mixed Go + TS repo needs
-        two passes. JS and TS share the `javascript` extractor, so a JS/TS repo
-        is still one pass — the map collapses `.ts`/`.tsx` to `javascript`.
-        """
+        """Every CodeQL language present in the tree, most-frequent first."""
         if self.cfg.language:
             return [self.cfg.language]
         counts: Counter[str] = Counter()
@@ -242,25 +184,16 @@ class CodeQLScanner(Scanner):
         langs = self.detect_languages(target)
         return langs[0] if langs else None
 
-    #: Written next to the SARIF so the next phase can find the databases without
-    #: guessing at the directory layout. Dot-prefixed like the databases
-    #: themselves: everything else ending in `.json` in that directory is a
-    #: findings report, and the ingest tried to parse this one as one.
     MANIFEST = ".codeql-databases.json"
 
     @staticmethod
     def database_dir(out_dir: Path | str, language: str) -> Path:
-        """Where this language's database lives. One place, one spelling."""
+        """Where this language's database lives."""
         return Path(out_dir) / f".codeql-db-{language}"
 
     @classmethod
     def databases(cls, out_dir: Path | str) -> dict[str, Path]:
-        """Language → database, as recorded by the scan that built them.
-
-        Reads the manifest rather than globbing: a directory that looks like a
-        database may be a half-written one from a run that failed, and querying
-        that produces an error rather than an answer.
-        """
+        """Language → database, as recorded by the scan that built them."""
         manifest = Path(out_dir) / cls.MANIFEST
         try:
             recorded = json.loads(manifest.read_text(encoding="utf-8"))
@@ -275,13 +208,7 @@ class CodeQLScanner(Scanner):
 
     @staticmethod
     def _merge_runs(docs: list[dict]) -> dict:
-        """Fold several single-language SARIF documents into one multi-run file.
-
-        The ingest already iterates `runs` (sarif.py), so concatenating each
-        language's runs under one document is all a downstream reader needs: one
-        codeql.sarif.json carrying every language's results, one manifest entry,
-        no change to dedup.
-        """
+        """Fold several single-language SARIF documents into one multi-run file."""
         return {
             "version": docs[0].get("version", "2.1.0"),
             "$schema": docs[0].get("$schema", "https://json.schemastore.org/sarif-2.1.0.json"),
@@ -289,24 +216,7 @@ class CodeQLScanner(Scanner):
         }
 
     def _analyze_one(self, exe: str, target: Path, out_dir: Path, language: str, part: Path) -> str | None:
-        """Create a database for one language and analyze it into `part`.
-
-        Returns None on success or a short error string. Isolated per language so
-        one broken build (a compiled language with no toolchain) does not sink the
-        languages that would analyze cleanly.
-
-        The database is **kept**. Building it is the expensive phase — minutes,
-        and a working build for compiled languages — and the dependency triage
-        that runs next in the same container needs exactly this artefact: asking
-        whether user input reaches the line where a vulnerable library function
-        is called is a query against the database, not something SARIF can
-        answer. SARIF only carries the paths CodeQL already judged to be flaws,
-        and a plain call into a dependency is not one of them.
-
-        Deleting it here cost precisely that: the config note says the database
-        "must survive both phases" and meant `create` and `analyze`, so the
-        second consumer never had one to query.
-        """
+        """Create a database for one language and analyze it into `part`."""
         db_dir = self.database_dir(out_dir, language)
         shutil.rmtree(db_dir, ignore_errors=True)
         create = [

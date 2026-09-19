@@ -1,7 +1,4 @@
-"""Provider factory: profile name -> concrete client.
-
-Adding a fourth provider means one class + one YAML file + one line here.
-"""
+"""Provider factory: profile name -> concrete client."""
 
 from __future__ import annotations
 

@@ -22,7 +22,7 @@
 # every rebuild. Only the resulting binary is copied into the runtime image.
 FROM golang:1.26-alpine AS wolfee-builder
 
-ARG WOLFEE_VERSION=1.5
+ARG WOLFEE_VERSION=1.6
 ARG WOLFEE_REPO=https://github.com/ShinigamiKiko/wolfee-cli.git
 
 RUN apk add --no-cache git make

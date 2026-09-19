@@ -1,27 +1,4 @@
-"""Psalm answers the dependency questions about a vulnerable PHP method.
-
-PHP has no CodeQL, and a text search for `parse(` cannot tell
-`Symfony\\Component\\Yaml\\Yaml::parse` from a project's own `DateParser::parse`.
-Measured on seeded projects: every PHP case came back "called, receiver class not
-confirmed", with no dataflow at all, and the verdict fell to policy. Psalm infers
-types, so it can answer both questions CodeQL answers for JavaScript:
-
-- **Where is the method called?** `psalm --find-references-to=Class::method`
-  lists call sites resolved by type — a call through `$this->parser` counts, a
-  same-named method of another class does not.
-- **Does untrusted input reach it?** A stub declares the method's parameters as
-  taint sinks and a taint run reports the path from `$_GET`/`$_POST` into them.
-
-Two measured constraints shape the taint run. Psalm ignores custom sink kinds, so
-the stub uses the built-in `eval` kind — and Psalm reports its own sinks too (an
-`echo` of request data is XSS), so only `TaintedEval` results whose sink line
-calls the named method are kept. The stub signature must match the real method,
-so it is read with Reflection through the project's own `vendor/autoload.php`,
-the same autoloader Psalm itself runs.
-
-Answers use `codeql_api.ApiAnswer`, so the chain and the model's investigation
-treat both engines alike: a call or a path found is a fact, a miss closes nothing.
-"""
+"""Psalm answers the dependency questions about a vulnerable PHP method."""
 
 from __future__ import annotations
 
@@ -155,15 +132,7 @@ _MAX_PACKAGE_FILES = 4000
 
 
 def qualify(project_root: Path | str, package: str, names: list[str]) -> dict[str, list[str]]:
-    """Fully qualified classes of the installed `package` that declare each method name.
-
-    A fix diff names the method — `parse`, `parseBlock` — never its class, and
-    PHP gives a bare name no meaning: Psalm cannot resolve it and a text search
-    matches any class's `parse`. Measured on a seeded project, a bare `parse`
-    matched `DateParser::parse` and reopened a closed finding. Reading which
-    classes of the installed package declare the method turns the name back into
-    something both Psalm and the class-bound text search can check.
-    """
+    """Fully qualified classes of the installed `package` that declare each method name."""
     from ..testpaths import is_test
 
     package_dir = Path(project_root) / "vendor" / package
@@ -190,6 +159,47 @@ def qualify(project_root: Path | str, package: str, names: list[str]) -> dict[st
             if len(found[name]) < _MAX_QUALIFIED and fqcn not in found[name] and pattern.search(text):
                 found[name].append(fqcn)
     return found
+
+
+_PUBLIC_METHOD = re.compile(
+    r"^\s*(?:(?:abstract|final|static)\s+)*(?:public\s+)?(?:(?:abstract|final|static)\s+)*"
+    r"function\s+&?([A-Za-z_]\w*)\s*\(",
+    re.MULTILINE)
+
+
+def public_api(project_root: Path | str, package: str, limit: int = 40) -> str:
+    """The installed package's public methods, as a line the model chooses its questions from."""
+    from ..testpaths import is_test
+
+    package_dir = Path(project_root) / "vendor" / package
+    if not package or not package_dir.is_dir():
+        return ""
+    entries: list[str] = []
+    php_files = sorted(package_dir.rglob("*.php"), key=lambda p: (len(p.relative_to(package_dir).parts), str(p)))
+    for index, path in enumerate(php_files):
+        if index >= _MAX_PACKAGE_FILES:
+            break
+        if is_test(path.relative_to(package_dir).as_posix()):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        declaration = _DECLARATION.search(text)
+        if declaration is None:
+            continue
+        namespace = _NAMESPACE.search(text)
+        fqcn = f"{namespace.group(1)}\\{declaration.group(1)}" if namespace else declaration.group(1)
+        for name in dict.fromkeys(_PUBLIC_METHOD.findall(text)):
+            if name.startswith("__"):
+                continue
+            entries.append(f"{fqcn}::{name}")
+    entries = entries[:limit]
+    if not entries:
+        return ""
+    return ("Public methods of the installed package (its API, read from vendor/; not evidence about this "
+            "project): " + ", ".join(entries) + ". A fix often names an internal helper no application "
+            "calls — ask about the public methods that lead to it.")
 
 
 def _relative(path: str, base: Path, project: Path) -> str | None:
@@ -259,11 +269,7 @@ _MAX_CALL_LINES = 40
 
 
 def _call_end(lines: list[str], start: int, function: str) -> int:
-    """The last line (1-based) of the call to `function` that begins on line `start`.
-
-    Parentheses are counted outside string literals; a call that cannot be read
-    as starting on that line ends where it starts.
-    """
+    """The last line (1-based) of the call to `function` that begins on line `start`."""
     if not 0 < start <= len(lines):
         return start
     chunk = "\n".join(lines[start - 1:start - 1 + _MAX_CALL_LINES])
@@ -293,15 +299,7 @@ def _call_end(lines: list[str], start: int, function: str) -> int:
 
 def _enclosing_call(project: Path, sink_file: str, sink_line: int, signatures: list[Signature],
                     references: dict[str, list[tuple[str, int]]]) -> tuple[Signature, int] | None:
-    """(method, line the call starts on) for a sink Psalm reported inside one of our calls.
-
-    Psalm places the sink on the argument, and an argument written on its own
-    line is below the line the call starts on: measured, `Yaml::parse(\\n $document\\n)`
-    reported the sink one line down, the line did not contain `parse(`, and a real
-    input path was dropped as not ours. So the sink counts when it lies inside the
-    span of a call Psalm resolved to the method; a sink line that itself calls the
-    method is the fallback for methods without resolved references.
-    """
+    """(method, line the call starts on) for a sink Psalm reported inside one of our calls."""
     try:
         lines = (project / sink_file).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:

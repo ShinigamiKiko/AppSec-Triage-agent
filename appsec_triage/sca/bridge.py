@@ -1,39 +1,4 @@
-"""From a transitive flaw to something the application could plausibly call.
-
-Searching an application for `matchesDomain` finds nothing, because the
-application does not call it — guzzle does, and the application calls guzzle.
-Measured on the advisories resolved so far, only 5 of 22 vulnerable functions
-were public API at all; the rest are internals, and a search for their names in
-first-party code can only ever come back empty.
-
-The intermediate package's own source closes that gap, and it is already
-fetched for the confirmation step. Two questions are answerable from it:
-
-*Does the parent call the flaw at all?* If `symfony/mailer` never calls the
-vulnerable function of `egulias/email-validator`, then no path through the
-parent reaches it. That is a real closure resting on the parent's code, not on
-the absence of evidence in the application's.
-
-*Through which of its own functions?* The enclosing declarations of those call
-sites are the parent's side of the bridge. Public ones are what an application
-can call, so those names — not the transitive one — are what to look for in
-first-party code.
-
-The walk can follow several hops, because a flaw is often two or three packages
-deep: the application calls A, A calls B, B calls the vulnerable function of C.
-One hop from the flaw yields B's function, but the application does not call that
-either — it calls A — so a single-hop search of first-party code comes back
-empty on a path that is entirely real. Each further hop repeats the same
-question one package outward, until it reaches a name the application could
-actually write.
-
-This is name matching, and name matching across hops is where false confidence
-is manufactured: two unrelated functions called `send` would splice into a path
-that does not exist. So the walk is bounded in depth, its confidence decays with
-each hop, and every result says how many hops it rests on and that it is a
-name-level path, not one proven by a call graph — which remains CodeQL's job.
-A hop whose source is not on disk stops the walk as *unknown*, never as closed.
-"""
+"""From a transitive flaw to something the application could plausibly call."""
 
 from __future__ import annotations
 
@@ -102,11 +67,7 @@ def _callers(
     parent_package: str = "",
     max_symbols: int = 12,
 ) -> BridgeResult:
-    """Which functions of `parent_source` call any name in `targets`.
-
-    The generalisation the walk needs: one hop looks for the vulnerable function,
-    every hop after it looks for the public names the previous hop surfaced.
-    """
+    """Which functions of `parent_source` call any name in `targets`."""
     label = ", ".join(sorted(targets)[:3]) or "искомую функцию"
     if not parent_source:
         return BridgeResult(
@@ -122,8 +83,6 @@ def _callers(
                     f"(файлы: {', '.join(kinds[:6]) or 'неизвестно'}) — "
                     "нельзя проверить, вызывает ли он уязвимую функцию"))
 
-    # One pattern per (language, name), built once rather than once per file:
-    # a package is hundreds of files and the walk asks about several names.
     patterns = {(language, target): decl.call_pattern(target, language)
                 for language in languages for target in targets}
 
@@ -138,9 +97,6 @@ def _callers(
             for match in patterns[(language, target)].finditer(text):
                 sites += 1
                 if parsed is None:
-                    # Parsed once per file, not once per match: `decl.enclosing`
-                    # re-reads the whole file every call, which is quadratic on a
-                    # file with many call sites.
                     parsed = decl.declarations(path, text)
                 enclosing = decl.enclosing_in(parsed, match.start())
                 if enclosing is None or enclosing.name in targets:
@@ -184,12 +140,7 @@ class BridgeWalk:
 
     @property
     def confidence(self) -> float:
-        """One hop is the measured baseline; each further hop multiplies the doubt.
-
-        Derived rather than stored: every construction site set it from `hops`,
-        so a new early exit that forgot the argument would have shipped a
-        default confidence of 1.0 next to a three-hop path.
-        """
+        """One hop is the measured baseline; each further hop multiplies the doubt."""
         return round(0.9 * (0.7 ** max(self.hops - 1, 0)), 3)
 
 
@@ -201,31 +152,11 @@ def walk_bridge(
     max_depth: int = 4,
     max_symbols: int = 12,
 ) -> BridgeWalk:
-    """Follow the flaw outward along `chain`, package by package, toward the app.
-
-    `chain` is the packages between the flaw and the application, innermost
-    first: the direct parent of the vulnerable package, then its parent, and so
-    on out to the direct dependency the project declares. `source_of(package)`
-    returns that package's installed source, or empty when it is not on disk.
-
-    Returns what to search for in first-party code — the public names of the
-    outermost package on a real path — together with how many hops that rests on
-    and a confidence that decays per hop. Three terminal shapes:
-
-    - **closed**: some package on the chain never calls inward, so no path runs
-      through it. A fact about that package's code, and it stands.
-    - **unknown**: a package's source is not on disk, or the chain is deeper than
-      we will follow. The question is open, reported as such, never as closed.
-    - a target list: the walk reached the direct dependency, and these public
-      names are its side of the bridge to look for in the application.
-    """
+    """Follow the flaw outward along `chain`, package by package, toward the app."""
     if not vulnerable_function:
         return BridgeWalk(unknown=True, detail="уязвимая функция не определена")
 
     targets = {vulnerable_function}
-    # What to offer if the walk stops early. Starts as the flaw itself and
-    # becomes each hop's public symbols, so a walk that runs out of source still
-    # hands back the furthest names it did establish rather than nothing.
     carried = [BridgeSymbol(vulnerable_function)]
     if not chain:
         return BridgeWalk(targets=carried, unknown=True,
@@ -257,8 +188,6 @@ def walk_bridge(
                 f"{package} вызывает искомое только через непубличные функции — "
                 "снаружи этот путь не адресуем", depth)
 
-        # These public names are the outer package's side of the bridge — what
-        # the next package out (or, after the last hop, first-party code) calls.
         carried = public[:max_symbols]
         targets = {s.function for s in public}
 

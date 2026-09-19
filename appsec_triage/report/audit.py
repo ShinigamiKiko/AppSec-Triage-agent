@@ -1,9 +1,4 @@
-"""JSONL audit trail — one line per decision, append-only, replayable.
-
-Every line carries enough provenance to answer "why did this get closed in
-March" six months later: provider, model, prompt id + version, the pre-override
-verdict, and which post-validation rules fired.
-"""
+"""JSONL audit trail — one line per decision, append-only, replayable."""
 
 from __future__ import annotations
 
@@ -45,7 +40,7 @@ def _from_row(row: dict) -> TriageRecord:
 
 
 def read_jsonl(path: Path) -> list[TriageRecord]:
-    """Load an audit log back into records. Inverse of `write_jsonl`."""
+    """Load an audit log back into records."""
     return [
         _from_row(json.loads(line))
         for line in Path(path).read_text(encoding="utf-8").splitlines()
@@ -90,8 +85,6 @@ def write_summary(run: TriageRun, path: Path) -> Path:
             "p95": latencies[int(len(latencies) * 0.95)] if latencies else None,
             "max": latencies[-1] if latencies else None,
         },
-        # Both, because they answer different questions: what the run cost, and
-        # how much of that a per-finding record can account for.
         "total_cost_usd": run.total_cost_usd,
         "verdict_cost_usd": run.verdict_cost_usd,
         "model_calls": run.model_calls,
@@ -101,17 +94,7 @@ def write_summary(run: TriageRun, path: Path) -> Path:
 
 
 class Journal:
-    """Append-only record of finished verdicts, written as the run proceeds.
-
-    Everything used to be written after the last finding returned, so a crash at
-    183 of 296 destroyed 183 completed verdicts along with the API spend and the
-    wall-clock time that produced them. The model calls are the expensive part of
-    this pipeline and they are not reproducible for free.
-
-    The journal is also the resume point: a re-run reads it, skips the findings
-    already decided, and pays only for what is left. It is deleted once the real
-    audit log is written, so its presence means "a run did not finish".
-    """
+    """Append-only record of finished verdicts, written as the run proceeds."""
 
     def __init__(self, path: Path, prompt_pack: str) -> None:
         self.path = Path(path)
@@ -145,11 +128,7 @@ class Journal:
 
     @classmethod
     def recover(cls, path: Path) -> list:
-        """Verdicts from an interrupted run. A corrupt tail is dropped, not fatal.
-
-        The last line of a killed process is routinely half-written. Refusing to
-        read the file for that would throw away everything the run did survive.
-        """
+        """Verdicts from an interrupted run."""
         path = Path(path)
         if not path.is_file():
             return []

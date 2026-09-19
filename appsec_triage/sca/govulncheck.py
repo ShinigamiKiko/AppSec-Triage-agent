@@ -1,29 +1,4 @@
-"""Reachability as a call graph states it, read from a govulncheck artifact.
-
-Everything else in this package approximates the question "is the vulnerable
-function actually reached" — from names, from imports, from a language server's
-view of one call site. govulncheck answers it outright for Go, by building the
-call graph of the program, and a pipeline that already runs it is holding the
-answer this agent works hardest to guess.
-
-It is read as an artifact rather than executed here. Running it needs the module
-sources on disk and a working build, which is the neighbouring job's business,
-not the scanner's — the same arrangement as vendor arriving from the psalm job.
-
-Three levels come out of its report, and they are not equally strong:
-
-- **called** — a function-level trace exists, so the flaw is on a real path from
-  an entry point. The trace itself is the evidence, and it names every frame.
-- **imported** — the vulnerable package is linked in but no vulnerable symbol is
-  called.
-- **module only** — the module is in the build list and its vulnerable package
-  is not even imported.
-
-The last two both mean "not reached" and close a finding. That is a claim about
-a static call graph: calls made through reflection, `go:linkname`, or a plugin
-loaded at run time are outside what it can see, so the closure says what it
-rests on rather than pretending to be a proof of impossibility.
-"""
+"""Reachability as a call graph states it, read from a govulncheck artifact."""
 
 from __future__ import annotations
 
@@ -37,14 +12,7 @@ log = logging.getLogger(__name__)
 
 
 class GovulncheckUnavailable(RuntimeError):
-    """A call-graph report was asked for and did not arrive.
-
-    Raised rather than logged because the request itself is the statement that
-    this run's verdicts should rest on a call graph. Continuing without one
-    produces a report that looks like every other, drawn from weaker evidence,
-    with nothing on the page to say so — and a Go finding closed on a name
-    search reads exactly like one closed on a proven unreachable path.
-    """
+    """A call-graph report was asked for and did not arrive."""
 
 
 class Reach(str, Enum):
@@ -64,7 +32,6 @@ class Verdict:
     reach: Reach
     trace: list[str] = field(default_factory=list)
     sites: list[tuple[str, int]] = field(default_factory=list)
-    """Each frame's file and line, outermost first, for reading the call site."""
 
     @property
     def reachable(self) -> bool:
@@ -131,13 +98,7 @@ def _frames(trace: list[dict]) -> list[str]:
 
 
 def _positions(trace: list[dict]) -> list[tuple[str, int]]:
-    """Where each frame sits, outermost first — the entry point comes last.
-
-    Kept because "the call graph reaches it" and "this call can actually fire the
-    flaw" are different questions, and the second is answered by reading the call
-    site. A trace that reports `http.Client.Get` says nothing about the URL being
-    plain HTTP to a link-local address, which is what decides an HTTP/2 flaw.
-    """
+    """Where each frame sits, outermost first — the entry point comes last."""
     out = []
     for frame in reversed(trace):
         position = frame.get("position") or {}
@@ -148,12 +109,7 @@ def _positions(trace: list[dict]) -> list[tuple[str, int]]:
 
 
 def load(path: Path | str) -> Report:
-    """Parse a `govulncheck -format json` artifact.
-
-    A missing or unreadable file is reported in `problem` and leaves the report
-    empty: the rest of the chain then works exactly as it does without it. A
-    reachability source that fails must cost nothing more than its own evidence.
-    """
+    """Parse a `govulncheck -format json` artifact."""
     path = Path(path)
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -185,16 +141,12 @@ def load(path: Path | str) -> Report:
             else:
                 reach = Reach.MODULE_ONLY
 
-            # One advisory produces several findings, one per path found; the
-            # strongest is the answer — a symbol called anywhere is called.
             previous = verdicts.get(ident)
             if previous is None or _STRENGTH[reach] > _STRENGTH[previous.reach]:
                 verdicts[ident] = Verdict(ident, reach, frames, _positions(trace))
     except ValueError as exc:
         return Report(problem=f"отчёт govulncheck повреждён ({path}): {exc}")
 
-    # Findings arrive under Go's own ids; a scanner may report the same flaw as
-    # its CVE or GHSA alias, so both spellings have to resolve.
     for ident, names in aliases.items():
         verdict = verdicts.get(ident)
         if verdict is None:

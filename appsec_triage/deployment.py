@@ -1,25 +1,4 @@
-"""Where the application actually runs, and what that is allowed to change.
-
-A finding is judged against a deployment, not against an abstract program. An
-app behind a Kubernetes ingress genuinely does not need a `HEALTHCHECK` in its
-image, because the kubelet probes it — that check is not about the application
-at all. Withholding that fact makes the tool report things the team has already
-solved, which is how a security tool loses its audience.
-
-The danger is the same fact used one step too far. "We are behind an ingress"
-is not a reason to close a SQL injection: the ingress passes the request
-through. So the split is deliberate and enforced in two different places:
-
-* **Platform-handled rules** — a small, explicit list where the check is about
-  infrastructure the platform owns. These close deterministically, and each
-  entry must name the fact it rests on, so the list cannot quietly become a
-  bucket of exceptions.
-* **Everything else** — the description reaches the model as *context*, framed
-  as something that changes priority and answers exposure questions, and
-  explicitly barred from closing a dataflow finding.
-
-An empty or missing config is normal and means "no claims made".
-"""
+"""Where the application actually runs, and what that is allowed to change."""
 
 from __future__ import annotations
 
@@ -51,6 +30,7 @@ class OutOfScopeComponent:
     why: str = ""
     keywords: list[str] = field(default_factory=list)
     markers: list[str] = field(default_factory=list)
+    owner: str = "platform-security"
 
 
 @dataclass(slots=True)
@@ -66,18 +46,13 @@ class DeploymentContext:
         return self.enabled and bool(self.description or self.facts)
 
     def components_out_of_scope(self) -> list[OutOfScopeComponent]:
-        """Entries whose fact is set. Like platform rules, a claim nobody confirmed is inert."""
+        """Entries whose fact is set."""
         if not self.enabled:
             return []
         return [c for c in self.out_of_scope if c.requires and self.facts.get(c.requires) is True]
 
     def handled_by_platform(self, rule_id: str | None) -> PlatformRule | None:
-        """The entry covering this rule, if its supporting fact is actually set.
-
-        Both halves are required. An entry whose fact is absent or false is
-        inert — the list describes what the platform does, and a claim nobody
-        confirmed does not get to close a finding.
-        """
+        """The entry covering this rule, if its supporting fact is actually set."""
         if not rule_id or not self.enabled:
             return None
         for entry in self.platform_handles:
@@ -86,7 +61,7 @@ class DeploymentContext:
         return None
 
     def render(self) -> str:
-        """The section the model sees. Last in the prompt, and framed as context."""
+        """The section the model sees."""
         if not self.usable:
             return ""
         lines = [
@@ -137,6 +112,7 @@ def load(path: Path | None = None) -> DeploymentContext:
             describe=" ".join(str(e.get("describe") or "").split()), why=str(e.get("why") or ""),
             keywords=[str(k) for k in (e.get("keywords") or []) if str(k).strip()],
             markers=[str(m) for m in (e.get("markers") or []) if str(m).strip()],
+            owner=str(e.get("owner") or "platform-security"),
         )
         for e in (data.get("out_of_scope_components") or [])
         if isinstance(e, dict) and e.get("id")

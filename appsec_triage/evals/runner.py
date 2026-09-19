@@ -1,32 +1,4 @@
-"""Benchmark runner: same corpus, same prompts, N providers, one comparison table.
-
-Corpus format is the native JSONL adapter plus one extra field:
-
-    {"finding_id": "...", "cwe": "CWE-798", "file_path": "...", "snippet": "...",
-     "label": "false_positive", "label_note": "reviewed by AppSec 2026-03"}
-
-The bench runs the pipeline as deployed, resolvers included. Snippets are
-materialized into a real tree under the output directory (or `source_roots`
-points at a real checkout), so the source resolver widens windows and the
-language servers answer origin questions exactly as they do in production —
-a bench that skips them scores a pipeline nobody actually runs, and its
-misses are the resolver's absence, not the model's.
-
-Dependency findings (SCA) go in the same corpus, carrying the native
-`dependency` object, and are scored separately under `by_kind`:
-
-    {"finding_id": "...", "scanner": "wolfee", "rule_id": "GHSA-...", "cwe": "CWE-502",
-     "file_path": "package-lock.json",
-     "dependency": {"package": "js-yaml", "ecosystem": "npm", "installed_version": "4.1.0",
-                    "reachability": "reachable", "call_site": "src/config.js:12"},
-     "label": "false_positive", "label_note": "only reads bundled config files"}
-
-The dependency chain runs only with `resolve_symbols` and a real checkout: it
-searches the project tree, and against materialized snippets every package
-reads as unused — a closure the bench would then score as correct. Its live
-lookups are pinned with a cassette (`sca/cassette.py`); without one, two runs
-of the same corpus also measure the network.
-"""
+"""Benchmark runner: same corpus, same prompts, N providers, one comparison table."""
 
 from __future__ import annotations
 
@@ -39,7 +11,7 @@ from ..config import PipelineConfig, load_provider_config
 from ..context.source import SourceResolver
 from ..ingest import native
 from ..llm.factory import build_client
-from ..lsp.service import LSPService
+from ..lsp.service import LSPService, required_languages as lsp_required_languages
 from ..pipeline import TriagePipeline
 from ..report import audit
 from ..sca import cassette
@@ -110,13 +82,7 @@ def run_bench(
     source = SourceResolver(roots)
     symbols = LSPService(cfg.lsp, roots) if cfg.lsp.enabled and not no_lsp else None
 
-    required_present = sorted(
-        {
-            lang
-            for f in findings
-            if (lang := cfg.lsp.language_for(f.code_context.file_path)) and lang in cfg.lsp.required_languages
-        }
-    )
+    required_present = lsp_required_languages(findings, cfg.lsp, cfg.scope.only_ecosystems)
     if required_present and not no_lsp:
         langs = ", ".join(required_present)
         if symbols is None:

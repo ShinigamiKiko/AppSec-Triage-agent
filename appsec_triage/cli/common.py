@@ -14,7 +14,7 @@ from .. import reuse as reuse_mod
 from ..config import load_lsp_config, load_pipeline_config, load_provider_config
 from ..context.source import SourceResolver
 from ..llm.factory import build_client
-from ..lsp.service import LSPService
+from ..lsp.service import LSPService, required_languages as lsp_required_languages
 from ..pipeline import TriagePipeline
 from ..report import audit, html
 
@@ -42,6 +42,14 @@ def gate_count(fail_on: str, counts: dict[str, int]) -> int | None:
 
 
 def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_roots: list[Path]) -> int:
+    if source_roots:
+        from ..context.detection import DetectionError, get_source_suffixes
+        try:
+            get_source_suffixes(source_roots, include_configs=True)
+        except DetectionError as exc:
+            print(f"error: invalid APPSEC_ECOSYSTEMS: {exc}", file=sys.stderr)
+            return 2
+
     cfg = load_pipeline_config(args.config)
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack
@@ -84,7 +92,7 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     if lsp_cfg.enabled and source_roots and not getattr(args, "no_lsp", False):
         symbols = LSPService(lsp_cfg, source_roots)
         print("→ language servers enabled (definitions and reachability)", file=sys.stderr)
-    required_present = sorted({lang for f in findings if (lang := lsp_cfg.language_for(f.code_context.file_path)) and lang in lsp_cfg.required_languages})
+    required_present = lsp_required_languages(findings, lsp_cfg, cfg.scope.only_ecosystems)
     if required_present:
         langs = ", ".join(required_present)
         if symbols is None:

@@ -1,26 +1,4 @@
-"""Who pulled a vulnerable package in, and what upgrading it actually means.
-
-A CVE in a transitive dependency is a different problem from a CVE in a direct
-one, and reporting them the same way makes both unactionable.
-
-*Nothing in the project calls it.* The application requires `symfony/mailer`;
-`egulias/email-validator` arrives underneath it. Searching the application for
-the vulnerable function finds nothing, and that absence says nothing at all —
-the caller is the intermediate package, not the application.
-
-*Upgrading it is not usually possible on its own.* A transitive version is
-pinned by its parent's constraint, so "update to 3.2.1" is advice the developer
-cannot follow; what they can do is upgrade the parent, or add an explicit
-constraint. Which of those it is depends on the path, so the path has to be
-known before anything useful can be said.
-
-The graph comes from cdxgen and from nowhere else. It reads every manifest and
-lockfile format there is, states the dependency edges directly, and installs
-nothing into the project. A second, hand-written source would cover one
-ecosystem, drift from its format, and disagree with the SBOM the rest of the
-pipeline already uses — so when cdxgen cannot answer, that is reported rather
-than replaced by a worse answer.
-"""
+"""Who pulled a vulnerable package in, and what upgrading it actually means."""
 
 from __future__ import annotations
 
@@ -159,14 +137,7 @@ class DependencyGraph:
 
     @classmethod
     def from_project(cls, root: Path | str) -> DependencyGraph:
-        """cdxgen, and nothing else.
-
-        A second source is a second set of quirks: a hand-written lockfile
-        parser covers one ecosystem, drifts from the format, and produces a
-        graph that disagrees with the SBOM the rest of the pipeline uses. One
-        source means one answer, and when it fails the failure is visible
-        instead of being papered over by a worse one.
-        """
+        """cdxgen, and nothing else."""
         root = Path(root)
         if not sbom_mod.available():
             graph = cls.empty()

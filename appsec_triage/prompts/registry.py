@@ -1,9 +1,4 @@
-"""Prompt registry: pick the CWE-specific prompt, fall back to base.
-
-The article's headline lesson — one universal prompt loses to a family of narrow
-ones — is enforced structurally here: a prompt file declares which CWEs it owns
-in its front matter, and `resolve()` picks the most specific match.
-"""
+"""Prompt registry: pick the CWE-specific prompt, fall back to base."""
 
 from __future__ import annotations
 
@@ -100,12 +95,7 @@ def normalize_cwe(cwe: str | None) -> str | None:
 
 
 def resolve(cwe: str | None, pack: str = "default", kind: str | None = None) -> Prompt:
-    """Most specific prompt for this finding: `kind` first, then CWE, then base.
-
-    `kind` wins because it describes what sort of question the finding is, and a
-    dependency CVE is a different question from a weakness in our own code even
-    when both happen to carry the same CWE.
-    """
+    """Most specific prompt for this finding: `kind` first, then CWE, then base."""
     prompts = load_pack(pack)
     if kind:
         for prompt in prompts.values():
@@ -122,13 +112,7 @@ def resolve(cwe: str | None, pack: str = "default", kind: str | None = None) -> 
 def render_system(
     cwe: str | None, pack: str = "default", stack_section: str = "", kind: str | None = None
 ) -> tuple[str, Prompt]:
-    """Compose the system prompt: base + CWE specialization + stack conventions.
-
-    Order is deliberate. The base rules come first because they are absolute; the
-    CWE specialization refines them; stack conventions come last and are framed
-    as context that cannot outrank evidence. Putting conventions first would
-    invite reasoning from convention and then hunting for evidence to fit it.
-    """
+    """Compose the system prompt: base + CWE specialization + stack conventions."""
     prompt = resolve(cwe, pack, kind)
     parts: list[str] = []
     if prompt.kind and not prompt.extends:
@@ -151,16 +135,7 @@ def render_system(
 
 @lru_cache(maxsize=32)
 def step(name: str) -> str:
-    """The system prompt for one dependency-triage step, by file name.
-
-    The SAST prompts are chosen by CWE; these are not — each belongs to one step
-    of the dependency chain and there is nothing to match on. They live in files
-    all the same, so the wording can be read and changed without opening the
-    code that uses it, and a diff to a prompt does not look like a diff to logic.
-
-    Missing is fatal rather than empty: a step whose prompt vanished would still
-    call the model, with no instructions, and take the answer seriously.
-    """
+    """The system prompt for one dependency-triage step, by file name."""
     path = PROMPTS_ROOT / "sca" / f"{name}.md"
     try:
         text = path.read_text(encoding="utf-8")

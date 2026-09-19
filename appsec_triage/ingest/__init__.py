@@ -1,4 +1,4 @@
-"""Input adapters. Format is detected from the file, not from a CLI flag."""
+"""Input adapters."""
 
 from __future__ import annotations
 
@@ -70,13 +70,7 @@ def load(path: Path) -> list[Finding]:
 
 
 def _richness(f: Finding) -> tuple:
-    """Which duplicate to keep. A finding carrying a dataflow trace wins.
-
-    This is what "the deep tool leads, the pattern matcher supports" means in
-    practice: when multiple scanners flag a line, the record that survives is
-    the one with `codeFlows`, because the trace is the thing the model cannot
-    reconstruct on its own and the whole verdict on a dataflow class hangs on it.
-    """
+    """Which duplicate to keep."""
     return (len(f.trace), bool(f.source), bool(f.sink), len(f.sanitizers), len(f.code_context.snippet or ""))
 
 

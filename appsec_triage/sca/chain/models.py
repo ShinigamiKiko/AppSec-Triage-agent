@@ -33,9 +33,12 @@ class ChainResult:
     reachability: govulncheck_mod.Verdict | None = None
     matched_symbol: str = ""
     audit: str = ""
+    closure_kind: str = ""
+    audited: bool = False
     # excluded | callgraph | codeql | text | package | condition | unknown
     route: str = ""
     codeql_calls: list[str] = field(default_factory=list)
+    owner: str = ""
 
     @property
     def needs_a_person(self) -> bool:
@@ -69,6 +72,7 @@ class ChainResult:
             elif condition.state is ConditionState.INFRASTRUCTURE:
                 external = condition.statement
                 owner = condition.where or "владелец системы"
+        owner = owner or self.owner
         return SCASummary(
             package=(dependency.package if dependency else "") or "",
             installed_version=(dependency.installed_version if dependency else "") or "",
@@ -84,8 +88,13 @@ class ChainResult:
                    else (self.reach.taint_path if self.reach else "")),
             external=external,
             owner=owner,
+            condition=(condition.statement if condition is not None else ""),
+            condition_state=(condition.state.value if condition is not None else ""),
+            condition_hits=(list(condition.hits[:4]) if condition is not None else []),
             exploitability=(self.exploitability.render() if self.exploitability else ""),
             audit=self.audit,
+            closure_kind=self.closure_kind,
+            audited=self.audited,
             route=self.route,
             codeql_calls=self.codeql_calls[:12],
             problems=self.problems[:4],

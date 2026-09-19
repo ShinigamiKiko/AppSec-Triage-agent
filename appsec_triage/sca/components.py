@@ -1,24 +1,4 @@
-"""A component the platform does not run closes a CVE before anything looks for it.
-
-Some flaws live in a part of a library only one kind of program uses. An
-authorization bypass in `ssh.ServerConfig.PublicKeyCallback` needs the
-application to accept SSH connections; a service in a Kubernetes pod, reached
-through an ingress and `kubectl exec`, accepts none. When the operator declares
-that as a fact of the platform, searching the code and asking CodeQL about such
-a CVE spends minutes confirming a decision already made.
-
-So the question is asked first, and split the usual way. The operator's fact
-decides — it is written in `deployment.yaml`, next to its reason. The model only
-says whether this advisory needs that component, with a sentence of the advisory
-quoted verbatim: a flaw that also reaches clients, or one the text does not tie
-to the component, is not excluded. A keyword filter keeps the question away from
-advisories that never mention the component at all.
-
-The code is still searched for the component. A server found in a service the
-operator says runs none does not reopen the finding — that call belongs to the
-operator — but it goes into the report as an anti-pattern, with the line, so the
-exception is visible instead of silently covered.
-"""
+"""A component the platform does not run closes a CVE before anything looks for it."""
 
 from __future__ import annotations
 
@@ -78,12 +58,13 @@ class Exclusion:
     def decision(self) -> CVEDecision:
         reasons = [f"advisory требует компонент «{self.component.id}»: «{self.quote[:200]}»",
                    f"по факту среды {self.component.requires}: {self.component.why}",
+                   f"владелец: {self.component.owner}",
                    "закрыто по заявленному факту платформы, до поиска в коде и до CodeQL"]
         if self.why:
             reasons.insert(1, self.why)
         if self.markers:
             reasons.append("антипаттерн — компонент всё же найден в проекте: " + ", ".join(self.markers))
-        return CVEDecision(CVEVerdict.CONDITION_ABSENT,
+        return CVEDecision(CVEVerdict.INFRASTRUCTURE,
                            f"к сервису не относится: {self.component.why}", reasons, list(self.markers))
 
 
@@ -110,8 +91,6 @@ def markers_in(roots, markers: list[str]) -> list[str]:
     for root in roots:
         root = Path(root)
         visited = 0
-        # Pruned during the walk: filtering after `rglob` still enumerated all of
-        # node_modules/ and vendor/, and the file limit never counted them.
         for parent, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
             for name in filenames:

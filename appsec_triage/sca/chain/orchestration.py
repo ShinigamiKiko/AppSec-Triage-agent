@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import logging
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import advisories as adv
-from .. import codeql_agent, codeql_reach, components as components_mod, conditions as conditions_mod, llm_advisory
+from .. import codeql_agent, codeql_api, codeql_reach, components as components_mod
+from .. import conditions as conditions_mod, llm_advisory
 from .. import exploitable as exploitable_mod, govulncheck as govulncheck_mod
 from .. import presence as presence_mod, reach as reach_mod, receiver as receiver_mod
-from .. import registries, unreached as unreached_mod
-from .helpers import _finding_call_site, _needs_llm_advisory, _render_finding_trace
+from .. import lsp_tools as lsp_tools_mod, registries, unreached as unreached_mod
+from .. import verdict as verdict_mod, versions as versions_mod
+from ...lsp import code_tools as lsp_code_tools
+from .helpers import _CODEQL_LANGUAGE, _finding_call_site, _needs_llm_advisory, _render_finding_trace
 from .models import ChainResult
 from .support import ChainSupport
+
 from ..verdict import CVEVerdict, decide
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..context.routes import RouteIndex
@@ -23,7 +31,60 @@ if TYPE_CHECKING:
 
 
 class DependencyChain(ChainSupport):
-    """Steps 1-4 for dependency findings. Constructed once per run."""
+    """Steps 1-4 for dependency findings."""
+
+    def prepare(self, findings: Iterable[Finding], *, workers: int = 1,
+                progress: Callable[[int, int], None] | None = None) -> None:
+        """Ask the database once per package, before any finding is triaged."""
+        if not self._roots or not self._databases:
+            return
+        todo: list[tuple[Finding, object, str, str]] = []
+        for finding in findings:
+            dependency = getattr(finding, "dependency", None)
+            if dependency is None or not dependency.package:
+                continue
+            language = _CODEQL_LANGUAGE.get((dependency.ecosystem or "").strip().lower())
+            if language not in codeql_api.SUPPORTED or language not in self._databases:
+                continue
+            package = dependency.package
+            if self._imports_absent(language, package):
+                continue
+            todo.append((finding, dependency, language, package))
+
+        def resolve(item):
+            finding, dependency, _, _ = item
+            try:
+                advisory = self._advisory_for(finding, dependency)
+                return self._resolve_symbol(advisory, dependency.installed_version or "")
+            except Exception:  # noqa: BLE001 - подготовка не обязана удаться
+                log.debug("batch prepare skipped %s", getattr(finding, "finding_id", "?"), exc_info=True)
+                return None
+
+        wanted: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(resolve, item): item for item in todo}
+            for done, future in enumerate(as_completed(futures), 1):
+                if progress:
+                    progress(done, len(todo))
+                _, _, language, package = futures[future]
+                symbol = future.result()
+                function = getattr(symbol, "function", "") or ""
+                if not function or getattr(symbol, "not_distributed", False):
+                    continue
+                wanted.setdefault((language, package), set()).add(
+                    (function, getattr(symbol, "klass", "") or ""))
+
+        for (language, package), pairs in wanted.items():
+            targets = sorted({codeql_api.Target(package, function, klass)
+                              for function, klass in pairs}, key=lambda t: (t.function, t.klass))
+            if not targets:
+                continue
+            answer = codeql_api.run(self._databases[language], targets, self._roots[0],
+                                    binary=self._codeql_binary)
+            if answer is None or not answer.usable:
+                continue
+            self._batched[(language, package)] = (answer, frozenset(t.label for t in targets))
+            log.info("codeql batch for %s: %d function(s) in one query", package, len(targets))
 
     def run(self, finding: Finding, *, codeql_findings: Iterable[Finding] = ()) -> ChainResult:
         dependency = finding.dependency
@@ -36,8 +97,6 @@ class DependencyChain(ChainSupport):
             reachability = self._reachability.lookup(finding.rule_id or "", *identifiers)
         if reachability is None and dependency.reachability in {"reachable", "unreachable"}:
             position = _finding_call_site(finding, dependency)
-            # Finding traces are source-first; Verdict.trace follows the
-            # govulncheck convention and keeps the vulnerable frame first.
             trace = [
                 step.message or (f"{step.file_path}:{step.line}" if step.line else step.file_path)
                 for step in reversed(finding.trace)
@@ -60,9 +119,6 @@ class DependencyChain(ChainSupport):
                 sites=sites,
             )
         elif reachability is not None and reachability.reachable and not reachability.sites:
-            # The external govulncheck index may preserve the call-graph verdict
-            # without positional frames. Wolfee still carries those positions,
-            # and CodeQL needs them to ask the dataflow question.
             sites = [
                 (step.file_path, step.line)
                 for step in finding.trace
@@ -76,10 +132,8 @@ class DependencyChain(ChainSupport):
         key = (identifiers[0] if identifiers else "", dependency.package or "",
                dependency.ecosystem or "", dependency.installed_version or "")
         try:
-            advisory = self._advisories.get(key)
-            if advisory is None:
-                advisory = adv.collect(*key, nvd_api_key=self._nvd_api_key)
-                self._advisories[key] = advisory
+            advisory, _ = self._once(self._advisories, key,
+                                     lambda: adv.collect(*key, nvd_api_key=self._nvd_api_key))
         except adv.DatabaseUnavailable as exc:
             problems.append(f"базы уязвимостей недоступны: {exc}")
             self.stats["undecided"] += 1
@@ -87,13 +141,22 @@ class DependencyChain(ChainSupport):
         if advisory.problem:
             problems.append(advisory.problem)
 
-        # A component the platform does not run settles the finding before any
-        # search, so neither the symbol lookup nor CodeQL is spent on it.
+        version_check = versions_mod.check(dependency.installed_version or "", advisory,
+                                           dependency.package or "", dependency.ecosystem or "")
+        if version_check.unaffected:
+            self.stats["version_unaffected"] += 1
+            return ChainResult(verdict_mod.version_unaffected(version_check), problems=problems,
+                               route="version")
+        if version_check.state == versions_mod.UNKNOWN:
+            problems.append(f"сверка версии не выполнена: {version_check.detail}")
+        else:
+            problems.append(f"сверка версии: {version_check.detail}")
+
         exclusion = components_mod.classify(advisory, self._deployment, self._client, self._roots)
         if exclusion is not None:
             self.stats["out_of_scope"] += 1
             return ChainResult(exclusion.decision(), problems=problems, route="excluded",
-                               audit=exclusion.render())
+                               audit=exclusion.render(), owner=exclusion.component.owner)
 
         context_parts = []
         if trace_context := _render_finding_trace(finding):
@@ -101,21 +164,9 @@ class DependencyChain(ChainSupport):
         if reachability is not None and reachability.reachable:
             if rendered := reachability.render():
                 context_parts.append(f"Wolfee reachability:\n{rendered}")
-        trace_dataflow = None
         dataflow_status = ""
         # Every question put to CodeQL for this finding, by whom, and its answer.
         codeql_calls: list[str] = []
-        if reachability is not None and reachability.reachable and reachability.sites:
-            trace_dataflow = self._dataflow_for(None, dependency, reachability.sites, record=codeql_calls,
-                                                asked_by="цепочка (позиции из графа вызовов)")
-            if isinstance(trace_dataflow, codeql_reach.Reached):
-                dataflow_status = trace_dataflow.render()
-                context_parts.append(trace_dataflow.render())
-            elif trace_dataflow is False:
-                dataflow_status = "CodeQL: ни одна проверенная позиция не получает пользовательский ввод."
-                context_parts.append(dataflow_status)
-            elif isinstance(trace_dataflow, str):
-                dataflow_status = trace_dataflow
         dataflow_context = "\n\n".join(context_parts)
         if _needs_llm_advisory(advisory) and reachability is not None and reachability.reachable:
             context = llm_advisory.lookup(
@@ -127,13 +178,15 @@ class DependencyChain(ChainSupport):
             else:
                 problems.append("внешние базы не дали описания advisory; LLM fallback недоступен")
 
-        symbol = self._resolver.resolve(advisory, dependency.installed_version or "")
+        symbol = self._resolve_symbol(advisory, dependency.installed_version or "")
         if symbol.note and not symbol.usable:
             problems.append(symbol.note)
         if symbol.precondition_problem:
             problems.append(symbol.precondition_problem)
         if symbol.usable:
             self.stats["resolved"] += 1
+
+        placement = self._placement(dependency.package or "")
 
         call_site = None
         if reachability is not None and reachability.reachable and self._roots:
@@ -158,7 +211,6 @@ class DependencyChain(ChainSupport):
             if graph_audit.detail and not graph_audit.reopens:
                 problems.append(graph_audit.detail)
 
-        placement = self._placement(dependency.package or "")
         bridge, targets, walked_through = self._bridge(symbol, placement, dependency)
         if bridge is not None and bridge.detail and bridge.calls_it is None:
             problems.append(bridge.detail)
@@ -176,16 +228,7 @@ class DependencyChain(ChainSupport):
         seen: set[str] = set()
 
         def search(pairs, *, lead: bool) -> None:
-            """Look for the first of `pairs` this code calls.
-
-            CodeQL's API graph goes first wherever a database for the language
-            exists: it resolves the call to the package's own export and answers
-            the dataflow question in the same pass. When it finds no call, the
-            text search still runs — a dynamic `require` or a bundler shim is
-            invisible to the graph, and its silence must not hide a call that is
-            written in the file. `lead` marks names the model supplied: searched,
-            never trusted to close anything.
-            """
+            """Look for the first of `pairs` this code calls."""
             nonlocal found, matched_symbol, receiver_class, api_answer
             if self._uses_psalm(dependency):
                 # PHP names from a fix diff carry no class; the installed package says which.
@@ -227,21 +270,40 @@ class DependencyChain(ChainSupport):
                         matched_symbol, receiver_class = label, short_class
                         return
 
-        # The model questions CodeQL first, wherever a database exists: it knows
-        # which exports lead to the flaw and reacts to what comes back. A call or a
-        # path it finds is a fact of the database; a miss on its names is not, so
-        # the chain's deterministic search still runs when it finds nothing.
         model_reached = None
-        if (self._client is not None and self._codeql_api_available(dependency)
+        lsp_audit = None
+        lsp_tools = (lsp_tools_mod.LSPTools(self._lsp, self._roots[0], dependency.ecosystem or "",
+                                            api_package, dependency.installed_version or "")
+                     if self._lsp is not None and self._roots else None)
+        engine_ok = self._codeql_api_available(dependency)
+        lsp_ok = lsp_tools is not None and bool(lsp_tools.language)
+        code_tools = (lsp_code_tools.CodeTools(self._lsp, self._roots[0])
+                      if self._lsp is not None and self._roots else None)
+        code_ok = code_tools is not None and bool(code_tools.languages())
+        if (self._client is not None and symbol.function and (engine_ok or lsp_ok or code_ok)
                 and not (bridge is not None and bridge.closes) and not symbol.not_distributed):
             engine = self._engine_name(dependency)
             asker = f"модель (запрос к {engine})"
             investigation = codeql_agent.investigate(
                 self._client, advisory, symbol, api_package, engine=engine,
+                api_hint=self._api_hint(dependency, api_package),
+                ask_package=lambda: self._package_usage(
+                    dependency, api_package, record=codeql_calls),
                 ask_functions=lambda pairs: self._codeql_api_for(
                     dependency, api_package, pairs, record=codeql_calls, asked_by=asker),
                 ask_sites=lambda sites: self._dataflow_for(
-                    None, dependency, sites, record=codeql_calls, asked_by=asker))
+                    None, dependency, sites, record=codeql_calls, asked_by=asker),
+                lsp_tools=lsp_tools if lsp_ok else None, engine_available=engine_ok,
+                code_tools=code_tools)
+            codeql_calls.extend(f"модель → {line}" for line in investigation.lsp_log)
+            if investigation.lsp_called:
+                problems.append("LSP нашёл вызовы уязвимой функции из кода проекта: "
+                                + " | ".join(investigation.lsp_called)[:400])
+            elif investigation.lsp_not_called:
+                lsp_audit = unreached_mod.Audit(
+                    kind="not_called", checked=True, subject="языковой сервер",
+                    detail=("LSP (запросы модели): у " + ", ".join(investigation.lsp_not_called)
+                            + " нет ни одного вызова из кода проекта — ссылки искались от объявления в пакете"))
             model_reached = investigation.reached
             if investigation.found is not None:
                 found, matched_symbol, receiver_class, api_answer = (
@@ -253,14 +315,6 @@ class DependencyChain(ChainSupport):
         if found is None or not found.found:
             search(targets, lead=False)
 
-        # A fix corrects the function whose body was wrong, and in a library that
-        # is usually a private helper no application calls: on a seeded project
-        # js-yaml's code injection resolved to `storeMappingPair`, the search
-        # missed it while `yaml.load(req.body)` sat in the handler, and the call
-        # site never got its dataflow question. For a direct dependency that miss
-        # is expected rather than informative, so the public entry points above
-        # the helper are searched too. They are named by the model and stay
-        # leads: a hit opens the finding, a miss closes nothing.
         if (found is not None and found.presence is presence_mod.SymbolPresence.ABSENT
                 and not (bridge is not None and bridge.closes)
                 and placement is not None and placement.direct
@@ -288,8 +342,6 @@ class DependencyChain(ChainSupport):
 
         dataflow = None
         if api_answer is not None and matched_symbol:
-            # The call was resolved by CodeQL, which asked the dataflow question
-            # in the same pass: its path, or its "no path", is the answer.
             dataflow = api_answer.dataflow(matched_symbol)
         elif found is not None and found.presence is presence_mod.SymbolPresence.CALLED:
             dataflow = self._dataflow_for(found, dependency, record=codeql_calls,
@@ -300,18 +352,11 @@ class DependencyChain(ChainSupport):
         if isinstance(model_reached, codeql_reach.Reached) and not isinstance(dataflow, codeql_reach.Reached):
             # A path CodeQL traced for a query the model chose is still CodeQL's path.
             dataflow = model_reached
-        if isinstance(trace_dataflow, codeql_reach.Reached):
-            dataflow = trace_dataflow
-        elif trace_dataflow is False and dataflow is None:
-            dataflow = False
-            dataflow_status = "CodeQL: ни одна проверенная позиция не получает пользовательский ввод."
-        elif isinstance(dataflow, str):
+        if isinstance(dataflow, str):
             dataflow_status = dataflow
         elif dataflow is False and not dataflow_status:
             dataflow_status = "CodeQL: ни одна проверенная позиция не получает пользовательский ввод."
         reached = None
-        # Once CodeQL has answered the dataflow question, a second answer written
-        # by the model reading the file would only compete with the real path.
         if (found is not None and found.presence is presence_mod.SymbolPresence.CALLED
                 and reach_mod.needs_input_path(finding.cwe) and dataflow is None):
             reached = reach_mod.assess(
@@ -347,13 +392,15 @@ class DependencyChain(ChainSupport):
         closure_audit = None
         graph_closes = reachability is not None and not reachability.reachable
         if self._roots and not graph_closes:
-            if dependency.dev_only:
+            if receiver_disproved:
+                closure_kind, claim = "wrong_receiver", (
+                    f"языковой сервер разрешил все вызовы {symbol} вне пакета {dependency.package}")
+            elif dependency.dev_only:
                 closure_kind, claim = "not_shipped", (
                     f"пакет {dependency.package} помечен в SBOM как нужный только для сборки или тестов")
             elif used is False and test_only and direct:
                 closure_kind, claim = "test_only", f"пакет {used_package} импортируется только в тестовом коде"
-            elif (reachability is None and dataflow is False and input_driven
-                    and not receiver_disproved):
+            elif reachability is None and dataflow is False and input_driven:
                 closure_kind, claim = "no_input_path", (
                     f"CodeQL не нашёл пути от пользовательского ввода к вызову {symbol}")
             elif package_used is False:
@@ -361,9 +408,6 @@ class DependencyChain(ChainSupport):
                     f"путь импорта {', '.join(symbol.package_paths[:3])} не найден в дереве проекта")
             elif used is False:
                 closure_kind, claim = "unused", f"пакет {used_package} не найден в дереве проекта"
-            elif receiver_disproved:
-                closure_kind, claim = "wrong_receiver", (
-                    f"языковой сервер разрешил все вызовы {symbol} вне пакета {dependency.package}")
             else:
                 closure_kind, claim = "", ""
             if closure_kind:
@@ -395,16 +439,34 @@ class DependencyChain(ChainSupport):
                    receiver_disproved=receiver_disproved, reachability=reachability,
                    call_site=call_site, graph_audit=graph_audit, dataflow=dataflow,
                    input_driven=input_driven,
-                   direct=direct, condition=condition),
+                   direct=direct, condition=condition, lsp_audit=lsp_audit),
             symbol, found, reached, problems, placement=placement, bridge=bridge,
             searched_for=searched, condition=condition, exploitability=exploit,
              matched_symbol=matched_symbol, reachability=reachability,
              dataflow=(dataflow if dataflow not in (None, False) else None),
              dataflow_status=dataflow_status, route=route, codeql_calls=codeql_calls)
         checked = closure_audit or graph_audit
+        if result.decision.verdict is CVEVerdict.NOT_CALLED:
+            checked = lsp_audit
         if checked is not None:
             result.audit = checked.render()
+            result.closure_kind = checked.kind
+            result.audited = checked.checked
         verdict = result.decision.verdict
+        if (checked is None and condition.state is conditions_mod.ConditionState.ABSENT
+                and condition.source == "text"):
+            result.closure_kind = "condition_absent"
+            result.audited = False
+            if verdict is CVEVerdict.PRESENT_UNPROVEN:
+                self.stats["unaudited_closures"] += 1
+                log.warning("closure for %s left unaudited, sent to review: "
+                            "condition absent by text search only (%s)",
+                            advisory.advisory_id, condition.statement[:120])
+        if verdict is CVEVerdict.PRESENT_UNPROVEN and checked is not None \
+                and not checked.checked:
+            self.stats["unaudited_closures"] += 1
+            log.warning("closure for %s left unaudited, sent to review: %s",
+                        advisory.advisory_id, checked.detail)
         if verdict is CVEVerdict.NOT_APPLICABLE:
             self.stats["not_distributed"] += 1
         elif verdict in (CVEVerdict.NO_DIRECT_CALL, CVEVerdict.MENTIONED_ONLY,

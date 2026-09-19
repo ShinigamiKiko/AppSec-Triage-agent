@@ -11,7 +11,7 @@ timeout_s: 240
 connect_timeout_s: 10
 max_retries: 1
 concurrency: 2
-budget_usd: 1.0
+budget_usd: 5.0
 keep_raw_response: false
 # Conservative planning estimates, NOT a quotation of current provider tariffs.
 # Replace with your account's rates for accurate cost reporting. This makes the
@@ -19,3 +19,5 @@ keep_raw_response: false
 pricing:
   input_usd_per_mtok: 2.0
   output_usd_per_mtok: 8.0
+# deepseek-reasoner не принимает `tools` — шаги с анализатором идут по JSON-протоколу.
+tool_calling: false

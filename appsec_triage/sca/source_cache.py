@@ -1,10 +1,4 @@
-"""Run-scoped, read-only source cache for exact dependency versions.
-
-The cache exists for transitive bridge analysis. It never installs a package,
-runs package-manager scripts, or adds files to the project. Composer archives
-are resolved through Packagist metadata, bounded, validated, and unpacked into
-a fresh temporary directory that is deleted when the SCA run ends.
-"""
+"""Run-scoped, read-only source cache for exact dependency versions."""
 
 from __future__ import annotations
 

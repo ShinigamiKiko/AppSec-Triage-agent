@@ -1,0 +1,49 @@
+# Example GitLab CI configuration for appsec-triage
+
+stages:
+  - security
+
+appsec-triage:
+  stage: security
+  image: your-registry/appsec-triage:latest
+  variables:
+    # REQUIRED: Specify ecosystems in your project
+    # Supported: npm, composer, pypi, go, maven, rubygems, cargo, nuget
+    APPSEC_ECOSYSTEMS: "npm"
+  
+  script:
+    - appsec-triage scan --root $CI_PROJECT_DIR --output appsec-report
+  
+  artifacts:
+    when: always
+    paths:
+      - appsec-report/
+    expire_in: 30 days
+  
+  only:
+    - merge_requests
+    - main
+
+# Example: Multi-ecosystem project
+appsec-triage-fullstack:
+  extends: appsec-triage
+  variables:
+    APPSEC_ECOSYSTEMS: "npm,pypi,go"
+
+# Example: PHP project
+appsec-triage-php:
+  extends: appsec-triage
+  variables:
+    APPSEC_ECOSYSTEMS: "composer"
+
+# Example: Java/Kotlin project
+appsec-triage-java:
+  extends: appsec-triage
+  variables:
+    APPSEC_ECOSYSTEMS: "maven"
+
+# Example: Rust project
+appsec-triage-rust:
+  extends: appsec-triage
+  variables:
+    APPSEC_ECOSYSTEMS: "cargo"
