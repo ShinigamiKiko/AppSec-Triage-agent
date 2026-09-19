@@ -106,7 +106,6 @@ def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str
                 patterns.append(rf"use\s+{re.escape(part)}\b")
         patterns.append(re.escape(package))
     else:
-        name = package.lstrip("@")
         patterns.append(rf"""["'`]{re.escape(package)}(?:/[^"'`]*)?["'`]""")
 
     return [re.compile(p, re.IGNORECASE) for p in patterns]

@@ -9,7 +9,7 @@ from pathlib import Path
 from .. import advisories as adv
 from .. import codeql_api, codeql_reach, container as container_mod, exploitability as exploit_mod, psalm_api
 from .. import presence as presence_mod, registries
-from ..bridge import BridgeResult, BridgeWalk, walk_bridge
+from ..bridge import BridgeWalk, walk_bridge
 from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
 from ..resolve import SymbolResolver, VulnerableSymbol

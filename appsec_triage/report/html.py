@@ -466,7 +466,7 @@ def _record_html(r: TriageRecord) -> str:
             if v.self_reported_confidence is not None
             else ""
         )
-        + f'</summary><div class="body">'),
+        + '</summary><div class="body">'),
         _why_html(r),
     ]
 

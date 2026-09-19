@@ -25,8 +25,6 @@ from ..verdict import CVEVerdict, decide
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ..context.routes import RouteIndex
-    from ..lsp.service import LSPService
     from ..models import Finding
 
 
