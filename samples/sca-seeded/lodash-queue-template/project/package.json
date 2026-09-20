@@ -1,0 +1,10 @@
+{
+  "name": "lodash-queue-template",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/worker.js",
+  "dependencies": {
+    "amqplib": "0.10.4",
+    "lodash": "4.17.20"
+  }
+}

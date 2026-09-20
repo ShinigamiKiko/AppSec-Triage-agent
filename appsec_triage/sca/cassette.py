@@ -46,10 +46,11 @@ def _write(path: Path, url: str, status: int, body: bytes, final_url: str) -> No
 
 def urlopen(request: urllib.request.Request, *, timeout: float, opener=None):
     """`urllib.request.urlopen` (or `opener.open`), routed through the cassette when one is set."""
-    live = opener.open if opener is not None else urllib.request.urlopen
     directory = os.environ.get(DIR_ENV)
     if not directory:
-        return live(request, timeout=timeout)
+        if opener is not None:
+            return opener.open(request, timeout=timeout)
+        return urllib.request.urlopen(request, timeout=timeout)
 
     path = Path(directory) / f"{_key(request)}.json"
     if os.environ.get(MODE_ENV, "replay").strip().lower() != "record":
@@ -62,9 +63,14 @@ def urlopen(request: urllib.request.Request, *, timeout: float, opener=None):
         return _Replayed(base64.b64decode(entry["body"]), entry["final_url"])
 
     try:
-        with live(request, timeout=timeout) as response:
-            body = response.read()
-            final_url = response.geturl()
+        if opener is not None:
+            with opener.open(request, timeout=timeout) as response:
+                body = response.read()
+                final_url = response.geturl()
+        else:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+                final_url = response.geturl()
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             _write(path, request.full_url, 404, b"", request.full_url)

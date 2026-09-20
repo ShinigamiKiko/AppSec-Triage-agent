@@ -15,6 +15,8 @@ def _triage_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prompt-pack", dest="prompt_pack")
     p.add_argument("--config", type=Path)
     p.add_argument("--workers", type=int)
+    p.add_argument("--parallel-llm", type=int, default=2,
+                   help="maximum independent LLM tool calls per turn (default: 2)")
     p.add_argument("--limit", type=int)
     p.add_argument("--govulncheck", dest="govulncheck", type=Path)
     # On by default; the flag stays so older commands and CI files keep working.

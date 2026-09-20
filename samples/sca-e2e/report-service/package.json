@@ -1,0 +1,10 @@
+{
+  "name": "report-service",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/server.js",
+  "dependencies": {
+    "express": "4.21.2",
+    "lodash": "4.17.20"
+  }
+}

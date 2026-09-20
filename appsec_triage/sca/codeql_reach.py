@@ -43,12 +43,17 @@ def database_lock(database: str | Path) -> threading.Lock:
         return _DATABASE_LOCKS.setdefault(key, threading.Lock())
 
 
-def run_codeql(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+def run_codeql(argv: list[str], *, finding_id: str = "", **kwargs) -> subprocess.CompletedProcess:
     """`subprocess.run` for a CodeQL command, holding its database's lock while it runs."""
     database = _database_of(argv)
     if database is None:
         return subprocess.run(argv, **kwargs)
-    with database_lock(database):
+    
+    lock = database_lock(database)
+    prefix = f"[{finding_id}] " if finding_id else ""
+    log.debug("%sacquiring database lock: %s", prefix, database)
+    with lock:
+        log.debug("%sdatabase lock acquired: %s", prefix, database)
         return subprocess.run(argv, **kwargs)
 
 _TIMEOUT_S = 1800
@@ -189,7 +194,7 @@ def _predicate(sites: list[tuple[str, int]]) -> str:
 
 
 def run(database: Path | str, language: str, sites: list[tuple[str, int]],
-        *, binary: str = "codeql", timeout_s: int = _TIMEOUT_S) -> Answer:
+        *, binary: str = "codeql", timeout_s: int = _TIMEOUT_S, finding_id: str = "") -> Answer:
     """Ask one database which of these call sites user input reaches."""
     wanted = sorted({(str(f), int(l)) for f, l in sites if f and l})
     if not wanted:
@@ -211,6 +216,9 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         targets=_predicate(wanted),
     )
 
+    prefix = f"[{finding_id}] " if finding_id else ""
+    log.info("%scodeql reachability: checking %d call sites", prefix, len(wanted))
+
     with tempfile.TemporaryDirectory(prefix="sca-reach-") as work:
         pack = Path(work)
         (pack / "qlpack.yml").write_text(
@@ -225,38 +233,51 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         results = pack / "results.bqrs"
         evaluated_results = pack / "evaluated.bqrs"
 
-        argv = [binary, "query", "run", *query_flags(), f"--database={database}",
-                f"--output={results}", str(query_file)]
-        try:
-            proc = run_codeql(argv, capture_output=True, text=True,
-                                  timeout=timeout_s, encoding="utf-8", errors="replace", check=False)
-        except subprocess.TimeoutExpired:
-            return Answer(problem=f"запрос CodeQL не уложился в {timeout_s}с")
-        except OSError as exc:
-            return Answer(problem=f"codeql не запустился: {exc}")
-        if proc.returncode != 0:
-            tail = "\n".join((proc.stderr or "").strip().splitlines()[-4:])
-            return Answer(problem=f"запрос CodeQL не выполнился: {tail[:300]}")
-
-        try:
-            evaluated_proc = run_codeql(
-                [binary, "query", "run", *query_flags(), f"--database={database}",
-                 f"--output={evaluated_results}", str(evaluated_file)],
-                capture_output=True, text=True, timeout=timeout_s,
-                encoding="utf-8", errors="replace", check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return Answer(problem=f"проверка позиций CodeQL не уложилась в {timeout_s}с")
-        except OSError as exc:
-            return Answer(problem=f"codeql не запустился для проверки позиций: {exc}")
-        if evaluated_proc.returncode != 0:
-            tail = "\n".join((evaluated_proc.stderr or "").strip().splitlines()[-4:])
-            return Answer(problem=f"проверка позиций CodeQL не выполнилась: {tail[:300]}")
+        # Run both queries in parallel using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        
+        def run_query(query_path: Path, output_path: Path, query_name: str):
+            argv = [binary, "query", "run", *query_flags(), f"--database={database}",
+                    f"--output={output_path}", str(query_path)]
+            start = time.monotonic()
+            log.info("%sstarting %s", prefix, query_name)
+            try:
+                proc = run_codeql(argv, capture_output=True, text=True,
+                                  timeout=timeout_s, encoding="utf-8", errors="replace", check=False,
+                                  finding_id=finding_id)
+                elapsed = time.monotonic() - start
+                if proc.returncode != 0:
+                    tail = "\n".join((proc.stderr or "").strip().splitlines()[-4:])
+                    log.warning("%s%s failed after %.2fs", prefix, query_name, elapsed)
+                    return None, f"{query_name} не выполнился: {tail[:300]}"
+                log.info("%s%s completed in %.2fs", prefix, query_name, elapsed)
+                return proc, None
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - start
+                log.warning("%s%s timed out after %.2fs", prefix, query_name, elapsed)
+                return None, f"{query_name} не уложился в {timeout_s}с"
+            except OSError as exc:
+                elapsed = time.monotonic() - start
+                log.error("%s%s failed to start after %.2fs: %s", prefix, query_name, elapsed, exc)
+                return None, f"codeql не запустился для {query_name}: {exc}"
+        
+        batch_start = time.monotonic()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            main_future = pool.submit(run_query, query_file, results, "запрос достижимости")
+            eval_future = pool.submit(run_query, evaluated_file, evaluated_results, "проверка позиций")
+            
+            for future in as_completed([main_future, eval_future]):
+                proc, error = future.result()
+                if error:
+                    return Answer(problem=error)
+        batch_elapsed = time.monotonic() - batch_start
+        log.info("%sboth reachability queries completed in %.2fs", prefix, batch_elapsed)
 
         decode = [binary, "bqrs", "decode", "--format=csv", "--no-titles", str(results)]
         try:
             decoded = run_codeql(decode, capture_output=True, text=True,
-                timeout=180, encoding="utf-8", errors="replace", check=False)
+                timeout=180, encoding="utf-8", errors="replace", check=False, finding_id=finding_id)
         except (subprocess.TimeoutExpired, OSError) as exc:
             return Answer(problem=f"результат CodeQL не прочитан: {exc}")
         if decoded.returncode != 0:
@@ -265,7 +286,7 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         evaluated_decode = run_codeql(
             [binary, "bqrs", "decode", "--format=csv", "--no-titles", str(evaluated_results)],
             capture_output=True, text=True, timeout=180,
-            encoding="utf-8", errors="replace", check=False,
+            encoding="utf-8", errors="replace", check=False, finding_id=finding_id,
         )
         if evaluated_decode.returncode != 0:
             return Answer(problem="позиции CodeQL не прочитаны: bqrs decode отказал")
@@ -287,6 +308,6 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
             continue
         answer.reached.setdefault(found.site, found)
 
-    log.info("codeql reachability: %d of %d call sites reached",
+    log.info("%scodeql reachability: %d of %d call sites reached", prefix,
              len(answer.reached), len(answer.asked))
     return answer
