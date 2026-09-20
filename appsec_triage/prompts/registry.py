@@ -49,8 +49,27 @@ def training_context() -> str:
     return text
 
 
+# The report is read in Russian, so the model writes its prose in Russian. What
+# it must NOT translate is anything that is checked character by character: a
+# quote is verified verbatim against the input it came from, and a translated
+# quote fails that check and is thrown away along with the reasoning it carried.
+_ANSWER_LANGUAGE = """## Язык ответа
+
+Все объяснения, обоснования и выводы пиши по-русски.
+
+Оставляй без перевода, ровно как во входных данных:
+- цитаты (поля `quote`, `evidence` и любые другие дословные выдержки);
+- имена функций, классов, методов, файлов, пакетов, версий;
+- идентификаторы advisory (CVE, GHSA, GO-), сообщения сканеров, значения полей.
+
+Цитата сверяется с исходным текстом посимвольно. Переведённая цитата не
+проходит сверку, и вместе с ней отбрасывается весь вывод, который на неё
+опирался. Если цитата на английском — так её и приводи."""
+
+
 def _with_training_context(system: str) -> str:
-    return "\n\n---\n\n## Project-specific context\n\n" + training_context() + "\n\n---\n\n" + system
+    return ("\n\n---\n\n## Project-specific context\n\n" + training_context()
+            + "\n\n---\n\n" + system + "\n\n---\n\n" + _ANSWER_LANGUAGE)
 
 
 def _parse(path: Path) -> Prompt:

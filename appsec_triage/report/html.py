@@ -512,7 +512,7 @@ def _record_html(r: TriageRecord) -> str:
 
     if sym:
         loc = f' <span class="loc">{_e(sym.location)}</span>' if sym.location else ""
-        heading = "What is at fault" if v.verdict.value == "confirmed" else "What the scanner pointed at"
+        heading = "В чём проблема" if v.verdict.value == "confirmed" else "На что указал сканер"
         parts.append(
             f"<h4>{heading}</h4>"
             f'<p><code class="sym">{_e(sym.name)}</code> <span class="kind">{_e(sym.kind)}</span>{loc}<br>'
@@ -524,14 +524,14 @@ def _record_html(r: TriageRecord) -> str:
     parts.append(_confidence_html(v))
     if v.verdict.value == "unknown" and v.blocking_question:
         parts.append(
-            f'<h4>What would settle this</h4><p class="blocking">{_e(v.blocking_question)}</p>'
+            f'<h4>Что решило бы вопрос</h4><p class="blocking">{_e(v.blocking_question)}</p>'
         )
     if v.evidence:
         quotes = "\n".join(_e(q) for q in v.evidence)
         parts.append(f"<h4>Evidence (verified against input)</h4><pre>{quotes}</pre>")
     if v.missing_information:
         items = "".join(f"<li>{_e(m)}</li>" for m in v.missing_information)
-        parts.append(f"<h4>Missing information</h4><ul>{items}</ul>")
+        parts.append(f"<h4>Чего не хватило</h4><ul>{items}</ul>")
     if r.error:
         parts.append(f"<h4>Error</h4><pre>{_e(r.error)}</pre>")
 
@@ -557,17 +557,17 @@ def _coverage_html(run: TriageRun) -> str:
     cov = getattr(run, "coverage", None)
     if cov is None:
         return (
-            '<div class="cov unknown">Scanner coverage unknown — these findings were not produced '
-            "by a scan this report can account for.</div>"
+            '<div class="cov unknown">Охват сканерами неизвестен — эти находки пришли не из '
+            "сканирования, за которое этот отчёт отвечает.</div>"
         )
     if getattr(cov, "complete", False):
-        return f'<div class="cov ok">All scanners completed: {_e(", ".join(cov.ran))}.</div>'
+        return f'<div class="cov ok">Все сканеры отработали: {_e(", ".join(cov.ran))}.</div>'
     gaps = "".join(f"<li>{_e(g)}</li>" for g in cov.gaps())
     return (
-        '<div class="cov bad"><strong>This report is incomplete.</strong>'
+        '<div class="cov bad"><strong>Отчёт неполный.</strong>'
         f"<ul>{gaps}</ul>"
-        "Findings below cover only what did run — a low count here is not evidence of a clean "
-        "codebase.</div>"
+        "Ниже только то, что успело отработать. Малое число находок здесь не означает "
+        "чистый код.</div>"
     )
 
 
@@ -579,14 +579,14 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
 
     scoped_out = sum(v for v in run.scope_excluded.values())
     cards = [
-        ("Findings", len(run.records), ""),
-        ("Model triaged", run.triaged_count, ""),
-        ("Confirmed", counts["confirmed"], "confirmed"),
-        ("Unknown", counts["unknown"], "unknown"),
-        ("Auto-closed", counts["false_positive"], "false_positive"),
-        ("Needs a human", review, ""),
-        ("Noise removed", f'{100 * counts["false_positive"] / total:.0f}%', ""),
-        ("Out of scope", scoped_out, ""),
+        ("Находок", len(run.records), ""),
+        ("Разобрано моделью", run.triaged_count, ""),
+        ("Подтверждено", counts["confirmed"], "confirmed"),
+        ("Не решено", counts["unknown"], "unknown"),
+        ("Закрыто автоматически", counts["false_positive"], "false_positive"),
+        ("На человека", review, ""),
+        ("Шума убрано", f'{100 * counts["false_positive"] / total:.0f}%', ""),
+        ("Вне области", scoped_out, ""),
     ]
     cards_html = "".join(
         f'<div class="card"><div class="n {cls}">{_e(n)}</div><div class="l">{_e(label)}</div></div>'
