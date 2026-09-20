@@ -238,7 +238,7 @@ def _trace_body(r: TriageRecord) -> str:
 def _external_cell(r: TriageRecord) -> str:
     """What has to be checked outside the code, and by whom."""
     if not r.sca:
-        return "—"
+        return '<span class="ext">цепочка не запускалась</span>'
     if r.sca.owner:
         return (f'<span class="ext">инфраструктура</span><br>{_e(r.sca.external)}'
                 f'<br><em>владелец: {_e(r.sca.owner)}</em>')
@@ -258,8 +258,12 @@ _CONDITION_LABEL = {
 def _condition_cell(r: TriageRecord) -> str:
     """What the flaw needs besides the vulnerable function, and what the repository answered."""
     sca = r.sca
-    if not sca or not sca.condition:
-        return "—"
+    if not sca:
+        return '<span class="cond outside">цепочка не запускалась</span>'
+    if not sca.condition:
+        # No precondition is a fact about the advisory, not a gap in the run:
+        # this flaw fires on the call alone.
+        return '<span class="cond outside">условий нет: достаточно вызова</span>'
     label, css = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", "outside"))
     parts = [f'<span class="cond {css}">{_e(label)}</span>', _e(sca.condition[:300])]
     if sca.condition_hits:
@@ -380,6 +384,12 @@ def _why_html(r: TriageRecord) -> str:
         if r.sca.placement:
             source += f" · {_e(r.sca.placement)}"
     step("Сканер сообщил", f"<p>{source}</p>")
+
+    if r.sca and r.sca.flaw:
+        body = f"<p>{_e(r.sca.flaw)}</p>"
+        if r.sca.what_changed:
+            body += f'<p class="note">исправление: {_e(r.sca.what_changed)}</p>'
+        step("В чём уязвимость", body)
 
     if r.reachability:
         step("Граф вызовов", f"<p>{_e(r.reachability)}</p>")

@@ -16,7 +16,8 @@ from .. import presence as presence_mod, reach as reach_mod, receiver as receive
 from .. import lsp_tools as lsp_tools_mod, registries, unreached as unreached_mod
 from .. import verdict as verdict_mod, versions as versions_mod
 from ...lsp import code_tools as lsp_code_tools
-from .helpers import _CODEQL_LANGUAGE, _finding_call_site, _needs_llm_advisory, _render_finding_trace
+from .helpers import (_CODEQL_LANGUAGE, _finding_call_site, _flaw_of, _needs_llm_advisory,
+                      _render_finding_trace)
 from .models import ChainResult
 from .support import ChainSupport
 
@@ -144,7 +145,7 @@ class DependencyChain(ChainSupport):
         if version_check.unaffected:
             self.stats["version_unaffected"] += 1
             return ChainResult(verdict_mod.version_unaffected(version_check), problems=problems,
-                               route="version")
+                               route="version", flaw=_flaw_of(advisory))
         if version_check.state == versions_mod.UNKNOWN:
             problems.append(f"сверка версии не выполнена: {version_check.detail}")
         else:
@@ -154,6 +155,7 @@ class DependencyChain(ChainSupport):
         if exclusion is not None:
             self.stats["out_of_scope"] += 1
             return ChainResult(exclusion.decision(), problems=problems, route="excluded",
+                               flaw=_flaw_of(advisory),
                                audit=exclusion.render(), owner=exclusion.component.owner)
 
         context_parts = []
@@ -448,7 +450,8 @@ class DependencyChain(ChainSupport):
             searched_for=searched, condition=condition, exploitability=exploit,
              matched_symbol=matched_symbol, reachability=reachability,
              dataflow=(dataflow if dataflow not in (None, False) else None),
-             dataflow_status=dataflow_status, route=route, codeql_calls=codeql_calls)
+             dataflow_status=dataflow_status, route=route, codeql_calls=codeql_calls,
+             flaw=_flaw_of(advisory))
         checked = closure_audit or graph_audit
         if result.decision.verdict is CVEVerdict.NOT_CALLED:
             checked = lsp_audit

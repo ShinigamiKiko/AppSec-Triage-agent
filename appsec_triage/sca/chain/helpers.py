@@ -53,6 +53,18 @@ def _pairs(symbols: list[BridgeSymbol], limit: int = 6) -> list[tuple[str, str]]
     return [(s.function, s.klass) for s in symbols[:limit]]
 
 
+def _flaw_of(advisory) -> str:
+    """The advisory's own description of the flaw, trimmed to one paragraph."""
+    summary = " ".join((getattr(advisory, "summary", "") or "").split())
+    details = " ".join((getattr(advisory, "details", "") or "").split())
+    if details.startswith(summary):
+        details = details[len(summary):].lstrip(" .:—-")
+    if len(details) > 420:
+        cut = details.rfind(". ", 0, 420)
+        details = details[:cut + 1] if cut > 200 else details[:420].rstrip() + "…"
+    return ". ".join(part for part in (summary.rstrip("."), details) if part).strip()
+
+
 def _walk_as_bridge(walk: BridgeWalk) -> BridgeResult:
     detail = walk.detail
     if walk.hops > 1:

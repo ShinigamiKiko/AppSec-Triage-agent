@@ -39,6 +39,9 @@ class ChainResult:
     route: str = ""
     codeql_calls: list[str] = field(default_factory=list)
     owner: str = ""
+    # What the advisory says the flaw is, in its own words. Without it a report
+    # can name the vulnerable function but not say what is wrong with it.
+    flaw: str = ""
 
     @property
     def needs_a_person(self) -> bool:
@@ -92,6 +95,7 @@ class ChainResult:
             condition_state=(condition.state.value if condition is not None else ""),
             condition_hits=(list(condition.hits[:4]) if condition is not None else []),
             exploitability=(self.exploitability.render() if self.exploitability else ""),
+            flaw=self.flaw,
             audit=self.audit,
             closure_kind=self.closure_kind,
             audited=self.audited,

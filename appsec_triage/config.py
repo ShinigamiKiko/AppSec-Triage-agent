@@ -197,7 +197,6 @@ class PipelineConfig:
     provider: str = "ollama"
     prompt_pack: str = "default"
     max_workers: int = 4
-    parallel_llm: int = 2
     fail_fast: bool = False
     scope: ScopeConfig = field(default_factory=ScopeConfig)
     queue: TriageQueueConfig = field(default_factory=TriageQueueConfig)
