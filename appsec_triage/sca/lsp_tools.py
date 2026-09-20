@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -14,10 +15,51 @@ log = logging.getLogger(__name__)
 
 ECOSYSTEM_LANGUAGE = {"npm": "typescript", "composer": "php", "go": "go", "golang": "go"}
 
-_SUFFIXES = {
-    "php": (".php",),
-    "typescript": (".d.ts", ".ts", ".js", ".mjs", ".cjs"),
-    "go": (".go",),
+
+@dataclass(frozen=True, slots=True)
+class Language:
+    """How one language spells the things this module has to recognise.
+
+    Everything language-specific lives here, in one row per language, rather
+    than in a chain of checks where whichever language is written last becomes
+    the silent default for every language nobody thought about.
+    """
+
+    suffixes: tuple[str, ...]
+    #: name, class -> the pattern that finds the declaration
+    declaration: Callable[[str, str], re.Pattern[str]]
+    #: class -> the pattern that must also appear in the file, when the
+    #: language declares a method inside a named container. None when a
+    #: function stands on its own, as in Go and JavaScript.
+    container: Callable[[str], re.Pattern[str]] | None = None
+
+
+def _php_declaration(name: str, klass: str) -> re.Pattern[str]:
+    return re.compile(rf"\bfunction\s+&?{re.escape(name)}\s*\(")
+
+
+def _php_container(klass: str) -> re.Pattern[str]:
+    return re.compile(rf"\b(?:class|trait|interface)\s+{re.escape(klass)}\b")
+
+
+def _go_declaration(name: str, klass: str) -> re.Pattern[str]:
+    receiver = rf"\([^)]*\*?{re.escape(klass)}\)\s*" if klass else r"(?:\([^)]*\)\s*)?"
+    return re.compile(rf"\bfunc\s+{receiver}{re.escape(name)}\s*[\[(]")
+
+
+def _ts_declaration(name: str, klass: str) -> re.Pattern[str]:
+    """A declaration in a .d.ts, a function, a method, or an export."""
+    n = re.escape(name)
+    return re.compile(
+        rf"(?:\bfunction\s+{n}\s*[<(]|\bexport\s+(?:declare\s+)?(?:const|let|var|function)\s+{n}\b"
+        rf"|^\s*(?:static\s+|async\s+|public\s+|readonly\s+)*{n}\s*[<(:]|\bexports\.{n}\s*=|\b{n}\s*:\s*function\b)",
+        re.MULTILINE)
+
+
+LANGUAGES = {
+    "php": Language((".php",), _php_declaration, _php_container),
+    "go": Language((".go",), _go_declaration),
+    "typescript": Language((".d.ts", ".ts", ".js", ".mjs", ".cjs"), _ts_declaration),
 }
 _SKIP = {"node_modules", "vendor", ".git", "dist", "build"}
 _MAX_DECLARATIONS = 3
@@ -25,20 +67,6 @@ _MAX_SCANNED = 3000
 _MAX_BYTES = 400_000
 _MAX_LISTED = 8
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
-
-
-def _declaration(language: str, name: str, klass: str) -> re.Pattern[str]:
-    n = re.escape(name)
-    if language == "php":
-        return re.compile(rf"\bfunction\s+&?{n}\s*\(")
-    if language == "go":
-        receiver = rf"\([^)]*\*?{re.escape(klass)}\)\s*" if klass else r"(?:\([^)]*\)\s*)?"
-        return re.compile(rf"\bfunc\s+{receiver}{n}\s*[\[(]")
-    # JS/TS: a declaration in a .d.ts, a function, a method, or an export.
-    return re.compile(
-        rf"(?:\bfunction\s+{n}\s*[<(]|\bexport\s+(?:declare\s+)?(?:const|let|var|function)\s+{n}\b"
-        rf"|^\s*(?:static\s+|async\s+|public\s+|readonly\s+)*{n}\s*[<(:]|\bexports\.{n}\s*=|\b{n}\s*:\s*function\b)",
-        re.MULTILINE)
 
 
 @dataclass(slots=True)
@@ -157,13 +185,14 @@ class LSPTools:
                               "искать негде, сервер не спрашивался")
             return result
         short = klass.rsplit("\\", 1)[-1].rsplit(".", 1)[-1] if klass else ""
-        pattern = _declaration(self.language, name, short)
+        spoken = LANGUAGES[self.language]
+        pattern = spoken.declaration(name, short)
         declarations: list[tuple[Path, int, int]] = []
         scanned = 0
         for path in sorted(self.package_dir.rglob("*")):
             if len(declarations) >= _MAX_DECLARATIONS or scanned >= _MAX_SCANNED:
                 break
-            if not path.is_file() or not path.name.endswith(_SUFFIXES[self.language]):
+            if not path.is_file() or not path.name.endswith(spoken.suffixes):
                 continue
             if {"test", "tests", "__tests__"} & {p.lower() for p in path.parts}:
                 continue
@@ -174,8 +203,7 @@ class LSPTools:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if short and self.language == "php" and not re.search(
-                    rf"\b(?:class|trait|interface)\s+{re.escape(short)}\b", text):
+            if short and spoken.container and not spoken.container(short).search(text):
                 continue
             for match in pattern.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
