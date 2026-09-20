@@ -32,6 +32,7 @@ span.cond.holds{background:#ffebe9;color:#b32020}
 span.cond.absent{background:#dafbe1;color:#1a7f37}
 span.cond.outside{background:#fff8c5;color:#9a6700}
 table.findings .cond-hits{color:#57606a;font-size:11px}
+table.findings .flaw{display:block;color:#1f2328;margin-bottom:.25rem}
 """
 
 _COV_CSS = """
@@ -256,19 +257,29 @@ _CONDITION_LABEL = {
 
 
 def _condition_cell(r: TriageRecord) -> str:
-    """What the flaw needs besides the vulnerable function, and what the repository answered."""
+    """What the flaw is, in the advisory's words, and what else it needs to fire."""
     sca = r.sca
     if not sca:
         return '<span class="cond outside">цепочка не запускалась</span>'
-    if not sca.condition:
+
+    parts = []
+    if sca.flaw:
+        text = sca.flaw if len(sca.flaw) <= 260 else sca.flaw[:260].rstrip() + "…"
+        parts.append(f'<span class="flaw">{_e(text)}</span>')
+
+    if sca.condition:
+        label, css = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", "outside"))
+        parts.append(f'<span class="cond {css}">{_e(label)}</span> {_e(sca.condition[:260])}')
+        if sca.condition_hits:
+            found = "<br>".join(_e(hit) for hit in sca.condition_hits[:3])
+            parts.append(f'<span class="cond-hits">в коде: {found}</span>')
+    elif sca.flaw:
         # No precondition is a fact about the advisory, not a gap in the run:
         # this flaw fires on the call alone.
-        return '<span class="cond outside">условий нет: достаточно вызова</span>'
-    label, css = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", "outside"))
-    parts = [f'<span class="cond {css}">{_e(label)}</span>', _e(sca.condition[:300])]
-    if sca.condition_hits:
-        found = "<br>".join(_e(hit) for hit in sca.condition_hits[:3])
-        parts.append(f'<span class="cond-hits">в коде: {found}</span>')
+        parts.append('<span class="cond outside">условий нет: достаточно вызова</span>')
+
+    if not parts:
+        return '<span class="cond outside">описание advisory не получено</span>'
     return "<br>".join(parts)
 
 
@@ -303,7 +314,7 @@ def _summary_table(run: TriageRun) -> str:
     return (
         '<h2>Находки</h2><table class="findings"><thead><tr>'
         "<th>Что</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
-        "<th>Вне кода</th><th>Почему</th><th>Условие уязвимости</th>"
+        "<th>Вне кода</th><th>Почему</th><th>В чём уязвимость</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
     )
 
