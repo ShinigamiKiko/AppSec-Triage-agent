@@ -40,31 +40,66 @@ CodeQL import gate and the SAST heuristics use exactly these patterns. Edit it
 here, and only here. A pattern ending in `/` is a directory name matched against
 any segment of a path; any other pattern is a file-name glob.
 
-Directories:
+Only conventions the whole language or its standard test runner uses belong
+here. Every pattern added makes more code count as test code, which makes a
+closure easier to reach — a name one project happens to use is not a reason to
+widen the list for everybody.
+
+Directories, any ecosystem:
 
 - `test/`
 - `tests/`
 - `testing/`
 - `spec/`
 - `specs/`
+- `fixture/`
+- `fixtures/`
+- `mocks/`
+- `e2e/`
+- `features/`
+
+Directories, JavaScript and TypeScript:
+
 - `__tests__/`
 - `__mocks__/`
-- `fixtures/`
-- `fixture/`
-- `testdata/`
-- `e2e/`
+- `__fixtures__/`
+- `__snapshots__/`
+- `cypress/`
 
-Files:
+Directories, Go — the toolchain itself ignores this one:
+
+- `testdata/`
+
+File names, Go:
 
 - `*_test.go`
+
+File names, Python:
+
 - `*_test.py`
 - `test_*.py`
+- `conftest.py`
+
+File names, PHP, Java and C# — the CamelCase suffix convention:
+
+- `*Test.*`
+- `*Tests.*`
+- `*TestCase.*`
+- `*Spec.*`
+- `*.phpt`
+
+File names, JavaScript and TypeScript:
+
 - `*.test.*`
 - `*.spec.*`
 - `*-test.*`
-- `*Test.*`
-- `*Tests.*`
-- `*Spec.*`
+- `*-spec.*`
+- `*.cy.*`
+- `*.stories.*`
+
+File names, any ecosystem:
+
+- `*.feature`
 
 ## Triage Rules
 
