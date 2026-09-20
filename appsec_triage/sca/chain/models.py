@@ -42,6 +42,7 @@ class ChainResult:
     # What the advisory says the flaw is, in its own words. Without it a report
     # can name the vulnerable function but not say what is wrong with it.
     flaw: str = ""
+    flaw_ru: str = ""
 
     @property
     def needs_a_person(self) -> bool:
@@ -96,6 +97,7 @@ class ChainResult:
             condition_hits=(list(condition.hits[:4]) if condition is not None else []),
             exploitability=(self.exploitability.render() if self.exploitability else ""),
             flaw=self.flaw,
+            flaw_ru=self.flaw_ru,
             audit=self.audit,
             closure_kind=self.closure_kind,
             audited=self.audited,

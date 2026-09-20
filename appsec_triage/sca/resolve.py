@@ -27,7 +27,7 @@ SYSTEM = registry.step("symbol")
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["vulnerable_function", "vulnerable_class", "vulnerable_file",
-                 "what_changed", "evidence", "why", "precondition",
+                 "what_changed", "evidence", "why", "flaw_ru", "precondition",
                  "precondition_quote", "precondition_tokens",
                  "precondition_where", "precondition_decidable"],
     "properties": {
@@ -37,6 +37,7 @@ SCHEMA = {
         "what_changed": {"type": "string"},
         "evidence": {"type": "string"},
         "why": {"type": "string"},
+        "flaw_ru": {"type": "string"},
         "precondition": {"type": "string"},
         "precondition_quote": {"type": "string"},
         "precondition_tokens": {"type": "array", "items": {"type": "string"}},
@@ -61,6 +62,8 @@ class VulnerableSymbol:
     candidates: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     package_paths: tuple[str, ...] = field(default_factory=tuple)
     what_changed: str = ""
+    # The advisory retold in Russian, for the report that is read in Russian.
+    flaw_ru: str = ""
     quotes_a_changed_line: bool = False
     declared_in_installed: bool | None = None
     existed_before_fix: bool | None = None
@@ -662,6 +665,7 @@ class SymbolResolver:
         base.steps = steps
         base.grounded_in_fix = bool(name) and grounded
         base.what_changed = (answer.get("what_changed") or "").strip()[:300]
+        base.flaw_ru = (answer.get("flaw_ru") or "").strip()[:600]
         base.quotes_a_changed_line = bool(name) and changed
         base.declared_in_installed = declared
         base.existed_before_fix = existed

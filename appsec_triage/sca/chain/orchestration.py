@@ -451,7 +451,8 @@ class DependencyChain(ChainSupport):
              matched_symbol=matched_symbol, reachability=reachability,
              dataflow=(dataflow if dataflow not in (None, False) else None),
              dataflow_status=dataflow_status, route=route, codeql_calls=codeql_calls,
-             flaw=_flaw_of(advisory))
+             flaw=_flaw_of(advisory),
+             flaw_ru=(symbol.flaw_ru if symbol is not None else ""))
         checked = closure_audit or graph_audit
         if result.decision.verdict is CVEVerdict.NOT_CALLED:
             checked = lsp_audit

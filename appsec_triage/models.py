@@ -259,6 +259,7 @@ class SCASummary(BaseModel):
     symbol: str = ""
     what_changed: str = ""
     flaw: str = ""
+    flaw_ru: str = ""
     outcome: str = ""
     outcome_note: str = ""
     call_sites: list[str] = Field(default_factory=list)

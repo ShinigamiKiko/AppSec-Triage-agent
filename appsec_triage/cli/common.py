@@ -156,7 +156,12 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     audit.write_jsonl(run, out / f"verdicts-{stem}.jsonl")
     journal_path.unlink(missing_ok=True)
     audit.write_summary(run, out / f"summary-{stem}.json")
-    report = html.write(run, out / f"report-{stem}.html", title=f"SAST LLM Triage — {provider_cfg.name}")
+    title = f"SAST LLM Triage — {provider_cfg.name}"
+    report = html.write(run, out / f"report-{stem}.html", title=title)
+    # The same report with the advisories retold in Russian. Two files rather
+    # than one bilingual page: each reads as one language, and the original
+    # wording stays available in the finding's own block.
+    html.write(run, out / f"report-{stem}-ru.html", title=title, russian=True)
     from ..models import VerdictLabel
     counts = run.counts()
     proven = sum(1 for r in run.records if r.verdict.verdict is VerdictLabel.confirmed and (r.sca is None or r.sca.outcome in _PROVEN_OUTCOMES))

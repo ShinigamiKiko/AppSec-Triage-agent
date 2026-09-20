@@ -257,7 +257,14 @@ _CONDITION_LABEL = {
 }
 
 
-def _condition_cell(r: TriageRecord) -> str:
+def _flaw_text(sca, *, russian: bool) -> str:
+    """The advisory's description: retold in Russian, or quoted as published."""
+    if russian and sca.flaw_ru:
+        return sca.flaw_ru
+    return sca.flaw
+
+
+def _condition_cell(r: TriageRecord, *, russian: bool = False) -> str:
     """What the advisory says this CVE is. Nothing about our code belongs here:
     whether the condition holds in this repository is a verdict, and verdicts
     live in their own column and in the finding's own block."""
@@ -266,8 +273,9 @@ def _condition_cell(r: TriageRecord) -> str:
         return '<span class="cond outside">цепочка не запускалась</span>'
 
     parts = []
-    if sca.flaw:
-        text = sca.flaw if len(sca.flaw) <= 260 else sca.flaw[:260].rstrip() + "…"
+    flaw = _flaw_text(sca, russian=russian)
+    if flaw:
+        text = flaw if len(flaw) <= 260 else flaw[:260].rstrip() + "…"
         parts.append(f'<span class="flaw">{_e(text)}</span>')
     if sca.condition:
         parts.append('<span class="cond-need">срабатывает, если: '
@@ -278,7 +286,18 @@ def _condition_cell(r: TriageRecord) -> str:
     return "<br>".join(parts)
 
 
-def _summary_table(run: TriageRun) -> str:
+def _flaw_step(sca, *, russian: bool) -> str:
+    """The block under the finding. The Russian report keeps the original too,
+    because a retelling is not the source and a reader may want to check it."""
+    body = f"<p>{_e(_flaw_text(sca, russian=russian))}</p>"
+    if russian and sca.flaw_ru and sca.flaw:
+        body += f'<p class="note">в оригинале: {_e(sca.flaw)}</p>'
+    if sca.what_changed:
+        body += f'<p class="note">исправление: {_e(sca.what_changed)}</p>'
+    return body
+
+
+def _summary_table(run: TriageRun, *, russian: bool = False) -> str:
     """One row per finding, in the order a queue should be worked."""
     rank = {"confirmed": 0, "unknown": 1, "false_positive": 2}
     ordered = sorted(run.records, key=lambda r: (rank.get(r.verdict.verdict.value, 3),
@@ -303,7 +322,7 @@ def _summary_table(run: TriageRun) -> str:
             f"<td class='trace'>{_trace(r)}</td>"
             f"<td class='ext-cell'>{_external_cell(r)}</td>"
             f"<td class='why'>{note[:400]}</td>"
-            f"<td class='cond-cell'>{_condition_cell(r)}</td>"
+            f"<td class='cond-cell'>{_condition_cell(r, russian=russian)}</td>"
             f"</tr>"
         )
     return (
@@ -374,7 +393,7 @@ def _confidence_html(v) -> str:
     )
 
 
-def _why_html(r: TriageRecord) -> str:
+def _why_html(r: TriageRecord, *, russian: bool = False) -> str:
     """The trail that produced this verdict, in the order it actually happened."""
     v = r.verdict
     steps: list[str] = []
@@ -391,11 +410,8 @@ def _why_html(r: TriageRecord) -> str:
             source += f" · {_e(r.sca.placement)}"
     step("Сканер сообщил", f"<p>{source}</p>")
 
-    if r.sca and r.sca.flaw:
-        body = f"<p>{_e(r.sca.flaw)}</p>"
-        if r.sca.what_changed:
-            body += f'<p class="note">исправление: {_e(r.sca.what_changed)}</p>'
-        step("В чём уязвимость", body)
+    if r.sca and (r.sca.flaw or r.sca.flaw_ru):
+        step("В чём уязвимость", _flaw_step(r.sca, russian=russian))
 
     if r.reachability:
         step("Граф вызовов", f"<p>{_e(r.reachability)}</p>")
@@ -464,7 +480,7 @@ def _why_html(r: TriageRecord) -> str:
     return f'<h4>Как получен вердикт</h4><ol class="why">{"".join(steps)}</ol>'
 
 
-def _record_html(r: TriageRecord) -> str:
+def _record_html(r: TriageRecord, *, russian: bool = False) -> str:
     v = r.verdict
     sym = v.vulnerable_symbol
     sym_summary = f'<span class="sym">{_e(sym.name)}</span>' if sym else ""
@@ -483,7 +499,7 @@ def _record_html(r: TriageRecord) -> str:
             else ""
         )
         + '</summary><div class="body">'),
-        _why_html(r),
+        _why_html(r, russian=russian),
     ]
 
     brief = review.build(r)
@@ -571,7 +587,7 @@ def _coverage_html(run: TriageRun) -> str:
     )
 
 
-def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
+def render(run: TriageRun, *, title: str = "SAST LLM Triage", russian: bool = False) -> str:
     counts = run.counts()
     total = len(run.records) or 1
     overridden = sum(1 for r in run.records if r.overrides)
@@ -604,7 +620,7 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage") -> str:
     )
 
     ordered = sorted(run.records, key=lambda r: (_ORDER[r.verdict.verdict], -r.verdict.confidence))
-    findings_html = "".join(_record_html(r) for r in ordered)
+    findings_html = "".join(_record_html(r, russian=russian) for r in ordered)
 
     coverage_html = _coverage_html(run)
     generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -623,14 +639,15 @@ cost ${run.total_cost_usd:.4f}</p>
 <h2>By CWE</h2>
 <table><thead><tr><th>CWE</th><th>Confirmed</th><th>Unknown</th><th>Closed</th><th>Total</th></tr></thead>
 <tbody>{rows}</tbody></table>
-{_summary_table(run)}
+{_summary_table(run, russian=russian)}
 <h2>Findings — highest priority first</h2>
 {findings_html}
 </main></body></html>"""
 
 
-def write(run: TriageRun, path: Path, *, title: str = "SAST LLM Triage") -> Path:
+def write(run: TriageRun, path: Path, *, title: str = "SAST LLM Triage",
+          russian: bool = False) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render(run, title=title), encoding="utf-8")
+    path.write_text(render(run, title=title, russian=russian), encoding="utf-8")
     return path
