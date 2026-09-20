@@ -176,12 +176,29 @@ _ANSWER = {
 }
 
 
+# The ingest writes this when a SARIF result carries no artifact location. A
+# dependency finding usually has none: the scanner reports a package, not a line.
+_NO_FILE = {"", "<unknown>"}
+
+
+def _location(r: TriageRecord) -> str:
+    """What to print where a file path would go, when there is no file."""
+    if r.file_path and r.file_path not in _NO_FILE:
+        return r.file_path
+    if r.sca and r.sca.package:
+        version = f"@{r.sca.installed_version}" if r.sca.installed_version else ""
+        return f"{r.sca.package}{version}"
+    if r.kind == "dependency":
+        return "зависимость проекта"
+    return "файл не указан"
+
+
 def _where(r: TriageRecord) -> str:
     """File, line and symbol — the three things a reviewer opens the editor with."""
     parts: list[str] = []
     if r.sca and r.sca.call_sites:
         parts.extend(r.sca.call_sites[:3])
-    elif r.file_path:
+    elif r.file_path and r.file_path not in _NO_FILE:
         location = r.file_path
         if r.start_line:
             location = f"{location}:{r.start_line}"
@@ -489,7 +506,7 @@ def _record_html(r: TriageRecord, *, russian: bool = False) -> str:
         f'<span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
         f'<span class="cwe">{_e(r.cwe or "—")}</span>'
         f"{sym_summary}"
-        f'<span class="path" title="{_e(r.file_path)}">{_e(r.file_path)}</span>'
+        f'<span class="path" title="{_e(_location(r))}">{_e(_location(r))}</span>'
         f'<span class="conf" title="{_e(v.confidence_rationale)}">'
         f'{_e(v.confidence_band or "—")} · {v.confidence:.2f}</span>'
         + (
