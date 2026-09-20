@@ -33,6 +33,7 @@ span.cond.absent{background:#dafbe1;color:#1a7f37}
 span.cond.outside{background:#fff8c5;color:#9a6700}
 table.findings .cond-hits{color:#57606a;font-size:11px}
 table.findings .flaw{display:block;color:#1f2328;margin-bottom:.25rem}
+table.findings .cond-need{display:block;color:#57606a;font-size:11px}
 """
 
 _COV_CSS = """
@@ -257,7 +258,9 @@ _CONDITION_LABEL = {
 
 
 def _condition_cell(r: TriageRecord) -> str:
-    """What the flaw is, in the advisory's words, and what else it needs to fire."""
+    """What the advisory says this CVE is. Nothing about our code belongs here:
+    whether the condition holds in this repository is a verdict, and verdicts
+    live in their own column and in the finding's own block."""
     sca = r.sca
     if not sca:
         return '<span class="cond outside">цепочка не запускалась</span>'
@@ -266,17 +269,9 @@ def _condition_cell(r: TriageRecord) -> str:
     if sca.flaw:
         text = sca.flaw if len(sca.flaw) <= 260 else sca.flaw[:260].rstrip() + "…"
         parts.append(f'<span class="flaw">{_e(text)}</span>')
-
     if sca.condition:
-        label, css = _CONDITION_LABEL.get(sca.condition_state, ("проверялось", "outside"))
-        parts.append(f'<span class="cond {css}">{_e(label)}</span> {_e(sca.condition[:260])}')
-        if sca.condition_hits:
-            found = "<br>".join(_e(hit) for hit in sca.condition_hits[:3])
-            parts.append(f'<span class="cond-hits">в коде: {found}</span>')
-    elif sca.flaw:
-        # No precondition is a fact about the advisory, not a gap in the run:
-        # this flaw fires on the call alone.
-        parts.append('<span class="cond outside">условий нет: достаточно вызова</span>')
+        parts.append('<span class="cond-need">срабатывает, если: '
+                     f'{_e(sca.condition[:260])}</span>')
 
     if not parts:
         return '<span class="cond outside">описание advisory не получено</span>'
