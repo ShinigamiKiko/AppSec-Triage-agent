@@ -266,6 +266,7 @@ class TriagePipeline:
                 deployment=deployment_ctx.load(getattr(cfg, "deployment_config", None)),
                 reachability=reachability, codeql_databases=databases,
                 codeql_binary=codeql_binary, psalm_binary=psalm_binary,
+                parallel_llm=cfg.parallel_llm,
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []

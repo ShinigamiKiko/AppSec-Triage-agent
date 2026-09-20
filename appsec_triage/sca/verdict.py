@@ -44,6 +44,7 @@ class CVEDecision:
                                 CVEVerdict.UNUSED, CVEVerdict.CONDITION_ABSENT,
                                 CVEVerdict.INFRASTRUCTURE, CVEVerdict.WRONG_RECEIVER,
                                 CVEVerdict.NOT_REACHED, CVEVerdict.ONLY_TEST_IMPORT,
+                                CVEVerdict.ONLY_IN_TESTS,
                                 CVEVerdict.NOT_CALLED, CVEVerdict.VERSION_UNAFFECTED)
 
     @property
@@ -369,11 +370,18 @@ def decide(
         )
 
     if presence.only_in_tests:
+        if not _audited(closure_audit, "only_in_tests"):
+            return _unchecked(
+                "вызовы найдены только в тестах, но закрытие не проверено",
+                closure_audit, "only_in_tests",
+                "все места вызова — тестовый код")
         return CVEDecision(
             CVEVerdict.ONLY_IN_TESTS,
             f"{symbol} вызывается только в тестах",
             [*reasons, "все места вызова — тестовый код, это не поверхность атаки",
-             "закрывать нельзя: рабочий код может вызывать через другой путь"],
+             "тестовые пути заданы в prompts/training-context.md, тот же список видит модель",
+             closure_audit.render(),
+             "закрыто: уязвимость в тестовом коде не эксплуатируется в продакшн"],
             [str(h) for h in presence.hits[:5]],
         )
 

@@ -291,10 +291,10 @@ class DependencyChain(ChainSupport):
                     dependency, api_package, record=codeql_calls),
                 ask_functions=lambda pairs: self._codeql_api_for(
                     dependency, api_package, pairs, record=codeql_calls, asked_by=asker),
-                ask_sites=lambda sites: self._dataflow_for(
-                    None, dependency, sites, record=codeql_calls, asked_by=asker),
-                lsp_tools=lsp_tools if lsp_ok else None, engine_available=engine_ok,
-                code_tools=code_tools)
+                 ask_sites=lambda sites: self._dataflow_for(
+                     None, dependency, sites, record=codeql_calls, asked_by=asker),
+                 lsp_tools=lsp_tools if lsp_ok else None, engine_available=engine_ok,
+                 code_tools=code_tools, parallel_llm=self._parallel_llm)
             codeql_calls.extend(f"модель → {line}" for line in investigation.lsp_log)
             if investigation.lsp_called:
                 problems.append("LSP нашёл вызовы уязвимой функции из кода проекта: "

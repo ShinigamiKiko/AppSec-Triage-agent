@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 class ChainSupport:
     def __init__(self, client, roots, *, lsp=None, routes=None, nvd_api_key=None,
                  deployment=None, reachability=None, codeql_databases=None,
-                 codeql_binary: str = "codeql", psalm_binary: str | None = None) -> None:
+                 codeql_binary: str = "codeql", psalm_binary: str | None = None,
+                 parallel_llm: int = 2) -> None:
         self._client = client
         self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
         self._roots = [Path(r) for r in roots]
@@ -33,6 +34,7 @@ class ChainSupport:
                            for k, v in (codeql_databases or {}).items()}
         self._codeql_binary = codeql_binary
         self._psalm_binary = psalm_binary
+        self._parallel_llm = max(1, parallel_llm)
         self._dataflow: dict[tuple[str, tuple], codeql_reach.Answer] = {}
         self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
         self._import_answers: dict[tuple[str, str], codeql_api.ImportAnswer] = {}

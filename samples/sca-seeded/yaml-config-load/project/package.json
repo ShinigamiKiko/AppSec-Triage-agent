@@ -1,0 +1,10 @@
+{
+  "name": "yaml-config-load",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/server.js",
+  "dependencies": {
+    "express": "4.21.2",
+    "js-yaml": "3.13.0"
+  }
+}

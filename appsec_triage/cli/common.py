@@ -54,6 +54,7 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack
     if getattr(args, "workers", None): cfg.max_workers = args.workers
+    if getattr(args, "parallel_llm", None): cfg.parallel_llm = args.parallel_llm
     if getattr(args, "resolve_symbols", False): cfg.resolve_vulnerable_symbols = True
     if getattr(args, "govulncheck", None): cfg.govulncheck_report = str(args.govulncheck)
     if getattr(args, "scan_dir", None): cfg.scan_out_dir = str(args.scan_dir)

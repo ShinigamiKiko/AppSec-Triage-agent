@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import stat
+import tarfile
 import tempfile
 import threading
 import urllib.error
@@ -36,6 +37,7 @@ _ALLOWED_ARCHIVE_HOSTS = {
     "gitlab.com",
     "bitbucket.org",
     "api.bitbucket.org",
+    "registry.npmjs.org",
 }
 _UA = {"User-Agent": "appsec-triage/0.1 source-cache"}
 
@@ -152,40 +154,60 @@ class PackageSourceCache:
 
     def _download(self, ecosystem: str, package: str, version: str) -> SourceSnapshot:
         snapshot = SourceSnapshot(ecosystem, package, version)
-        if ecosystem not in {"composer", "packagist", "php"}:
+        if ecosystem not in {"composer", "packagist", "php", "npm", "node", "javascript"}:
             snapshot.problem = f"remote source cache does not support ecosystem {ecosystem or 'unknown'}"
-            return snapshot
-        if not package or "/" not in package or not version:
-            snapshot.problem = "Composer package name or exact version is missing"
             return snapshot
 
         try:
-            release = self._composer_release(package, version)
-            dist = release.get("dist") or {}
-            url = str(dist.get("url") or "")
-            if str(dist.get("type") or "zip").lower() != "zip" or not url:
-                raise ValueError("Packagist release has no zip dist archive")
-            self._validate_archive_url(url)
-            archive, final_url = self._fetch_bytes(
-                url, _MAX_ARCHIVE_BYTES, allowed_hosts=_ALLOWED_ARCHIVE_HOSTS)
-            self._validate_archive_url(final_url)
-            shasum = str(dist.get("shasum") or "").lower()
-            if shasum and len(shasum) == 40 and hashlib.sha1(archive).hexdigest() != shasum:
-                raise ValueError("archive SHA-1 does not match Packagist metadata")
-            destination = self.root / hashlib.sha256(f"{ecosystem}://{package}://{version}".encode()).hexdigest()[:20]
-            destination.mkdir()
-            snapshot.files = self._extract_zip(archive, destination)
-            if not snapshot.files:
-                raise ValueError("archive contains no supported source files")
-            snapshot.source_url = final_url
-            snapshot.archive_sha256 = hashlib.sha256(archive).hexdigest()
+            if ecosystem in {"composer", "packagist", "php"}:
+                release = self._composer_release(package, version)
+                dist = release.get("dist") or {}
+                url = str(dist.get("url") or "")
+                if str(dist.get("type") or "zip").lower() != "zip" or not url:
+                    raise ValueError("Packagist release has no zip dist archive")
+                self._validate_archive_url(url)
+                archive, final_url = self._fetch_bytes(
+                    url, _MAX_ARCHIVE_BYTES, allowed_hosts=_ALLOWED_ARCHIVE_HOSTS)
+                self._validate_archive_url(final_url)
+                shasum = str(dist.get("shasum") or "").lower()
+                if shasum and len(shasum) == 40 and hashlib.sha1(archive).hexdigest() != shasum:
+                    raise ValueError("archive SHA-1 does not match Packagist metadata")
+                destination = self.root / hashlib.sha256(f"{ecosystem}://{package}://{version}".encode()).hexdigest()[:20]
+                destination.mkdir()
+                snapshot.files = self._extract_zip(archive, destination)
+                if not snapshot.files:
+                    raise ValueError("archive contains no supported source files")
+                snapshot.source_url = final_url
+                snapshot.archive_sha256 = hashlib.sha256(archive).hexdigest()
+            elif ecosystem in {"npm", "node", "javascript"}:
+                release = self._npm_release(package, version)
+                dist = release.get("dist") or {}
+                url = str(dist.get("tarball") or "")
+                if not url:
+                    raise ValueError("npm release has no tarball")
+                self._validate_archive_url(url)
+                archive, final_url = self._fetch_bytes(
+                    url, _MAX_ARCHIVE_BYTES, allowed_hosts=_ALLOWED_ARCHIVE_HOSTS)
+                self._validate_archive_url(final_url)
+                shasum = str(dist.get("shasum") or "").lower()
+                if shasum and len(shasum) == 40 and hashlib.sha1(archive).hexdigest() != shasum:
+                    raise ValueError("archive SHA-1 does not match npm registry metadata")
+                destination = self.root / hashlib.sha256(f"{ecosystem}://{package}://{version}".encode()).hexdigest()[:20]
+                destination.mkdir()
+                snapshot.files = self._extract_tarball(archive, destination)
+                if not snapshot.files:
+                    raise ValueError("archive contains no supported source files")
+                snapshot.source_url = final_url
+                snapshot.archive_sha256 = hashlib.sha256(archive).hexdigest()
             log.info("source cache downloaded %s", snapshot.describe())
-        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, urllib.error.URLError) as exc:
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, tarfile.TarError, urllib.error.URLError) as exc:
             snapshot.problem = str(exc)[:500]
             log.warning("source cache: %s", snapshot.describe())
         return snapshot
 
     def _composer_release(self, package: str, version: str) -> dict:
+        if not package or "/" not in package or not version:
+            raise ValueError("Composer package name or exact version is missing")
         encoded = urllib.parse.quote(package, safe="/")
         url = f"https://repo.packagist.org/p2/{encoded}.json"
         raw, _ = self._fetch_bytes(
@@ -200,6 +222,21 @@ class PackageSourceCache:
             if _normalise_version(str(release.get("version") or "")) == wanted:
                 return release
         raise ValueError(f"Packagist has no exact release {package}@{version}")
+
+    def _npm_release(self, package: str, version: str) -> dict:
+        if not package or not version:
+            raise ValueError("npm package name or exact version is missing")
+        encoded = urllib.parse.quote(package, safe="/@")
+        url = f"https://registry.npmjs.org/{encoded}/{version}"
+        raw, _ = self._fetch_bytes(
+            url, _MAX_METADATA_BYTES, allowed_hosts={"registry.npmjs.org"})
+        try:
+            document = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"npm registry metadata is not valid JSON: {exc}") from exc
+        if not isinstance(document, dict):
+            raise ValueError("npm registry response is not a JSON object")
+        return document
 
     @staticmethod
     def _validate_archive_url(url: str) -> None:
@@ -253,6 +290,47 @@ class PackageSourceCache:
                 if len(files) >= _MAX_SOURCE_FILES:
                     raise ValueError(f"archive has more than {_MAX_SOURCE_FILES} supported source files")
                 body = zipped.read(info)
+                target = destination.joinpath(*relative.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+                files[str(relative)] = body.decode("utf-8", errors="replace")
+            return files
+
+    @staticmethod
+    def _extract_tarball(archive: bytes, destination: Path) -> dict[str, str]:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+            members = tar.getmembers()
+            if len(members) > _MAX_ARCHIVE_FILES:
+                raise ValueError(f"archive contains more than {_MAX_ARCHIVE_FILES} entries")
+            total = sum(m.size for m in members if m.isfile())
+            if total > _MAX_UNPACKED_BYTES:
+                raise ValueError(f"archive expands beyond {_MAX_UNPACKED_BYTES} bytes")
+
+            paths: list[PurePosixPath] = []
+            for member in members:
+                if member.isfile():
+                    path = _safe_member_path(member.name.rstrip("/"))
+                    paths.append(path)
+                elif member.issym() or member.islnk():
+                    raise ValueError(f"archive contains a symlink: {member.name}")
+            root = _common_root(paths)
+
+            files: dict[str, str] = {}
+            for member in members:
+                if not member.isfile():
+                    continue
+                original = _safe_member_path(member.name.rstrip("/"))
+                relative = PurePosixPath(*original.parts[1:]) if root and original.parts[0] == root else original
+                if not relative.parts or not _interesting(relative):
+                    continue
+                if member.size > _MAX_SOURCE_FILE_BYTES:
+                    continue
+                if len(files) >= _MAX_SOURCE_FILES:
+                    raise ValueError(f"archive has more than {_MAX_SOURCE_FILES} supported source files")
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                body = extracted.read()
                 target = destination.joinpath(*relative.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(body)

@@ -452,9 +452,14 @@ def _run_tool(session: _Session, name: str, arguments: dict, offered: set[str]) 
     return "\n".join(lines)
 
 
-def _investigate_with_tools(client, session: _Session, material: str, rounds: int) -> None:
+def _investigate_with_tools(client, session: _Session, material: str, rounds: int,
+                            parallel_llm: int = 2) -> None:
     """The model calls the analyser itself and reacts to each answer."""
+    from ..llm.tools import run_tool_loop
+    
     result = session.result
+    advisory_id = getattr(session.advisory, "advisory_id", "?")
+    
     # Psalm answers by type, not by position, so it is offered no position tool.
     tools = [TOOLS[0]]
     if session.engine_available:
@@ -466,41 +471,47 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
 
         tools += function_tools(_function_tool)
     offered = {tool["function"]["name"] for tool in tools}
-    messages = [{"role": "system", "content": TOOLS_SYSTEM}, {"role": "user", "content": material}]
-    for turn_no in range(1, max(1, rounds) * 3 + 1):
-        left = getattr(client, "budget_left_usd", None)
-        if isinstance(left, (int, float)) and not isinstance(left, bool) and left <= 0:
-            result.detail = "бюджет прогона исчерпан"
-            break
-        try:
-            turn = client.chat_tools(messages, tools)
-        except Exception as exc:  # noqa: BLE001 - the chain's own search still runs
-            # If the endpoint rejects native tools, fall back to JSON protocol
-            if "tool" in str(exc).lower() or "function" in str(exc).lower():
-                log.info("codeql investigation: native tools rejected, falling back to JSON protocol")
+    
+    def make_handler(call_name: str):
+        def handler(arguments: dict) -> str:
+            if result.tool_calls >= _MAX_TOOL_CALLS:
+                return "Not run: the limit of questions to the analyser is reached."
+            result.tool_calls += 1
+            log.info("[%s] executing tool: %s(%s)", advisory_id, call_name,
+                     json.dumps(arguments, ensure_ascii=False)[:300])
+            content = _run_tool(session, call_name, arguments, offered)
+            if call_name == "check_package" and result.package_used is False:
+                # Signal early exit by raising
+                raise StopIteration("package not used in production")
+            return content
+        return handler
+    
+    handlers = {tool["function"]["name"]: make_handler(tool["function"]["name"]) for tool in tools}
+    
+    try:
+        loop = run_tool_loop(
+            client=client,
+            system=TOOLS_SYSTEM,
+            user=material,
+            tools=tools,
+            handlers=handlers,
+            max_calls=_MAX_TOOL_CALLS,
+            max_turns=max(1, rounds) * 3,
+            parallel_limit=parallel_llm,
+            finding_id=advisory_id,
+        )
+        if loop.error:
+            # Check if it's a fallback-worthy error
+            if "tool" in loop.error.lower() or "function" in loop.error.lower():
+                log.info("[%s] native tools rejected, falling back to JSON protocol", advisory_id)
                 _investigate_with_json(client, session, material, rounds)
                 return
-            log.warning("codeql investigation turn %d failed for %s: %s",
-                        turn_no, getattr(session.advisory, "advisory_id", "?"), exc)
-            result.detail = f"ход {turn_no} не выполнен: {exc}"
-            break
-        if not turn.tool_calls:
-            break  # the model has what it needs; the verdict is made later
-        messages.append(turn.message)
-        for call in turn.tool_calls:
-            if result.tool_calls >= _MAX_TOOL_CALLS:
-                content = "Not run: the limit of questions to the analyser is reached."
-            else:
-                result.tool_calls += 1
-                log.info("model tool call for %s: %s(%s)", getattr(session.advisory, "advisory_id", "?"),
-                         call.name, json.dumps(call.arguments, ensure_ascii=False)[:300])
-                content = _run_tool(session, call.name, call.arguments, offered)
-            messages.append(client.tool_result_message(call, content))
-            if call.name == "check_package" and result.package_used is False:
-                return
+            result.detail = loop.error
         if result.tool_calls >= _MAX_TOOL_CALLS:
             result.detail = result.detail or f"достигнут лимит в {_MAX_TOOL_CALLS} вопросов к {session.engine}"
-            break
+    except StopIteration as early_exit:
+        log.info("[%s] investigation stopped early: %s", advisory_id, early_exit)
+        return
 
 
 def _investigate_with_json(client, session: _Session, material: str, rounds: int) -> None:
@@ -547,6 +558,7 @@ def investigate(
     lsp_tools=None,
     engine_available: bool = True,
     code_tools=None,
+    parallel_llm: int = 2,
 ) -> Investigation:
     """Let the model question the analysis engine about this CVE; return what it established."""
     result = Investigation()
@@ -567,7 +579,7 @@ def investigate(
                        lsp=lsp, engine_available=engine_available, code=code)
     if getattr(client, "supports_tools", False) is True and callable(getattr(client, "chat_tools", None)):
         result.via_tools = True
-        _investigate_with_tools(client, session, material, rounds)
+        _investigate_with_tools(client, session, material, rounds, parallel_llm)
     else:
         if lsp is not None:
             result.lsp_log.append("LSP: провайдер не поддерживает tool calling — языковой сервер моделью не опрашивался")
