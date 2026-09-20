@@ -178,6 +178,19 @@ docker run --rm -v "$CI_PROJECT_DIR:/src:ro" -v "$CI_PROJECT_DIR/out:/out" \
   run /src -p deepseek -o /out --fail-on confirmed
 ```
 
+Код зависимостей агент читает с диска, поэтому смонтировать надо и его. Для Go
+это кеш модулей — прогрейте его на хосте (`go mod download`) и отдайте внутрь:
+
+```bash
+docker run --rm -v "$CI_PROJECT_DIR:/src:ro" -v "$CI_PROJECT_DIR/out:/out" \
+  -v "$(go env GOMODCACHE):/gomod:ro" -e GOMODCACHE=/gomod \
+  --env-file .env wolfee-agent-triage \
+  run /src -p deepseek -o /out --fail-on confirmed
+```
+
+Для npm и Composer отдельного монтирования не нужно: `node_modules/` и
+`vendor/` лежат внутри проекта и приезжают вместе с ним.
+
 Коды возврата: `0` — чисто, `1` — сработал `--fail-on`, `2` — не поднялся обязательный языковой сервер.
 
 Образ ~6,4 ГБ: CodeQL с наборами запросов, Go, PHP, Node и четыре языковых сервера. Это цена «весь анализ в одном артефакте».
