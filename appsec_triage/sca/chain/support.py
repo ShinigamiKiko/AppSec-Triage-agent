@@ -99,25 +99,8 @@ class ChainSupport:
             return None, default, ""
         ecosystem = dependency.ecosystem or ""
 
-        # Packages whose code was downloaded rather than read from the project:
-        # the report has to say so, because the walk rests on it.
-        fetched: list[str] = []
-
         def source_of(package: str) -> dict[str, str]:
-            version = self._graph_version(package)
-            files = self._resolver._source_for(ecosystem, package, version)
-            if (ecosystem.lower(), package.lower(), version) in self._resolver.fetched:
-                name = f"{package}@{version}" if version else package
-                if name not in fetched:
-                    fetched.append(name)
-            return files
-
-        def as_bridge(walk: BridgeWalk):
-            result = _walk_as_bridge(walk)
-            if fetched:
-                note = "исходники загружены из реестра: " + ", ".join(fetched[:5])
-                result.detail = f"{result.detail}; {note}" if result.detail else note
-            return result
+            return self._resolver._source_for(ecosystem, package, self._graph_version(package))
 
         best: tuple[BridgeWalk, str] | None = None
         for intro in sorted(placement.introductions, key=lambda i: len(i.path))[:2]:
@@ -127,14 +110,14 @@ class ChainSupport:
             walk = walk_bridge(symbol.function, chain_pkgs, source_of)
             through = intro.root_requirement
             if walk.closed:
-                return as_bridge(walk), [], through
+                return _walk_as_bridge(walk), [], through
             if walk.targets and not walk.unknown:
-                return as_bridge(walk), _pairs(walk.targets), through
+                return _walk_as_bridge(walk), _pairs(walk.targets), through
             best = best or (walk, through)
         if best is None:
             return None, default, ""
         walk, through = best
-        return as_bridge(walk), (_pairs(walk.targets) or default), through
+        return _walk_as_bridge(walk), (_pairs(walk.targets) or default), through
 
     def _once(self, cache: dict, key, compute):
         """(value, was_cached): run `compute` once per key without holding the lock while it runs."""

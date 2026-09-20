@@ -160,7 +160,7 @@ def walk_bridge(
         source = source_of(package)
         if not source:
             return stopped(
-                f"исходников {package} нет ни в проекте, ни в реестре — "
+                f"{package} не установлен в дереве проекта — "
                 "путь через него не прослежен",
                 depth - 1)
 

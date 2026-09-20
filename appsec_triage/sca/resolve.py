@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..prompts import registry
-from . import cassette, go_source, npm_source, registries
+from . import cassette, registries
 from .advisories import Advisory
 
 log = logging.getLogger(__name__)
@@ -404,11 +404,9 @@ class SymbolResolver:
         self._client = client
         self._roots = [Path(r) for r in (roots or [])]
         self._sources: dict[tuple[str, str, str], dict[str, str]] = {}
-        # Keys whose code came from the registry rather than from the project.
-        self.fetched: set[tuple[str, str, str]] = set()
 
     def _source_for(self, ecosystem: str, package: str, version: str = "") -> dict[str, str]:
-        """The package's own code, read once per run: installed tree first, registry second."""
+        """The installed package, read once per run; a miss is remembered too."""
         key = (ecosystem.lower(), package.lower(), version)
         cached = self._sources.get(key)
         if cached is not None:
@@ -418,19 +416,8 @@ class SymbolResolver:
             if files:
                 self._sources[key] = files
                 return files
-        # Nothing installed here: a call chain still has to be walked through this
-        # package, so the exact version the lockfile names is fetched. Composer is
-        # not on this list — a PHP job installs `vendor/` before the agent runs.
-        if npm_source.supported(ecosystem):
-            files = npm_source.fetch(package, version)
-        elif go_source.supported(ecosystem):
-            files = go_source.fetch(package, version, self._roots)
-        else:
-            files = {}
-        if files:
-            self.fetched.add(key)
-        self._sources[key] = files
-        return files
+        self._sources[key] = {}
+        return {}
 
 
     def _ask(self, user: str) -> dict:

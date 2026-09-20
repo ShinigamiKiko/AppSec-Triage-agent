@@ -1,9 +1,11 @@
-# Dependency triage for a PHP project in GitLab CI — without the agent's Docker image.
+# Dependency triage in GitLab CI — without the agent's Docker image.
 #
-# The agent does not install dependencies. Psalm proves calls and input paths into
-# a vulnerable PHP method only when vendor/autoload.php exists, so build the
-# project and install its dependencies in before_script. Without vendor/ the
-# analysis still runs, with a text search instead of Psalm.
+# The agent installs nothing and downloads no package sources: it reads a
+# dependency's own code from the installed tree, so the job installs them first.
+# Psalm proves calls and input paths into a vulnerable PHP method only when
+# vendor/autoload.php exists; gopls and the TypeScript server resolve types
+# inside a dependency only when its directory is on disk. Without them the
+# analysis still runs, with a text search instead.
 #
 # Variables in Settings → CI/CD → Variables (masked):
 #   DEEPSEEK_API_KEY   provider key
@@ -14,12 +16,26 @@
 
 appsec-triage:
   stage: test
+  # The agent reads a dependency's own code from the installed tree and never
+  # downloads it, so these directories must be there. Restoring them from the
+  # cache is what keeps the job short.
+  cache:
+    key:
+      files: [composer.lock, package-lock.json, go.sum]
+    paths: [vendor/, node_modules/, .go/pkg/mod/]
+  variables:
+    GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
   before_script:
     # The project's own build, whatever it needs before composer can resolve.
     - ./build.sh
     # Vulnerable versions must install: they are what is being analysed.
     - composer config --no-interaction audit.block-insecure false
     - composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist
+    # Same for the other two, when the project has them. Dev dependencies stay:
+    # a package pruned from the tree cannot be read, and the chain stops there.
+    - '[ -f package-lock.json ] && npm ci --no-audit --no-fund || true'
+    - '[ -f yarn.lock ] && yarn install --frozen-lockfile || true'
+    - '[ -f go.sum ] && go mod download || true'
   script:
     - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
   artifacts:
