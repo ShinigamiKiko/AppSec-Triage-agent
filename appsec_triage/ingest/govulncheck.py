@@ -27,14 +27,6 @@ def decode_stream(text: str) -> list[dict[str, Any]]:
     return objects
 
 
-def looks_like_govulncheck(text: str) -> bool:
-    try:
-        objects = decode_stream(text)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return any((obj.get("config") or {}).get("scanner_name") == "govulncheck" for obj in objects)
-
-
 def _cwe(advisory: dict[str, Any]) -> str | None:
     candidates = list((advisory.get("database_specific") or {}).get("cwe_ids") or [])
     for affected in advisory.get("affected") or []:

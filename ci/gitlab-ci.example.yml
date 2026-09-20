@@ -21,7 +21,7 @@ appsec-triage:
     - composer config --no-interaction audit.block-insecure false
     - composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist
   script:
-    - appsec-triage run "$CI_PROJECT_DIR" --resolve-symbols -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
+    - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
   artifacts:
     when: always
     paths: [appsec-out/]

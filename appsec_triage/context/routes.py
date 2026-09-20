@@ -86,28 +86,6 @@ class RouteIndex:
             return None
         return hop, self._perimeter_via.get(key, [])
 
-    def routes_naming(self, symbol: str, limit: int = 3) -> list[Route]:
-        """Routed methods whose file mentions `symbol` — one hop out."""
-        if not symbol or len(symbol) < 3:
-            return []
-        if symbol in self._naming_cache:
-            return self._naming_cache[symbol]
-        out: list[Route] = []
-        seen: set[str] = set()
-        for route in self.routes:
-            if route.file_path in seen:
-                continue
-            try:
-                text = Path(route.file_path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if re.search(rf"\b{re.escape(symbol)}\b", text):
-                seen.add(route.file_path)
-                out.append(route)
-                if len(out) >= limit:
-                    break
-        self._naming_cache[symbol] = out
-        return out
 
 
 def _method_spans(lines: list[str]) -> list[tuple[int, int, str]]:

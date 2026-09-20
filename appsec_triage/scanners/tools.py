@@ -179,10 +179,6 @@ class CodeQLScanner(Scanner):
                 counts[lang] += 1
         return [lang for lang, _ in counts.most_common()]
 
-    def detect_language(self, target: Path) -> str | None:
-        """Dominant CodeQL language only — retained for single-language callers."""
-        langs = self.detect_languages(target)
-        return langs[0] if langs else None
 
     MANIFEST = ".codeql-databases.json"
 

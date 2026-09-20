@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -266,6 +268,7 @@ class TriagePipeline:
                 deployment=deployment_ctx.load(getattr(cfg, "deployment_config", None)),
                 reachability=reachability, codeql_databases=databases,
                 codeql_binary=codeql_binary, psalm_binary=psalm_binary,
+                parallel_llm=cfg.parallel_llm,
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
@@ -732,15 +735,19 @@ class TriagePipeline:
         """Let the model read and search the repository itself; True when evidence was added."""
         evidence = self.repository_evidence
         added = False
+        # Parallel tool calls share one evidence package: reading a file and
+        # appending its block is quick, and it must not interleave.
+        writing = threading.Lock()
 
         def run(request: dict) -> str:
             nonlocal added
-            blocks, notes = len(pkg.evidence_blocks), len(pkg.context_notes)
-            added = evidence.retrieve(pkg, [request]) or added
-            new_blocks = pkg.evidence_blocks[blocks:]
-            if new_blocks:
-                return "\n\n".join(new_blocks)[:6000]
-            return " ".join(pkg.context_notes[notes:]) or "Nothing found."
+            with writing:
+                blocks, notes = len(pkg.evidence_blocks), len(pkg.context_notes)
+                added = evidence.retrieve(pkg, [request]) or added
+                new_blocks = pkg.evidence_blocks[blocks:]
+                if new_blocks:
+                    return "\n\n".join(new_blocks)[:6000]
+                return " ".join(pkg.context_notes[notes:]) or "Nothing found."
 
         def read(arguments: dict) -> str:
             line = arguments.get("line", 1)
@@ -826,13 +833,15 @@ class TriagePipeline:
                 answer = handler(arguments)
                 shown = " ".join(str(answer).split())[:160]
                 args = ", ".join(f"{k}={v!r}" for k, v in (arguments or {}).items())[:160]
-                pkg.code_questions.append(f"{'walk ' if walk else ''}{name}({args}) → {shown}")
+                with writing:
+                    pkg.code_questions.append(f"{'walk ' if walk else ''}{name}({args}) → {shown}")
                 return answer
             return call
 
         handlers = {name: logged(name, handler) for name, handler in handlers.items()}
         loop = run_tool_loop(self.client, _CONTEXT_TOOLS_SYSTEM, question, tools,
-                             handlers, max_calls=8, max_turns=10)
+                             handlers, max_calls=8, max_turns=10,
+                             parallel=max(1, self.cfg.parallel_llm))
         responses.extend(loop.turns)
         if loop.error and not added:
             raise LLMError(loop.error)
@@ -856,9 +865,46 @@ class TriagePipeline:
         if self.dep_chain is not None:
             self.dep_chain.prepare(items, workers=workers, progress=_prepare_progress)
         records: list[TriageRecord | None] = [None] * len(items)
+        log.info("triaging %d finding(s) on %d worker(s)", len(items), workers)
+
+        in_flight: dict[str, float] = {}
+        guard = threading.Lock()
+        finished = threading.Event()
+
+        def timed(finding: Finding) -> TriageRecord:
+            """One finding, with the two lines that say which one is running and for how long."""
+            started = time.monotonic()
+            with guard:
+                in_flight[finding.finding_id] = started
+            log.info("finding %s (%s) started", finding.finding_id,
+                     finding.dependency.package if finding.dependency else finding.code_context.file_path)
+            try:
+                record = self.triage_one(finding)
+            finally:
+                with guard:
+                    in_flight.pop(finding.finding_id, None)
+            log.info("finding %s decided %s in %.1fs", finding.finding_id,
+                     record.verdict.verdict.value, time.monotonic() - started)
+            return record
+
+        def watch() -> None:
+            """Name the findings that are taking too long, while they still are."""
+            warned: set[str] = set()
+            limit = max(30, self.cfg.slow_finding_seconds)
+            while not finished.wait(30):
+                now = time.monotonic()
+                with guard:
+                    slow = [(fid, now - t) for fid, t in in_flight.items() if now - t > limit]
+                for fid, elapsed in slow:
+                    if fid not in warned:
+                        warned.add(fid)
+                        log.warning("finding %s still running after %.0f s", fid, elapsed)
+
+        watcher = threading.Thread(target=watch, name="slow-finding-watch", daemon=True)
+        watcher.start()
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(self.triage_one, f): i for i, f in enumerate(items)}
+            futures = {pool.submit(timed, f): i for i, f in enumerate(items)}
             for done, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
                 try:
@@ -873,6 +919,8 @@ class TriagePipeline:
                         log.exception("could not journal %s", items[index].finding_id)
                 if progress:
                     progress(done, len(items))
+
+        finished.set()
 
         return TriageRun(
             records=[r for r in records if r is not None] + scoped.excluded,

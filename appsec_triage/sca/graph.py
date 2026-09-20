@@ -161,14 +161,6 @@ class DependencyGraph:
         log.info("dependency graph from cdxgen: %d components", len(graph))
         return graph
 
-    @classmethod
-    def from_sbom_file(cls, path: Path | str) -> DependencyGraph:
-        """An SBOM built by an earlier pipeline stage."""
-        document, problem = sbom_mod.read(Path(path))
-        if document is None:
-            log.warning("%s", problem)
-            return cls.empty()
-        return cls._from_sbom(document)
 
     @classmethod
     def _from_sbom(cls, document: dict) -> DependencyGraph:

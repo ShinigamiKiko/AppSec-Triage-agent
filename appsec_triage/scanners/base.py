@@ -280,16 +280,5 @@ class Scanner(ABC):
         )
 
 
-    def _docker_prefix(self, target: Path) -> list[str]:
-        """Read-only mount, no network unless the scanner needs to fetch rules."""
-        argv = ["docker", "run", "--rm", "-v", f"{target}:/src:ro", "-w", "/src"]
-        if not self.cfg.docker_network:
-            argv += ["--network", "none"]
-        for extra in self.cfg.docker_args:
-            argv.append(extra)
-        argv.append(self.cfg.image or "")
-        return argv
-
-
 def _first_line(text: str) -> str:
     return (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""

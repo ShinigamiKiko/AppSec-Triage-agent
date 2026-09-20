@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import os
 import sys
 from pathlib import Path
@@ -52,14 +53,23 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
         print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
 
 
+# Every HTTP client here sets its own timeout; this is the floor for whatever does not.
+_SOCKET_TIMEOUT_S = 300.0
+
+
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_streams()
     _load_dotenv()
     args = build_parser().parse_args(argv)
+    level = logging.DEBUG if args.verbose else getattr(logging, getattr(args, "log_level", "warning").upper())
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
+    # A network call whose caller forgot a timeout cannot hang the run forever:
+    # a scan once sat for half an hour on one connection that never opened.
+    socket.setdefaulttimeout(_SOCKET_TIMEOUT_S)
     try:
         return args.func(args)
     except (ConfigError, ingest.IngestError, registry.PromptError) as exc:

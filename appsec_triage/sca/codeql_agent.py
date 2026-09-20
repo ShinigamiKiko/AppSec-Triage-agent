@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -163,6 +165,7 @@ class _Session:
     asked_sites: set[tuple[str, int]] = field(default_factory=set)
     package: str = ""
     package_checked: bool = False
+    guard: threading.Lock = field(default_factory=threading.Lock)
     lsp: object = None
     code: object = None
     engine_available: bool = True
@@ -170,9 +173,10 @@ class _Session:
 
     def check_package(self) -> str:
         """Ask the project-level usage tool before looking for vulnerable calls."""
-        if self.package_checked:
-            return "Package usage was already checked."
-        self.package_checked = True
+        with self.guard:
+            if self.package_checked:
+                return "Package usage was already checked."
+            self.package_checked = True
         if self.ask_package is None:
             return "проверка использования пакета недоступна"
         used, detail, test_only = self.ask_package()
@@ -212,7 +216,8 @@ class _Session:
 
     def functions(self, reply: dict) -> list[str] | None:
         """Ask the engine about the functions in `reply`."""
-        functions = _functions(self._normalise(reply), self.asked_functions)
+        with self.guard:
+            functions = _functions(self._normalise(reply), self.asked_functions)
         if not functions:
             return None
         lines: list[str] = []
@@ -265,9 +270,10 @@ class _Session:
         label = f"{klass}::{name}" if klass else name
         if not valid_name(name) or not _CLASS_NAME.match(klass or "a"):
             return "Not run: the name is not a valid identifier."
-        if label in self.asked_usages:
-            return "Not run: already asked, the answer is above."
-        self.asked_usages.add(label)
+        with self.guard:
+            if label in self.asked_usages:
+                return "Not run: already asked, the answer is above."
+            self.asked_usages.add(label)
         note = "" if vulnerable else " (context — not marked vulnerable, not evidence)"
         if vulnerable and (sentence := declared_unaffected(self.advisory, name)):
             vulnerable = False
@@ -333,7 +339,8 @@ class _Session:
 
     def sites(self, reply: dict) -> list[str] | None:
         """Ask the engine about the positions in `reply`."""
-        sites = _sites(reply, self.asked_sites)
+        with self.guard:
+            sites = _sites(reply, self.asked_sites)
         if not sites:
             return None
         result = self.result
@@ -452,7 +459,7 @@ def _run_tool(session: _Session, name: str, arguments: dict, offered: set[str]) 
     return "\n".join(lines)
 
 
-def _investigate_with_tools(client, session: _Session, material: str, rounds: int) -> None:
+def _investigate_with_tools(client, session: _Session, material: str, rounds: int, parallel: int = 1) -> None:
     """The model calls the analyser itself and reacts to each answer."""
     result = session.result
     # Psalm answers by type, not by position, so it is offered no position tool.
@@ -487,17 +494,40 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
         if not turn.tool_calls:
             break  # the model has what it needs; the verdict is made later
         messages.append(turn.message)
-        for call in turn.tool_calls:
+        answers: list[str | None] = [None] * len(turn.tool_calls)
+        allowed: list[int] = []
+        for index, call in enumerate(turn.tool_calls):
             if result.tool_calls >= _MAX_TOOL_CALLS:
-                content = "Not run: the limit of questions to the analyser is reached."
+                answers[index] = "Not run: the limit of questions to the analyser is reached."
             else:
                 result.tool_calls += 1
-                log.info("model tool call for %s: %s(%s)", getattr(session.advisory, "advisory_id", "?"),
-                         call.name, json.dumps(call.arguments, ensure_ascii=False)[:300])
-                content = _run_tool(session, call.name, call.arguments, offered)
-            messages.append(client.tool_result_message(call, content))
-            if call.name == "check_package" and result.package_used is False:
-                return
+                allowed.append(index)
+
+        def ask(index: int) -> str:
+            call = turn.tool_calls[index]
+            log.info("model tool call for %s: %s(%s)", getattr(session.advisory, "advisory_id", "?"),
+                     call.name, json.dumps(call.arguments, ensure_ascii=False)[:300])
+            return _run_tool(session, call.name, call.arguments, offered)
+
+        # Usage decides whether the rest is worth asking, so it goes first and alone.
+        package = [i for i in allowed if turn.tool_calls[i].name == "check_package"]
+        rest = [i for i in allowed if i not in package]
+        for index in package:
+            answers[index] = ask(index)
+        stop = result.package_used is False
+        if not stop and rest:
+            if len(rest) > 1 and parallel > 1:
+                with ThreadPoolExecutor(max_workers=min(parallel, len(rest))) as pool:
+                    for index, answer in zip(rest, pool.map(ask, rest)):
+                        answers[index] = answer
+            else:
+                for index in rest:
+                    answers[index] = ask(index)
+        for call, content in zip(turn.tool_calls, answers):
+            if content is not None:
+                messages.append(client.tool_result_message(call, content))
+        if stop:
+            return
         if result.tool_calls >= _MAX_TOOL_CALLS:
             result.detail = result.detail or f"достигнут лимит в {_MAX_TOOL_CALLS} вопросов к {session.engine}"
             break
@@ -547,6 +577,7 @@ def investigate(
     lsp_tools=None,
     engine_available: bool = True,
     code_tools=None,
+    parallel: int = 1,
 ) -> Investigation:
     """Let the model question the analysis engine about this CVE; return what it established."""
     result = Investigation()
@@ -567,7 +598,7 @@ def investigate(
                        lsp=lsp, engine_available=engine_available, code=code)
     if getattr(client, "supports_tools", False) is True and callable(getattr(client, "chat_tools", None)):
         result.via_tools = True
-        _investigate_with_tools(client, session, material, rounds)
+        _investigate_with_tools(client, session, material, rounds, parallel)
     else:
         if lsp is not None:
             result.lsp_log.append("LSP: провайдер не поддерживает tool calling — языковой сервер моделью не опрашивался")

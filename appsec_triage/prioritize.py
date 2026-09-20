@@ -42,9 +42,6 @@ class QueueItem:
     def cluster_size(self) -> int:
         return 1 + len(self.cluster)
 
-    @property
-    def all_records(self) -> list[TriageRecord]:
-        return [self.record, *self.cluster]
 
     def as_dict(self) -> dict:
         return {

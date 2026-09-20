@@ -17,14 +17,22 @@ def _triage_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--workers", type=int)
     p.add_argument("--limit", type=int)
     p.add_argument("--govulncheck", dest="govulncheck", type=Path)
+    # On by default; the flag stays so older commands and CI files keep working.
     p.add_argument("--resolve-symbols", dest="resolve_symbols", action="store_true")
+    p.add_argument("--no-resolve-symbols", dest="resolve_symbols", action="store_false",
+                   help="skip the dependency chain and judge a dependency on its version alone")
+    p.set_defaults(resolve_symbols=None)
     p.add_argument("--no-lsp", action="store_true")
     p.add_argument("--fail-on", choices=["none", "confirmed", "review"], default="none")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="appsec-triage", description="LLM triage for SAST findings")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="same as --log-level debug")
+    p.add_argument("--parallel-llm", type=int, default=None, metavar="N",
+                   help="independent tool calls per finding at once (default from pipeline.yaml; 1 = sequential)")
+    p.add_argument("--log-level", choices=["warning", "info", "debug"], default="warning",
+                   help="info follows the run step by step without the debug noise")
     sub = p.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("triage", help="triage a findings file or directory")
     t.add_argument("input"); _triage_options(t)
@@ -34,7 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("bench", help="score providers against a labelled corpus")
     b.add_argument("corpus"); b.add_argument("-p", "--providers", nargs="+"); b.add_argument("-o", "--out", default="out/bench")
     b.add_argument("--config", type=Path); b.add_argument("--limit", type=int); b.add_argument("--source-root", action="append", default=[]); b.add_argument("--no-lsp", action="store_true")
-    b.add_argument("--resolve-symbols", dest="resolve_symbols", action="store_true"); b.add_argument("--scan-dir", type=Path)
+    b.add_argument("--resolve-symbols", dest="resolve_symbols", action="store_true")
+    b.add_argument("--no-resolve-symbols", dest="resolve_symbols", action="store_false")
+    b.set_defaults(resolve_symbols=None); b.add_argument("--scan-dir", type=Path)
     b.add_argument("--http-cassette", type=Path, help="pin SCA database lookups to this directory"); b.add_argument("--record", action="store_true", help="fill the cassette from the network instead of replaying it")
     b.set_defaults(func=bench.cmd_bench)
     sc = sub.add_parser("scan", help="run the scanners against a source tree")

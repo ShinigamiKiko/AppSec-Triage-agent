@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 class ChainSupport:
     def __init__(self, client, roots, *, lsp=None, routes=None, nvd_api_key=None,
                  deployment=None, reachability=None, codeql_databases=None,
-                 codeql_binary: str = "codeql", psalm_binary: str | None = None) -> None:
+                 codeql_binary: str = "codeql", psalm_binary: str | None = None,
+                 parallel_llm: int = 1) -> None:
         self._client = client
         self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
         self._roots = [Path(r) for r in roots]
@@ -33,6 +34,8 @@ class ChainSupport:
                            for k, v in (codeql_databases or {}).items()}
         self._codeql_binary = codeql_binary
         self._psalm_binary = psalm_binary
+        # Independent questions of one finding, asked side by side.
+        self._parallel_llm = max(1, parallel_llm)
         self._dataflow: dict[tuple[str, tuple], codeql_reach.Answer] = {}
         self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
         self._import_answers: dict[tuple[str, str], codeql_api.ImportAnswer] = {}
@@ -96,8 +99,25 @@ class ChainSupport:
             return None, default, ""
         ecosystem = dependency.ecosystem or ""
 
+        # Packages whose code was downloaded rather than read from the project:
+        # the report has to say so, because the walk rests on it.
+        fetched: list[str] = []
+
         def source_of(package: str) -> dict[str, str]:
-            return self._resolver._source_for(ecosystem, package, self._graph_version(package))
+            version = self._graph_version(package)
+            files = self._resolver._source_for(ecosystem, package, version)
+            if (ecosystem.lower(), package.lower(), version) in self._resolver.fetched:
+                name = f"{package}@{version}" if version else package
+                if name not in fetched:
+                    fetched.append(name)
+            return files
+
+        def as_bridge(walk: BridgeWalk):
+            result = _walk_as_bridge(walk)
+            if fetched:
+                note = "исходники загружены из реестра: " + ", ".join(fetched[:5])
+                result.detail = f"{result.detail}; {note}" if result.detail else note
+            return result
 
         best: tuple[BridgeWalk, str] | None = None
         for intro in sorted(placement.introductions, key=lambda i: len(i.path))[:2]:
@@ -107,14 +127,14 @@ class ChainSupport:
             walk = walk_bridge(symbol.function, chain_pkgs, source_of)
             through = intro.root_requirement
             if walk.closed:
-                return _walk_as_bridge(walk), [], through
+                return as_bridge(walk), [], through
             if walk.targets and not walk.unknown:
-                return _walk_as_bridge(walk), _pairs(walk.targets), through
+                return as_bridge(walk), _pairs(walk.targets), through
             best = best or (walk, through)
         if best is None:
             return None, default, ""
         walk, through = best
-        return _walk_as_bridge(walk), (_pairs(walk.targets) or default), through
+        return as_bridge(walk), (_pairs(walk.targets) or default), through
 
     def _once(self, cache: dict, key, compute):
         """(value, was_cached): run `compute` once per key without holding the lock while it runs."""

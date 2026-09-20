@@ -156,12 +156,6 @@ def package_usage(root: Path | str, ecosystem: str, package: str) -> tuple[bool 
     return False, f"ни одно из имён ({', '.join(names)}) не встречается в коде проекта", False
 
 
-def package_is_used(root: Path | str, ecosystem: str, package: str) -> tuple[bool | None, str]:
-    """`package_usage` without the test-only flag."""
-    used, detail, _ = package_usage(root, ecosystem, package)
-    return used, detail
-
-
 def import_path_used(
     root: Path | str, ecosystem: str, paths: list[str] | tuple[str, ...]
 ) -> tuple[bool | None, str]:

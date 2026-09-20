@@ -54,7 +54,15 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack
     if getattr(args, "workers", None): cfg.max_workers = args.workers
-    if getattr(args, "resolve_symbols", False): cfg.resolve_vulnerable_symbols = True
+    # Only an explicit flag overrides the file: an argparse default would quietly
+    # replace `parallel_llm` from pipeline.yaml on every run.
+    if (parallel := getattr(args, "parallel_llm", None)) is not None:
+        if parallel < 1:
+            print("error: --parallel-llm must be 1 or more", file=sys.stderr)
+            return 2
+        cfg.parallel_llm = parallel
+    if (resolve := getattr(args, "resolve_symbols", None)) is not None:
+        cfg.resolve_vulnerable_symbols = resolve
     if getattr(args, "govulncheck", None): cfg.govulncheck_report = str(args.govulncheck)
     if getattr(args, "scan_dir", None): cfg.scan_out_dir = str(args.scan_dir)
     if os.environ.get("NVD_API_KEY"): cfg.nvd_api_key = os.environ["NVD_API_KEY"]

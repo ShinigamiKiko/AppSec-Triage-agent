@@ -212,10 +212,21 @@ class PipelineConfig:
     max_evidence_chars: int = 32000
     context_retrieval_rounds: int = 2
     code_walk_first: bool = True
+    # A finding that has been running this long is reported while it runs, with
+    # its id: a silent progress bar cannot say which one is stuck.
+    slow_finding_seconds: int = 300
+    # Independent questions one finding may put to the analysers at the same
+    # time: CodeQL, Psalm and the language servers answer on their own threads.
+    # 1 keeps a finding strictly sequential; `max_workers` is the separate knob
+    # for how many findings run at once.
+    parallel_llm: int = 2
     redact_secrets: bool = False
     secrets_without_model: bool = True
     deployment_config: str | None = None
-    resolve_vulnerable_symbols: bool = False
+    # The dependency chain is the work itself: resolve the advisory's symbol,
+    # look for its calls, walk the chain, check the closure. It needs the
+    # network for advisories, so `--no-resolve-symbols` turns it off.
+    resolve_vulnerable_symbols: bool = True
     nvd_api_key: str | None = None
     govulncheck_report: str | None = None
     scan_out_dir: str | None = None

@@ -167,7 +167,7 @@ docker run --rm \
 docker run --rm \
   -v "$CI_PROJECT_DIR:/src:ro" -v "$CI_PROJECT_DIR/out:/out" \
   --env-file .env wolfee-agent-triage \
-  triage /out/deps.json --source-root /src --resolve-symbols -p deepseek -o /out
+  triage /out/deps.json --source-root /src -p deepseek -o /out
 ```
 
 Сканеры и триаж вместе — одной командой:
@@ -175,7 +175,7 @@ docker run --rm \
 ```bash
 docker run --rm -v "$CI_PROJECT_DIR:/src:ro" -v "$CI_PROJECT_DIR/out:/out" \
   --env-file .env wolfee-agent-triage \
-  run /src --resolve-symbols -p deepseek -o /out --fail-on confirmed
+  run /src -p deepseek -o /out --fail-on confirmed
 ```
 
 Коды возврата: `0` — чисто, `1` — сработал `--fail-on`, `2` — не поднялся обязательный языковой сервер.
@@ -211,10 +211,13 @@ appsec-triage triage findings.sarif --source-root . -o out/
 Сканеры и триаж вместе, с разбором зависимостей:
 
 ```bash
-appsec-triage run /path/to/project --resolve-symbols -o out/
+appsec-triage run /path/to/project -o out/
 ```
 
-`--resolve-symbols` включает цепочку SCA. Требует доступа в сеть.
+Цепочка SCA включена по умолчанию: символ из advisory, поиск его вызовов,
+обход цепочки через посредников, проверка закрытия. Ей нужен доступ в сеть за
+advisory; `--no-resolve-symbols` её выключает, и тогда зависимость оценивается
+только по версии.
 
 ---
 

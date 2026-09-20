@@ -198,14 +198,16 @@ class DependencyChain(ChainSupport):
                 return "CodeQL dataflow не проверен: база или запрос недоступны."
             call_site = exploitable_mod.assess(
                 reachability, self._roots[0], advisory, self._client,
-                dataflow_context=dataflow_context, dataflow_query=query_dataflow)
+                dataflow_context=dataflow_context, dataflow_query=query_dataflow,
+                parallel=self._parallel_llm)
             if call_site.detail and not call_site.lowers:
                 problems.append(call_site.detail)
 
         graph_audit = None
         if reachability is not None and not reachability.reachable and self._roots:
             graph_audit = unreached_mod.audit(
-                reachability, self._roots[0], advisory, symbol, self._client)
+                reachability, self._roots[0], advisory, symbol, self._client,
+                parallel=self._parallel_llm)
             if graph_audit.detail and not graph_audit.reopens:
                 problems.append(graph_audit.detail)
 
@@ -292,7 +294,7 @@ class DependencyChain(ChainSupport):
                 ask_sites=lambda sites: self._dataflow_for(
                     None, dependency, sites, record=codeql_calls, asked_by=asker),
                 lsp_tools=lsp_tools if lsp_ok else None, engine_available=engine_ok,
-                code_tools=code_tools)
+                code_tools=code_tools, parallel=self._parallel_llm)
             codeql_calls.extend(f"модель → {line}" for line in investigation.lsp_log)
             if investigation.lsp_called:
                 problems.append("LSP нашёл вызовы уязвимой функции из кода проекта: "
@@ -406,11 +408,15 @@ class DependencyChain(ChainSupport):
                     f"путь импорта {', '.join(symbol.package_paths[:3])} не найден в дереве проекта")
             elif used is False:
                 closure_kind, claim = "unused", f"пакет {used_package} не найден в дереве проекта"
+            elif found is not None and found.only_in_tests:
+                closure_kind, claim = "only_in_tests", (
+                    f"все найденные вызовы {symbol} лежат в тестовом коде")
             else:
                 closure_kind, claim = "", ""
             if closure_kind:
                 closure_audit = unreached_mod.audit_closure(
-                    closure_kind, claim, self._roots[0], advisory, symbol, self._client)
+                    closure_kind, claim, self._roots[0], advisory, symbol, self._client,
+                    parallel=self._parallel_llm)
                 if closure_audit.detail and not closure_audit.reopens:
                     problems.append(closure_audit.detail)
 

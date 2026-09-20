@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..prompts import registry
-from . import cassette, registries
+from . import cassette, npm_source, registries
 from .advisories import Advisory
 
 log = logging.getLogger(__name__)
@@ -404,24 +404,28 @@ class SymbolResolver:
         self._client = client
         self._roots = [Path(r) for r in (roots or [])]
         self._sources: dict[tuple[str, str, str], dict[str, str]] = {}
+        # Keys whose code came from the registry rather than from the project.
+        self.fetched: set[tuple[str, str, str]] = set()
 
     def _source_for(self, ecosystem: str, package: str, version: str = "") -> dict[str, str]:
-        """The installed package, read once per run and only when it is there."""
+        """The package's own code, read once per run: installed tree first, registry second."""
         key = (ecosystem.lower(), package.lower(), version)
         cached = self._sources.get(key)
-        if cached:
+        if cached is not None:
             return cached
         for root in self._roots:
             files = registries.package_source(ecosystem, package, version, root)
             if files:
                 self._sources[key] = files
                 return files
-        return {}
+        # Nothing under node_modules: a call chain still has to be walked through
+        # this package, so the exact version the lockfile names is fetched.
+        files = npm_source.fetch(package, version) if npm_source.supported(ecosystem) else {}
+        if files:
+            self.fetched.add(key)
+        self._sources[key] = files
+        return files
 
-    def extract_context(self, advisory: Advisory, version: str = "") -> VulnerableSymbol | None:
-        """Run only the advisory-context fallback, without project SCA or verdicts."""
-        diff, diff_url = fix_diff(advisory)
-        return self._context_resort(advisory, version, diff, diff_url)
 
     def _ask(self, user: str) -> dict:
         try:

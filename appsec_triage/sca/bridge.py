@@ -46,20 +46,6 @@ class BridgeResult:
         return self.calls_it is False
 
 
-def find_bridge(
-    vulnerable_function: str,
-    parent_source: dict[str, str],
-    *,
-    parent_package: str = "",
-    max_symbols: int = 12,
-) -> BridgeResult:
-    """Which functions of `parent_source` call `vulnerable_function`."""
-    if not vulnerable_function:
-        return BridgeResult(detail="уязвимая функция не определена")
-    return _callers({vulnerable_function}, parent_source,
-                    parent_package=parent_package, max_symbols=max_symbols)
-
-
 def _callers(
     targets: set[str],
     parent_source: dict[str, str],
@@ -174,7 +160,8 @@ def walk_bridge(
         source = source_of(package)
         if not source:
             return stopped(
-                f"исходники {package} не на диске — путь через него не прослежен",
+                f"исходников {package} нет ни в проекте, ни в реестре — "
+                "путь через него не прослежен",
                 depth - 1)
 
         result = _callers(targets, source, parent_package=package, max_symbols=max_symbols)

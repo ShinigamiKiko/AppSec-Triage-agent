@@ -21,7 +21,15 @@ max_trace_steps: 12
 max_evidence_chars: 32000
 # 0 disables follow-ups. Each round can plan reads and then revise the verdict.
 context_retrieval_rounds: 2
-code_walk_first: true     # перед первым вердиктом модель проходит по коду через lsp_* инструменты
+# Перед первым вердиктом модель проходит по коду через lsp_* инструменты.
+code_walk_first: true
+# Сколько независимых инструментов модель выполняет одновременно в одной находке.
+parallel_llm: 2
+# Столько секунд на находку — и она попадёт в лог как затянувшаяся.
+slow_finding_seconds: 300
+# Цепочка SCA для зависимостей: символ из advisory, поиск вызовов, обход цепочки,
+# проверка закрытия. Нужен доступ в сеть за advisory; выключается --no-resolve-symbols.
+resolve_vulnerable_symbols: true
 
 # Второй, состязательный проход по отдельным вердиктам.
 # Не переголосование: на один и тот же вопрос модель дважды даёт один и тот же

@@ -61,6 +61,18 @@ _BLIND_SPOTS = {
         "вызванный рабочей командой), и директория с тестовым именем, которая на "
         "самом деле собирается в образ. Ищите импорт этих тестовых файлов из рабочего кода."
     ),
+    "only_in_tests": (
+        "Утверждение получено так: найдены все места вызова уязвимой функции, и "
+        "каждое лежит в файле, который список тестовых путей из "
+        "prompts/training-context.md считает тестовым. Мимо такой проверки "
+        "проходит вызов через обёртку — рабочий код зовёт свою функцию, а уже "
+        "она зовёт уязвимую, и имени уязвимой в рабочем файле нет; тестовый "
+        "хелпер или фабрика, которую подключает рабочий код (сидер, фикстура, "
+        "консольная команда); директория с тестовым именем, которая на самом "
+        "деле собирается в образ; и вызов, собранный из строки или идущий через "
+        "контейнер. Ищите рабочий код, который вызывает эти тестовые файлы или "
+        "повторяет тот же вызов под своим именем."
+    ),
 }
 
 _SEARCH_SCHEMA = {
@@ -107,7 +119,8 @@ class Audit:
         return self.detail or self.passed
 
 
-def _patterns_by_tools(client, system: str, header: str, root: Path, limit: int) -> list[str]:
+def _patterns_by_tools(client, system: str, header: str, root: Path, limit: int,
+                       parallel: int = 1) -> list[str]:
     """Let the model grep itself; return the patterns it searched, in order."""
     searched: list[str] = []
 
@@ -125,13 +138,13 @@ def _patterns_by_tools(client, system: str, header: str, root: Path, limit: int)
                 "not a regular expression.",
         {"pattern": {"type": "string", "description": "Plain substring."}}, ["pattern"])
     loop = run_tool_loop(client, system + TOOL_MODE_NOTE, header, [tool], {"grep": grep},
-                         max_calls=limit, max_turns=limit + 2)
+                         max_calls=limit, max_turns=limit + 2, parallel=parallel)
     if loop.error and not searched:
         raise RuntimeError(loop.error)
     return searched[:limit]
 
 
-def audit(reachability, root: Path | str, advisory, symbol, client) -> Audit:
+def audit(reachability, root: Path | str, advisory, symbol, client, parallel: int = 1) -> Audit:
     """Check a "not reached" answer for the paths a static graph cannot resolve."""
     if client is None:
         return Audit(kind="not_reached",
@@ -156,7 +169,7 @@ def audit(reachability, root: Path | str, advisory, symbol, client) -> Audit:
 
     try:
         if supports_tools(client):
-            patterns = _patterns_by_tools(client, SEARCH_SYSTEM, header, root, 4)
+            patterns = _patterns_by_tools(client, SEARCH_SYSTEM, header, root, 4, parallel)
         else:
             asked = json.loads(client.complete(
                 SEARCH_SYSTEM, header, json_schema=_SEARCH_SCHEMA).text)
@@ -214,7 +227,8 @@ _CLOSURE_SCHEMA = {
 }
 
 
-def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, client) -> Audit:
+def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, client,
+                  parallel: int = 1) -> Audit:
     """Check a mechanical closure against the way that kind of check fails."""
     if client is None:
         return Audit(kind=kind, detail="модель не подключена — закрытие не проверено")
@@ -237,7 +251,7 @@ def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, cli
 
     try:
         if supports_tools(client):
-            patterns = _patterns_by_tools(client, CLOSURE_SEARCH_SYSTEM, header, root, 8)
+            patterns = _patterns_by_tools(client, CLOSURE_SEARCH_SYSTEM, header, root, 8, parallel)
         else:
             asked = json.loads(client.complete(
                 CLOSURE_SEARCH_SYSTEM, header, json_schema=_SEARCH_SCHEMA).text)
