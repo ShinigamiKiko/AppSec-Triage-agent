@@ -57,13 +57,32 @@ class ToolTurn:
     attempts: int = 1
 
 
+def loads_relaxed(text: str) -> Any:
+    """Parse a model's JSON, tolerating raw control characters inside strings.
+
+    A model quoting source code writes the newline it saw, where the standard
+    wants `\n`. Python's parser refuses that by default, so a reply that is
+    otherwise perfectly good is thrown away and asked for again. Nothing else
+    is relaxed: a genuinely broken reply still raises.
+    """
+    try:
+        return json.loads(text)
+    except ValueError:
+        return json.loads(text, strict=False)
+
+
+def to_strict_json(text: str) -> str:
+    """The same reply, re-encoded so every consumer can parse it strictly."""
+    return json.dumps(loads_relaxed(text), ensure_ascii=False)
+
+
 def tool_arguments(raw: Any) -> dict[str, Any]:
     """A tool call's arguments as a dict, however the provider encoded them."""
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
         try:
-            value = json.loads(raw)
+            value = loads_relaxed(raw)
         except ValueError:
             return {}
         return value if isinstance(value, dict) else {}
@@ -131,7 +150,8 @@ class BaseHTTPClient(ABC):
                         "Return one JSON object matching the schema and nothing "
                         "else. Escape every backslash and quote inside string "
                         "values — a namespace like Symfony\\\\Component needs its "
-                        "backslashes doubled.",
+                        "backslashes doubled — and write a line break inside a "
+                        "quoted value as \\n, never as a real newline.",
                         json_schema,
                     )
                 resp = self._client.post(path, json=payload)
@@ -142,7 +162,9 @@ class BaseHTTPClient(ABC):
                 text, ptok, ctok = self._parse(resp.json())
                 if json_schema is not None and text:
                     try:
-                        json.loads(text)
+                        # Hand on a reply the consumers can parse strictly, so a
+                        # newline inside a quoted line does not cost three calls.
+                        text = to_strict_json(text)
                     except ValueError as exc:
                         raise _UnparsableReply(
                             f"{self.name}: ответ не разбирается как JSON: {exc}") from exc
