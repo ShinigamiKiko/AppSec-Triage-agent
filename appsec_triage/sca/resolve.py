@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..prompts import registry
-from . import cassette, npm_source, registries
+from . import cassette, go_source, npm_source, registries
 from .advisories import Advisory
 
 log = logging.getLogger(__name__)
@@ -418,9 +418,15 @@ class SymbolResolver:
             if files:
                 self._sources[key] = files
                 return files
-        # Nothing under node_modules: a call chain still has to be walked through
-        # this package, so the exact version the lockfile names is fetched.
-        files = npm_source.fetch(package, version) if npm_source.supported(ecosystem) else {}
+        # Nothing installed here: a call chain still has to be walked through this
+        # package, so the exact version the lockfile names is fetched. Composer is
+        # not on this list — a PHP job installs `vendor/` before the agent runs.
+        if npm_source.supported(ecosystem):
+            files = npm_source.fetch(package, version)
+        elif go_source.supported(ecosystem):
+            files = go_source.fetch(package, version, self._roots)
+        else:
+            files = {}
         if files:
             self.fetched.add(key)
         self._sources[key] = files
