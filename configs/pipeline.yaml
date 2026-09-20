@@ -26,7 +26,7 @@ code_walk_first: true
 # Сколько независимых инструментов модель выполняет одновременно в одной находке.
 parallel_llm: 2
 # Столько секунд на находку — и она попадёт в лог как затянувшаяся.
-slow_finding_seconds: 300
+slow_finding_seconds: 900
 # Цепочка SCA для зависимостей: символ из advisory, поиск вызовов, обход цепочки,
 # проверка закрытия. Нужен доступ в сеть за advisory; выключается --no-resolve-symbols.
 resolve_vulnerable_symbols: true

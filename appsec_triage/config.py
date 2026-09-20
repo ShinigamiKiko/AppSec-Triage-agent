@@ -213,8 +213,10 @@ class PipelineConfig:
     context_retrieval_rounds: int = 2
     code_walk_first: bool = True
     # A finding that has been running this long is reported while it runs, with
-    # its id: a silent progress bar cannot say which one is stuck.
-    slow_finding_seconds: int = 300
+    # its id: a silent progress bar cannot say which one is stuck. Measured on a
+    # chain run, a finding takes 300-800 s, so a lower threshold would fire on
+    # every one of them and the warning would come to mean "normal".
+    slow_finding_seconds: int = 900
     # Independent questions one finding may put to the analysers at the same
     # time: CodeQL, Psalm and the language servers answer on their own threads.
     # 1 keeps a finding strictly sequential; `max_workers` is the separate knob
