@@ -10,6 +10,7 @@ import tempfile
 import time
 from collections import Counter
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 from .base import Availability, Scanner, ScannerError, ScanResult
 
@@ -81,17 +82,32 @@ class PsalmScanner(Scanner):
                 mode="w", suffix=".xml", prefix="psalm-autonomous-", dir=out_dir,
                 encoding="utf-8", delete=False,
             ) as handle:
+                # vendor/ is read for types through the autoloader, never
+                # analysed: the taint paths wanted are the project's own, and
+                # analysing an old dependency tree is what makes Psalm crash.
+                autoload = target / "vendor" / "autoload.php"
+                # Psalm refuses a config naming a directory that is not there,
+                # so only the ones this project actually has are listed.
+                skip = [target / name for name in ("vendor", "node_modules")
+                        if (target / name).is_dir()]
+                ignored = "".join(
+                    f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
                 handle.write(
                     '<?xml version="1.0" encoding="UTF-8"?>\n'
-                    '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8">\n'
+                    '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8"'
+                    + (f' autoloader={quoteattr(str(autoload))}' if autoload.is_file() else "")
+                    + '>\n'
                     '  <projectFiles>\n'
-                    f'    <directory name="{target}" />\n'
-                    '  </projectFiles>\n'
+                    f'    <directory name={quoteattr(str(target))} />\n'
+                    + (f'    <ignoreFiles>\n{ignored}    </ignoreFiles>\n' if ignored else "")
+                    + '  </projectFiles>\n'
                     '</psalm>\n'
                 )
                 temporary = Path(handle.name)
             self._runtime_config = temporary
-            self._runtime_root = Path(out_dir).resolve()
+            # The project, not the directory the report is written to: --root is
+            # what Psalm resolves the analysed tree against.
+            self._runtime_root = target
         try:
             return super().scan(target, out_dir)
         finally:
