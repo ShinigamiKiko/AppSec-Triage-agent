@@ -1,49 +1,68 @@
-# Example GitLab CI configuration for appsec-triage
+# Dependency triage in GitLab CI, using the agent's Docker image.
+# For a runner without the image, see ci/gitlab-ci.example.yml.
+#
+# Variables in Settings → CI/CD → Variables (masked):
+#   DEEPSEEK_API_KEY   provider key
+#
+# The image sets ENTRYPOINT ["appsec-triage"], so `entrypoint: [""]` is needed
+# for GitLab to run its own shell and the lines under `script`.
 
 stages:
   - security
 
-appsec-triage:
+.appsec-triage:
   stage: security
-  image: your-registry/appsec-triage:latest
+  image:
+    name: your-registry/appsec-triage:latest
+    entrypoint: [""]
   variables:
-    # REQUIRED: Specify ecosystems in your project
-    # Supported: npm, composer, pypi, go, maven, rubygems, cargo, nuget
+    # REQUIRED: which ecosystems this project has. It decides which source files
+    # are read and which language servers must come up; an unknown name or an
+    # unset variable stops the run with exit 2.
+    # Accepted: npm, composer, pypi, go, maven, rubygems, cargo, nuget.
+    # Dependency findings are triaged only for the ecosystems listed under
+    # scope.only_ecosystems in configs/pipeline.yaml — go, npm and composer by
+    # default; findings from the rest are filtered out before the model sees them.
     APPSEC_ECOSYSTEMS: "npm"
-  
+    # GitLab caches only paths under the project directory.
+    GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+  # The agent reads a dependency's own code from the installed tree and never
+  # downloads it. Another job may have filled these directories already — the
+  # key is the lock files, so a restored tree always matches them.
+  cache:
+    key:
+      files: [composer.lock, package-lock.json, go.sum]
+    paths: [vendor/, node_modules/, .go/pkg/mod/]
+  before_script:
+    # Install only what the cache did not bring. Dev dependencies stay: a package
+    # pruned from the tree cannot be read, and the chain stops at it.
+    - '[ -f composer.lock ] && [ ! -d vendor ] && composer install --no-interaction --no-progress --prefer-dist || true'
+    - '[ -f package-lock.json ] && [ ! -d node_modules ] && npm ci --no-audit --no-fund || true'
+    - '[ -f yarn.lock ] && [ ! -d node_modules ] && yarn install --frozen-lockfile || true'
+    - '[ -f go.sum ] && go mod download || true'
   script:
-    - appsec-triage scan --root $CI_PROJECT_DIR --output appsec-report
-  
+    - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o appsec-report --fail-on confirmed
+  # 0 — clean, 1 — --fail-on triggered, 2 — a required language server did not start.
   artifacts:
     when: always
     paths:
       - appsec-report/
     expire_in: 30 days
-  
+
+appsec-triage:
+  extends: .appsec-triage
   only:
     - merge_requests
     - main
 
-# Example: Multi-ecosystem project
+# Example: a project with several ecosystems at once.
 appsec-triage-fullstack:
-  extends: appsec-triage
+  extends: .appsec-triage
   variables:
-    APPSEC_ECOSYSTEMS: "npm,pypi,go"
+    APPSEC_ECOSYSTEMS: "npm,go,composer"
 
 # Example: PHP project
 appsec-triage-php:
-  extends: appsec-triage
+  extends: .appsec-triage
   variables:
     APPSEC_ECOSYSTEMS: "composer"
-
-# Example: Java/Kotlin project
-appsec-triage-java:
-  extends: appsec-triage
-  variables:
-    APPSEC_ECOSYSTEMS: "maven"
-
-# Example: Rust project
-appsec-triage-rust:
-  extends: appsec-triage
-  variables:
-    APPSEC_ECOSYSTEMS: "cargo"

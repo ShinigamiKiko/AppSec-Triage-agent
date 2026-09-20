@@ -24,20 +24,28 @@ appsec-triage:
       files: [composer.lock, package-lock.json, go.sum]
     paths: [vendor/, node_modules/, .go/pkg/mod/]
   variables:
+    # REQUIRED: which ecosystems this project has. Unset or unknown stops the
+    # run with exit 2. Dependency findings are triaged only for what
+    # scope.only_ecosystems in configs/pipeline.yaml allows.
+    APPSEC_ECOSYSTEMS: "composer"
+    # GitLab caches only paths under the project directory.
     GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
   before_script:
     # The project's own build, whatever it needs before composer can resolve.
     - ./build.sh
     # Vulnerable versions must install: they are what is being analysed.
     - composer config --no-interaction audit.block-insecure false
-    - composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist
+    # Install only what the cache did not bring; the key is the lock files, so a
+    # restored tree always matches them.
+    - '[ ! -d vendor ] && composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist || true'
     # Same for the other two, when the project has them. Dev dependencies stay:
     # a package pruned from the tree cannot be read, and the chain stops there.
-    - '[ -f package-lock.json ] && npm ci --no-audit --no-fund || true'
-    - '[ -f yarn.lock ] && yarn install --frozen-lockfile || true'
+    - '[ -f package-lock.json ] && [ ! -d node_modules ] && npm ci --no-audit --no-fund || true'
+    - '[ -f yarn.lock ] && [ ! -d node_modules ] && yarn install --frozen-lockfile || true'
     - '[ -f go.sum ] && go mod download || true'
   script:
     - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
+  # 0 — clean, 1 — --fail-on triggered, 2 — a required language server did not start.
   artifacts:
     when: always
     paths: [appsec-out/]
