@@ -122,11 +122,28 @@ RUN pip install \
     && pylsp --help >/dev/null
 
 # CodeQL bundle (CLI + standard query packs). Large layer.
+# Only the languages this agent is run on. The bundle carries ten, and the
+# eight nobody uses here are 1.2 GB of the image. A language is whatever has
+# a `<lang>-queries` pack, so a language a future bundle adds is dropped too
+# rather than slipping through a fixed list. The shared libraries and the
+# small generic extractors (html, xml, yaml, csv, properties) stay: Go and
+# JavaScript analysis read config files through them.
+# PHP needs nothing here — CodeQL does not support it; Psalm and phpactor do.
+ARG CODEQL_LANGUAGES="go javascript"
 RUN curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODEQL_BUNDLE_TAG}/codeql-bundle-linux64.tar.gz" \
         -o /tmp/codeql.tgz \
     && tar -xzf /tmp/codeql.tgz -C /opt && rm /tmp/codeql.tgz \
+    && for pack in /opt/codeql/qlpacks/codeql/*-queries; do \
+         lang="$(basename "$pack" -queries)"; \
+         case " ${CODEQL_LANGUAGES} " in *" $lang "*) continue ;; esac; \
+         rm -rf "/opt/codeql/$lang" /opt/codeql/qlpacks/codeql/"$lang"-*; \
+       done \
     && ln -s /opt/codeql/codeql /usr/local/bin/codeql \
-    && codeql version --format terse
+    && codeql version --format terse \
+    && for lang in ${CODEQL_LANGUAGES}; do \
+         codeql resolve languages | grep -q "^$lang " \
+           || { echo "CodeQL lost $lang while being trimmed" >&2; exit 1; }; \
+       done
 
 # Wolfee provides SCA inventory and Go reachability traces for the triage run.
 COPY --from=wolfee-builder /build/wolfee/bin/wolfee /usr/local/bin/wolfee

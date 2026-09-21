@@ -156,6 +156,17 @@ appsec-triage doctor
 docker build -t wolfee-agent-triage .
 ```
 
+Из CodeQL в образ попадают только Go и JavaScript/TypeScript: остальные языки
+бандла весят 1.2 ГБ, а агент на них не запускается. PHP CodeQL не поддерживает —
+его разбирают Psalm и phpactor. Нужен другой набор — задайте его при сборке:
+
+```bash
+docker build --build-arg CODEQL_LANGUAGES="go javascript python" -t wolfee-agent-triage .
+```
+
+Опечатка в списке не пройдёт незаметно: сборка остановится с сообщением, какой
+язык потерялся.
+
 Джоба в пайплайне: находит уязвимые зависимости, потом триажит.
 
 ```bash
