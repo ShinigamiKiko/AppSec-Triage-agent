@@ -1,0 +1,27 @@
+# Names that belong to JavaScript itself, the browser or Node — never to an npm package.
+# A call whose receiver (or bare name) is one of these is not a package call, bound or not.
+# One or more names per line; `#` starts a comment.
+
+# language
+Object Array Function Boolean Number String Symbol BigInt Math JSON Date RegExp Error EvalError
+RangeError ReferenceError SyntaxError TypeError URIError AggregateError Promise Proxy Reflect
+Map Set WeakMap WeakSet WeakRef FinalizationRegistry ArrayBuffer SharedArrayBuffer DataView
+Int8Array Uint8Array Uint8ClampedArray Int16Array Uint16Array Int32Array Uint32Array
+Float32Array Float64Array BigInt64Array BigUint64Array Atomics Intl globalThis
+parseInt parseFloat isNaN isFinite decodeURI decodeURIComponent encodeURI encodeURIComponent
+escape unescape eval queueMicrotask structuredClone setTimeout setInterval clearTimeout
+clearInterval setImmediate clearImmediate
+
+# browser
+window self document navigator location history screen localStorage sessionStorage
+indexedDB caches crypto performance console alert confirm prompt open close print
+fetch XMLHttpRequest Headers Request Response FormData URL URLSearchParams Blob File
+FileReader FileList Image Audio Option Event CustomEvent EventTarget AbortController
+AbortSignal MutationObserver IntersectionObserver ResizeObserver PerformanceObserver
+WebSocket Worker SharedWorker BroadcastChannel MessageChannel TextEncoder TextDecoder
+atob btoa requestAnimationFrame cancelAnimationFrame requestIdleCallback getComputedStyle
+matchMedia DOMParser XMLSerializer Node Element HTMLElement HTMLInputElement
+HTMLFormElement NodeList CSS Notification ClipboardItem
+
+# node
+process Buffer require module exports __dirname __filename global

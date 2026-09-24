@@ -20,6 +20,14 @@ class LLMRetryableError(LLMError):
     """Transient failure: timeout, 429, 5xx, connection reset."""
 
 
+class LLMAuthError(LLMError):
+    """The provider refused the credentials (HTTP 401/403).
+
+    Fatal for the whole run: every later call would fail the same way, so the
+    client remembers it and refuses further calls without touching the network.
+    """
+
+
 class _UnparsableReply(LLMRetryableError):
     """The reply was delivered but is not the JSON the schema asked for."""
 
@@ -116,6 +124,8 @@ class BaseHTTPClient(ABC):
         self.completion_tokens_total = 0
         self.spend_usd = 0.0
         self._native_tools_rejected = False
+        # Set once on HTTP 401/403; every later call raises it immediately.
+        self.fatal_error: LLMAuthError | None = None
         self._client = httpx.Client(
             base_url=cfg.base_url,
             timeout=httpx.Timeout(cfg.timeout_s, connect=cfg.connect_timeout_s),
@@ -135,7 +145,24 @@ class BaseHTTPClient(ABC):
         """Return (text, prompt_tokens, completion_tokens)."""
 
 
+    def _refuse_if_fatal(self) -> None:
+        if self.fatal_error is not None:
+            raise self.fatal_error
+
+    def _auth_failure(self, resp: httpx.Response) -> None:
+        """Remember and raise a credentials refusal: nothing after it can succeed."""
+        if resp.status_code in (401, 403):
+            self.fatal_error = LLMAuthError(
+                f"{self.name}: HTTP {resp.status_code} — ключ API не принят провайдером: {resp.text[:300]}")
+            raise self.fatal_error
+
+    def ping(self) -> None:
+        """One tiny call before the run: a bad key or an unreachable endpoint fails in
+        seconds instead of after the scanners and the SCA preparation."""
+        self.complete('Reply with the json object {"ok": true} and nothing else.', "ping — answer in json")
+
     def complete(self, system: str, user: str, *, json_schema: dict[str, Any] | None = None) -> LLMResponse:
+        self._refuse_if_fatal()
         path, payload = self._build_payload(system, user, json_schema)
         started = time.monotonic()
         last_exc: Exception | None = None
@@ -157,6 +184,7 @@ class BaseHTTPClient(ABC):
                 resp = self._client.post(path, json=payload)
                 if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
                     raise LLMRetryableError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:300]}")
+                self._auth_failure(resp)
                 if resp.status_code >= 400:
                     raise LLMError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:500]}")
                 text, ptok, ctok = self._parse(resp.json())
@@ -209,6 +237,7 @@ class BaseHTTPClient(ABC):
         """One turn of a native tool-calling conversation, with the usual retries."""
         if not self.supports_tools:
             raise LLMError(f"{self.name}: tool calling is not enabled for this provider")
+        self._refuse_if_fatal()
         path, payload = self._tool_payload(messages, tools)
         started = time.monotonic()
         last_exc: Exception | None = None
@@ -217,6 +246,7 @@ class BaseHTTPClient(ABC):
                 resp = self._client.post(path, json=payload)
                 if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
                     raise LLMRetryableError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:300]}")
+                self._auth_failure(resp)
                 if resp.status_code >= 400:
                     # HTTP 400 with tools often means the model doesn't support them
                     error_text = resp.text[:500]

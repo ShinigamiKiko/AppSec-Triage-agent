@@ -16,8 +16,6 @@ from . import codeql_reach
 
 log = logging.getLogger(__name__)
 
-SYSTEM = registry.step("codeql-agent")
-TOOLS_SYSTEM = registry.step("codeql-agent-tools")
 
 _ROUNDS = 3
 _MAX_FUNCTIONS = 6
@@ -67,7 +65,8 @@ class Investigation:
     lsp_called: list[str] = field(default_factory=list)
 
 
-def _material(advisory, symbol, package: str, engine: str = "CodeQL") -> str:
+def _material(advisory, symbol, package: str, engine: str = "CodeQL",
+              placement=None) -> str:
     lines = [
         f"Advisory: {advisory.advisory_id} — {advisory.summary}",
         (advisory.details or "")[:1500],
@@ -90,6 +89,22 @@ def _material(advisory, symbol, package: str, engine: str = "CodeQL") -> str:
         lines.append(f"Vulnerable function named by the fix analysis: {symbol}")
     if symbol is not None and getattr(symbol, "what_changed", ""):
         lines.append(f"What the fix changed: {symbol.what_changed}")
+    # Direct or transitive decides what the question is: for a transitive package
+    # "this project never calls it" is the expected state, not an answer.
+    if placement is not None:
+        if getattr(placement, "direct", False):
+            lines.append(f"Placement: {package} is a direct dependency — the project's own "
+                         "manifest asks for it, so the project is expected to call it itself.")
+        elif getattr(placement, "introductions", None):
+            chains = "; ".join(i.describe() for i in placement.introductions[:3])
+            parents = ", ".join(placement.parents[:3]) or "the package above it"
+            lines.append(f"Placement: {package} is transitive. Installed through: {chains}. "
+                         f"The package that calls it is {parents}; its source is installed and "
+                         "readable with lsp_outline/lsp_read_symbol under node_modules/ or "
+                         "vendor/. Read it before concluding anything about reachability.")
+        else:
+            lines.append(f"Placement: {package} is transitive, but the install path could not be "
+                         "reconstructed — say so rather than assuming either way.")
     return "\n\n".join(line for line in lines if line)
 
 
@@ -165,6 +180,8 @@ class _Session:
     asked_sites: set[tuple[str, int]] = field(default_factory=set)
     package: str = ""
     package_checked: bool = False
+    # The packages that install a transitive dependency; empty for a direct one.
+    parents: tuple[str, ...] = ()
     guard: threading.Lock = field(default_factory=threading.Lock)
     lsp: object = None
     code: object = None
@@ -180,6 +197,13 @@ class _Session:
         if self.ask_package is None:
             return "проверка использования пакета недоступна"
         used, detail, test_only = self.ask_package()
+        if used is False and self.parents and not test_only:
+            # A transitive package is not imported by the project; that is its normal state.
+            # Whether it runs is a question about the parent, so the investigation goes on.
+            parents = ", ".join(self.parents)
+            return (f"Проект сам не импортирует {self.package} — для транзитивного пакета это ожидаемо: "
+                    f"его загружает {parents}. Это не ответ: проверьте, как проект использует {parents} "
+                    f"и доходит ли код {parents} до уязвимой функции ({detail}).")
         self.result.package_used = used
         if used is False:
             suffix = " (только тесты)" if test_only else ""
@@ -312,15 +336,14 @@ class _Session:
         elif method == "outline":
             answer, asked = code.outline(file), file
         elif method == "read_symbol":
-            start, problem = code.symbol_start(file, name)
-            if start is None:
-                answer = problem
-            else:
-                path = code.resolve(file)
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[start - 1:start + 59]
-                body = "\n".join(f"{start + i}: {text}" for i, text in enumerate(lines))
-                answer = redact_secrets(body)[0] or ""
-            asked = f"{name} @ {file}"
+            answer, asked = code.read_symbol(file, name), f"{name} @ {file}"
+        elif method == "read_file":
+            path = str(arguments.get("path") or file).replace("\\", "/")
+            line = as_int(arguments.get("line")) or 1
+            answer, asked = code.read(path, line), f"{path}:{line}"
+        elif method == "search_code":
+            answer = code.search(arguments.get("pattern"))
+            asked = f"{arguments.get('pattern')!r}"
         else:
             line = as_int(arguments.get("line"))
             if line is None or line < 1 or not file:
@@ -333,7 +356,8 @@ class _Session:
                 answer = code.references(file, line, name)
             asked = f"{name} @ {file}:{line}" if name else f"{file}:{line}"
         # The log keeps the question and a bounded answer; code bodies stay out of it.
-        shown = answer if method != "read_symbol" else f"прочитано {len(answer.splitlines())} строк"
+        shown = (answer if method not in ("read_symbol", "read_file")
+                 else f"прочитано {len(answer.splitlines())} строк")
         self.result.lsp_log.append(f"LSP lsp_{method} {asked}: {shown[:300]}")
         return answer
 
@@ -413,7 +437,6 @@ def _function_tool(name, description, properties, required):
         "name": name, "description": description,
         "parameters": {"type": "object", "required": required, "properties": properties}}}
 
-_MAX_TOOL_CALLS = 8
 
 
 def _flag(value: object) -> bool:
@@ -444,6 +467,8 @@ def _run_tool(session: _Session, name: str, arguments: dict, offered: set[str]) 
                               _flag(arguments.get("vulnerable")))
     if name.startswith("lsp_") and session.code is not None:
         return session.code_question(name[4:], arguments)
+    if name in ("read_file", "search_code") and session.code is not None:
+        return session.code_question(name, arguments)
     if name == "find_calls":
         lines = session.functions({"functions": [{
             "name": arguments.get("name"), "class": arguments.get("class") or "",
@@ -459,7 +484,8 @@ def _run_tool(session: _Session, name: str, arguments: dict, offered: set[str]) 
     return "\n".join(lines)
 
 
-def _investigate_with_tools(client, session: _Session, material: str, rounds: int, parallel: int = 1) -> None:
+def _investigate_with_tools(client, session: _Session, material: str, rounds: int,
+                            parallel: int = 1, max_calls: int = 20) -> None:
     """The model calls the analyser itself and reacts to each answer."""
     result = session.result
     # Psalm answers by type, not by position, so it is offered no position tool.
@@ -469,12 +495,15 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
     if session.lsp is not None:
         tools += LSP_TOOLS
     if session.code is not None:
-        from ..lsp.code_tools import function_tools
+        from ..lsp.code_tools import function_tools, reading_tools
 
-        tools += function_tools(_function_tool)
+        tools += reading_tools(_function_tool) + function_tools(_function_tool)
     offered = {tool["function"]["name"] for tool in tools}
-    messages = [{"role": "system", "content": TOOLS_SYSTEM}, {"role": "user", "content": material}]
-    for turn_no in range(1, max(1, rounds) * 3 + 1):
+    messages = [{"role": "system", "content": registry.step("codeql-agent-tools")}, {"role": "user", "content": material}]
+    # Ходов должно хватать на весь бюджет вопросов. При одном вызове за ход
+    # девять ходов обрывали разговор на девятом вопросе, сколько бы вызовов
+    # ни было разрешено — второй, невидимый потолок.
+    for turn_no in range(1, max(max(1, rounds) * 3, max_calls + 2) + 1):
         left = getattr(client, "budget_left_usd", None)
         if isinstance(left, (int, float)) and not isinstance(left, bool) and left <= 0:
             result.detail = "бюджет прогона исчерпан"
@@ -497,7 +526,7 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
         answers: list[str | None] = [None] * len(turn.tool_calls)
         allowed: list[int] = []
         for index, call in enumerate(turn.tool_calls):
-            if result.tool_calls >= _MAX_TOOL_CALLS:
+            if result.tool_calls >= max_calls:
                 answers[index] = "Not run: the limit of questions to the analyser is reached."
             else:
                 result.tool_calls += 1
@@ -528,8 +557,8 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
                 messages.append(client.tool_result_message(call, content))
         if stop:
             return
-        if result.tool_calls >= _MAX_TOOL_CALLS:
-            result.detail = result.detail or f"достигнут лимит в {_MAX_TOOL_CALLS} вопросов к {session.engine}"
+        if result.tool_calls >= max_calls:
+            result.detail = result.detail or f"достигнут лимит в {max_calls} вопросов к {session.engine}"
             break
 
 
@@ -542,7 +571,7 @@ def _investigate_with_json(client, session: _Session, material: str, rounds: int
             result.detail = "бюджет прогона исчерпан"
             break
         try:
-            reply = json.loads(client.complete(SYSTEM, material, json_schema=_SCHEMA).text)
+            reply = json.loads(client.complete(registry.step("codeql-agent"), material, json_schema=_SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - the chain's own search still runs
             log.warning("codeql investigation round %d failed for %s: %s",
                         round_no, getattr(session.advisory, "advisory_id", "?"), exc)
@@ -578,6 +607,8 @@ def investigate(
     engine_available: bool = True,
     code_tools=None,
     parallel: int = 1,
+    max_calls: int = 20,
+    placement=None,
 ) -> Investigation:
     """Let the model question the analysis engine about this CVE; return what it established."""
     result = Investigation()
@@ -585,7 +616,7 @@ def investigate(
         result.detail = f"модель не подключена — {engine} моделью не опрашивался"
         return result
 
-    material = _material(advisory, symbol, package, engine)
+    material = _material(advisory, symbol, package, engine, placement=placement)
     if api_hint:
         material = f"{material}\n\n{api_hint}"
     lsp = lsp_tools if lsp_tools is not None and lsp_tools.available else None
@@ -594,11 +625,14 @@ def investigate(
         material = (f"{material}\n\nLanguage servers indexed this project and are available as tools: "
                     "find_usages for callers of a package function, and lsp_* to find, read and follow any "
                     "declaration in the project's code.")
+    parents = ()
+    if placement is not None and not getattr(placement, "direct", False):
+        parents = tuple(getattr(placement, "parents", None) or ())[:3]
     session = _Session(advisory, engine, ask_functions, ask_sites, ask_package, result, package=package,
-                       lsp=lsp, engine_available=engine_available, code=code)
+                       lsp=lsp, engine_available=engine_available, code=code, parents=parents)
     if getattr(client, "supports_tools", False) is True and callable(getattr(client, "chat_tools", None)):
         result.via_tools = True
-        _investigate_with_tools(client, session, material, rounds, parallel)
+        _investigate_with_tools(client, session, material, rounds, parallel, max_calls)
     else:
         if lsp is not None:
             result.lsp_log.append("LSP: провайдер не поддерживает tool calling — языковой сервер моделью не опрашивался")

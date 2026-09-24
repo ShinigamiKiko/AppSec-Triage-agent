@@ -81,13 +81,28 @@ def govulncheck_baseline(finding: Finding) -> Verdict:
     )
 
 
-def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage) -> str | None:
-    """Return FP reason for advisory preconditions impossible in this deployment."""
+def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage,
+                              advisory_text: str = "") -> str | None:
+    """Return FP reason for advisory preconditions impossible in this deployment.
+
+    `advisory_text` is the advisory the dependency chain fetched. The scanner's own
+    title is often too short to name the component ("Misuse of ServerConfig.PublicKeyCallback
+    ... in golang.org/x/crypto" never says SSH), so the rule must also read the full text.
+    """
+    from ..testpaths import is_local_environment
+
+    location = finding.code_context.file_path or ""
+    if is_local_environment(location):
+        return (
+            f"{location} is a docker-compose file: it describes a local development environment, "
+            "not the production deployment. The finding does not apply to the running application."
+        )
     advisory = finding.raw.get("advisory", {})
     details = "\n".join(
         text
         for text in (
             str(advisory.get("details", "")),
+            advisory_text,
             finding.title or "",
             finding.description or "",
             finding.dependency.package if finding.dependency else "",
@@ -236,26 +251,144 @@ def _to_unknown(v: Verdict, evidence_class: EvidenceClass | None = None) -> Verd
     )
 
 
+def stated_confidence(result: Verdict) -> float:
+    """The confidence the model itself stated; the measured score when it stated none."""
+    return (result.self_reported_confidence if result.self_reported_confidence is not None
+            else result.confidence)
+
+
 def apply_confidence_policy(result: Verdict, overrides: list[str]) -> Verdict:
-    """Allow automatic application only for a non-unknown verdict above 85%."""
+    """Apply a verdict without a person only when the model itself is above the threshold.
+
+    The model's own number decides, for code findings and dependencies alike. The
+    measured score is the floor under it, not the gate: a verdict it rates low has
+    already been turned into `unknown` before this runs.
+    """
+    stated = stated_confidence(result)
     if result.verdict is VerdictLabel.unknown:
         if not result.requires_human_review:
             result = result.model_copy(update={"requires_human_review": True})
             overrides.append("confidence_policy: unknown verdict requires human review")
-    elif result.confidence > AUTO_APPLY_CONFIDENCE:
+    elif stated > AUTO_APPLY_CONFIDENCE:
         if result.requires_human_review:
             result = result.model_copy(update={"requires_human_review": False})
             overrides.append(
-                f"confidence_policy: confidence {result.confidence:.2f} is above the "
+                f"confidence_policy: model confidence {stated:.2f} is above the "
                 f"{AUTO_APPLY_CONFIDENCE:.2f} auto-apply threshold"
             )
     elif not result.requires_human_review:
         result = result.model_copy(update={"requires_human_review": True})
         overrides.append(
-            f"confidence_policy: confidence {result.confidence:.2f} is not above "
+            f"confidence_policy: model confidence {stated:.2f} is not above "
             f"the {AUTO_APPLY_CONFIDENCE:.2f} auto-apply threshold"
         )
     return result
+
+
+# Chain outcomes whose only evidence of a call is a name match in the text.
+# They cannot carry a confirmation on their own: the object being called was
+# never resolved, so the match may belong to a builtin or to another library.
+_UNPROVEN_CALL = {"call_unconfirmed", "mentioned"}
+
+
+_RESOLVED_ROUTES = {"codeql", "callgraph"}
+_LSP_CALLED = "LSP нашёл вызовы"
+
+
+def _project_site(site: str) -> bool:
+    """`file:line` in the project's own code — not a dependency, not a status line."""
+    head = str(site or "").split()[0] if str(site or "").strip() else ""
+    path, _, line = head.rpartition(":")
+    if not path or not line.rstrip(",;").isdigit():
+        return False
+    parts = set(path.replace("\\", "/").split("/"))
+    return not parts & {"node_modules", "vendor"}
+
+
+def _call_resolved(sca) -> bool:
+    """Something beyond a name says the project calls the package: an analyser that
+    resolves calls, a language server that did, or a call site in project code."""
+    if (getattr(sca, "route", "") or "") in _RESOLVED_ROUTES:
+        return True
+    if any(str(p).startswith(_LSP_CALLED) for p in (getattr(sca, "problems", None) or [])):
+        return True
+    return any(_project_site(site) for site in (getattr(sca, "call_sites", None) or []))
+
+
+def _installed_owner(location: str) -> str:
+    """The installed package a `path:line` points into, or "" for anything else."""
+    head = str(location or "").split()[0] if str(location or "").strip() else ""
+    parts = [p for p in head.replace("\\", "/").split("/") if p]
+    for index, part in enumerate(parts[:-1]):
+        if part in ("node_modules", "vendor"):
+            rest = parts[index + 1:]
+            two = part == "vendor" or rest[0].startswith("@")
+            return "/".join(rest[:2]) if two and len(rest) > 2 else rest[0]
+    return ""
+
+
+def _parent_bridge(result: Verdict, sca):
+    """(project step, parent step) of a quoted path into a transitive package, or None."""
+    parents = {str(p).strip().lower() for p in (getattr(sca, "loaded_via", None) or []) if str(p).strip()}
+    package = (getattr(sca, "package", "") or "").strip()
+    if not parents or not package:
+        return None
+    name = package.rsplit("/", 1)[-1]
+    mentions = re.compile(rf"(?<![\w$@/-]){re.escape(name)}(?![\w$-])")
+    steps = [s for s in result.dataflow if s.grounded and s.code]
+    project = next((s for s in steps if _project_site(s.location)), None)
+    bridge = next((s for s in steps if _installed_owner(s.location).lower() in parents
+                   and mentions.search(s.code)), None)
+    return (project, bridge) if project is not None and bridge is not None else None
+
+
+def quoted_parent_path(result: Verdict, sca) -> str:
+    """The quoted chain that carries a transitive package's path, or "".
+
+    The project never calls a transitive package, so "no call site in project code" is
+    its normal state and cannot be what a confirmation lacks. What it needs instead:
+    a step in the project's own code and a step in the installed source of a package
+    that loads it where that code names the vulnerable package — both quoted
+    verbatim from the input, so neither can be invented.
+    """
+    found = _parent_bridge(result, sca)
+    if found is None:
+        return ""
+    project, bridge = found
+    return (f"{project.location} → {bridge.location} "
+            f"({_installed_owner(bridge.location)} вызывает {getattr(sca, 'package', '')})")
+
+
+def cap_unproven_call(result: Verdict, sca, overrides: list[str]) -> Verdict:
+    """A confirmation needs a resolved call, not a name that looks like one."""
+    if sca is None or result.verdict is not VerdictLabel.confirmed:
+        return result
+    if quoted_parent_path(result, sca):
+        return result
+    outcome = getattr(sca, "outcome", "")
+    if outcome in _UNPROVEN_CALL:
+        overrides.append(
+            f"unproven_call: chain outcome {outcome!r} — the call site was matched by name only "
+            "and the receiver was never resolved, so it cannot confirm the CVE"
+        )
+    elif (getattr(sca, "route", "") or "") == "text" and not _call_resolved(sca):
+        # Measured on a real project: a transitive package confirmed three times by
+        # the model with no call site at all and no language server behind it.
+        overrides.append(
+            "unproven_call: text route with no call site in project code, no language-server "
+            "resolution and no analyser path — nothing shows the project calls this package"
+        )
+    else:
+        return result
+    result = _to_unknown(result, EvidenceClass.insufficient_context)
+    return result.model_copy(
+        update={
+            "missing_information": [
+                *result.missing_information,
+                "a language server or CodeQL must resolve what the matched call belongs to",
+            ]
+        }
+    )
 
 
 def validate(
@@ -409,13 +542,29 @@ def validate(
             )
             result = _to_unknown(result, EvidenceClass.insufficient_context)
 
+    # A decisive verdict must rest on evidence of its own kind. `false_positive` with
+    # INSUFFICIENT_CONTEXT is "I could not see enough, so it's fine" — the one closure a
+    # triage must never make. `confirmed` with it is allowed only for a dependency, where
+    # the installed version itself is the evidence.
+    if result.evidence_class is EvidenceClass.insufficient_context:
+        if result.verdict is VerdictLabel.false_positive:
+            overrides.append(
+                "inconsistent_evidence_class: closed as false_positive while declaring INSUFFICIENT_CONTEXT — "
+                "a closure needs a named reason (version, shipping, runtime, defence), not missing context")
+            result = _to_unknown(result)
+        elif result.verdict is VerdictLabel.confirmed and finding.dependency is None:
+            overrides.append(
+                "inconsistent_evidence_class: confirmed while declaring INSUFFICIENT_CONTEXT — "
+                "a code weakness is confirmed on a traced path, not on missing context")
+            result = _to_unknown(result)
+
     cal = calibrate(result, pkg, finding, overrides)
     result = result.model_copy(
         update={
             "self_reported_confidence": result.confidence,
             "confidence": cal.score,
             "confidence_band": cal.band,
-            "confidence_rationale": _merge_rationale(result.confidence_rationale, result.self_reported_confidence, cal),
+            "confidence_rationale": _merge_rationale(result.confidence_rationale, result.confidence, cal),
         }
     )
 
@@ -426,6 +575,14 @@ def validate(
         )
         result = _to_unknown(result)
 
+    if result.verdict is VerdictLabel.unknown and not result.requires_human_review:
+        overrides.append("escalated: unknown always requires human review")
+        result = result.model_copy(update={"requires_human_review": True})
+
+    result = apply_confidence_policy(result, overrides)
+
+    # After the threshold, not before it: a confident model must not lift the rule that a
+    # confirmed high-severity finding is seen by a person.
     if (
         cfg.escalate_severities
         and finding.severity.value in cfg.escalate_severities
@@ -437,16 +594,17 @@ def validate(
         )
         result = result.model_copy(update={"requires_human_review": True})
 
-    if result.verdict is VerdictLabel.unknown and not result.requires_human_review:
-        overrides.append("escalated: unknown always requires human review")
-        result = result.model_copy(update={"requires_human_review": True})
-
+    # After the confidence policy, not before it: a confirmed dependency with a published
+    # fix is a patch task whatever the calibrated number says. In the other order the
+    # policy put every such finding straight back on a person's desk (both overrides were
+    # logged on the same record).
     dep = pkg.dependency
     if (
         result.verdict is VerdictLabel.confirmed
         and dep is not None
         and dep.upgrade_target
         and result.requires_human_review
+        and not (finding.severity.value in ("critical",) and result.evidence_class is EvidenceClass.exploitable_dataflow)
     ):
         result = result.model_copy(update={"requires_human_review": False})
         overrides.append(
@@ -454,8 +612,6 @@ def validate(
             "confirmed, with a published fix on the installed branch, so this is a patch task "
             "rather than a triage decision"
         )
-
-    result = apply_confidence_policy(result, overrides)
 
     if finding.cwe and result.cwe != finding.cwe:
         result = result.model_copy(update={"cwe": finding.cwe})
@@ -529,3 +685,114 @@ def _question_from_override(overrides: list[str], original: Verdict) -> str:
         ),
     }
     return templates.get(kind, f"Automated checks overrode a `{said}` verdict ({kind}). Review by hand.")
+
+
+# Chain outcomes that found a call bound to the package: the model may not close these
+# without naming why the flaw cannot fire here.
+_BOUND_CALL = {"present", "actual"}
+
+
+def guard_dependency_verdict(result: Verdict, sca, overrides: list[str]) -> Verdict:
+    """The model does not get to overrule the dependency chain on a hunch.
+
+    * a call bound to the package (outcome `present`/`actual`, attributed by import,
+      CodeQL or LSP) cannot become `false_positive` unless the model names a defence
+      (SANITIZED_DATAFLOW) or a precondition fact (IDENTIFIER_ONLY);
+    * the shipping check has the last word on shipping: a model that closes a package
+      the running application loads, on the ground that it "does not ship", is wrong.
+    """
+    if sca is None or result.verdict is not VerdictLabel.false_positive:
+        return result
+    outcome = getattr(sca, "outcome", "")
+    evidence = getattr(sca, "call_evidence", "")
+    shipped = getattr(sca, "shipped", "")
+    reason = f"{result.reason} {result.confidence_rationale}".lower()
+    if shipped == "runtime" and re.search(r"not shipped|не поставляется|dev[- ]?only|devdependencies|"
+                                          r"development only|только для разработки", reason):
+        overrides.append(
+            "shipping_conflict: closed as \"not shipped\", but the shipping check found that the running "
+            f"application loads the package ({getattr(sca, 'runtime', '') or 'runtime'})")
+        return _to_unknown(result, EvidenceClass.insufficient_context)
+    if (outcome in _BOUND_CALL and evidence in ("import", "codeql", "psalm", "lsp")
+            and result.evidence_class not in (EvidenceClass.sanitized_dataflow, EvidenceClass.identifier_only)):
+        overrides.append(
+            f"chain_conflict: the dependency chain found a call bound to the package (outcome {outcome!r}, "
+            f"by {evidence}); closing it needs a named defence or precondition, not "
+            f"`{result.evidence_class.value}`")
+        return _to_unknown(result, EvidenceClass.insufficient_context)
+    return result
+
+
+def cap_unproven_dependency_confirmation(
+    result: Verdict, finding: Finding, chain, overrides: list[str], sca=None
+) -> Verdict:
+    """An affected version alone cannot establish this application's exploit path."""
+    if result.verdict is not VerdictLabel.confirmed or finding.dependency is None or chain is None:
+        return result
+    parent = _parent_bridge(result, sca) if sca is not None else None
+    symbol = getattr(chain, "symbol", None)
+    condition = getattr(chain, "condition", None)
+    condition_state = getattr(getattr(condition, "state", None), "value", "")
+    proven = getattr(chain, "dataflow", None) is not None
+    expected = getattr(symbol, "function", "") or ""
+    matched = (getattr(chain, "matched_symbol", "") or "").rsplit("::", 1)[-1]
+    entries = set(getattr(chain, "entry_points", None) or ())
+    # Through the parent, the function reached is the one the quoted line calls:
+    # `qs.parse(` reaches `combine` only if `parse` is one of its entries.
+    parent_reaches = parent is not None and any(
+        re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", parent[1].code)
+        for name in {expected, *entries} if name)
+    if getattr(symbol, "declared_in_installed", None) is False:
+        missing = "уязвимый символ отсутствует в установленной версии; проверьте механизм по её исходникам"
+    elif expected and matched != expected and matched not in entries and not parent_reaches:
+        missing = "путь ведёт к публичному API, но не доказан переход к уязвимой функции"
+    elif condition_state == "external":
+        missing = "обязательное условие эксплуатации в окружении не проверено"
+    elif not proven and not parent_reaches:
+        missing = "путь до уязвимого вызова не доказан"
+    else:
+        return result
+    overrides.append(f"unproven_dependency: {missing}")
+    result = _to_unknown(result, EvidenceClass.insufficient_context)
+    return result.model_copy(update={
+        "missing_information": [*result.missing_information, missing],
+        "blocking_question": missing,
+    })
+
+
+def settle_dependency_review(result: Verdict, finding: Finding, sca, overrides: list[str]) -> Verdict:
+    """Who has to look at a model-decided dependency verdict.
+
+    A confirmed finding with a fix is a patch task; only a high-priority one on a
+    critical/high advisory keeps a person in the loop. A false positive closes on
+    its own only when the model itself is sure of it — its stated confidence above
+    AUTO_APPLY_CONFIDENCE; otherwise it goes to a person as a proposed closure.
+    `unknown` always needs a person.
+    """
+    if sca is None:
+        return result
+    if result.verdict is VerdictLabel.unknown:
+        return result if result.requires_human_review else result.model_copy(update={"requires_human_review": True})
+    priority = getattr(sca, "priority", "") or "medium"
+    severity = finding.severity.value if finding.severity else ""
+    wants_person = (result.verdict is VerdictLabel.confirmed and priority in ("critical", "high")
+                    and severity in ("critical", "high"))
+    has_fix = bool(finding.dependency and finding.dependency.upgrade_target)
+    if result.verdict is VerdictLabel.confirmed and not has_fix:
+        wants_person = wants_person or priority in ("critical", "high", "medium")
+    # The model's own number, not the measured one: the measured score is built for
+    # every weakness class and marks down a dependency closure for the very signal
+    # ("the application loads the package") that the model refuted with quotes.
+    stated = stated_confidence(result)
+    unsure_closure = result.verdict is VerdictLabel.false_positive and stated <= AUTO_APPLY_CONFIDENCE
+    wants_person = wants_person or unsure_closure
+    if result.requires_human_review != wants_person:
+        overrides.append(
+            f"dependency_review: {'a person looks at it' if wants_person else 'no person needed'} — "
+            f"verdict {result.verdict.value}, priority {priority}, advisory severity {severity or 'unknown'}"
+            + ("" if has_fix or result.verdict is not VerdictLabel.confirmed else ", no published fix")
+            + (f", model confidence {stated:.2f}"
+               f" {'not above' if unsure_closure else 'above'} {AUTO_APPLY_CONFIDENCE:.2f}"
+               if result.verdict is VerdictLabel.false_positive else ""))
+        result = result.model_copy(update={"requires_human_review": wants_person})
+    return result

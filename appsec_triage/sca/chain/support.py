@@ -9,7 +9,7 @@ from pathlib import Path
 from .. import advisories as adv
 from .. import codeql_api, codeql_reach, container as container_mod, exploitability as exploit_mod, psalm_api
 from .. import presence as presence_mod, registries
-from ..bridge import BridgeWalk, walk_bridge
+from ..bridge import BridgeWalk, entry_points, walk_bridge
 from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
 from ..resolve import SymbolResolver, VulnerableSymbol
@@ -21,8 +21,10 @@ class ChainSupport:
     def __init__(self, client, roots, *, lsp=None, routes=None, nvd_api_key=None,
                  deployment=None, reachability=None, codeql_databases=None,
                  codeql_binary: str = "codeql", psalm_binary: str | None = None,
-                 parallel_llm: int = 1) -> None:
+                 parallel_llm: int = 1, max_tool_calls: int = 20,
+                 sbom_path: str = "") -> None:
         self._client = client
+        self._max_tool_calls = max_tool_calls
         self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
         self._roots = [Path(r) for r in roots]
         self._lsp = lsp
@@ -43,10 +45,19 @@ class ChainSupport:
         self._pending: dict[tuple[int, object], threading.Event] = {}
         self._advisories: dict[tuple[str, str, str, str], adv.Advisory] = {}
         self._graphs: dict[str, DependencyGraph] = {}
+        self._entries: dict[tuple[str, str, str], list] = {}
+        self._sbom: dict | None = None
+        if sbom_path:
+            from .. import sbom as sbom_mod
+            self._sbom, problem = sbom_mod.load(sbom_path)
+            if problem:
+                log.warning("%s — граф будет построен отдельным проходом cdxgen", problem)
         self._wirings: dict[str, container_mod.Wiring] = {}
         self._exploit = exploit_mod.ExploitabilityService()
         self._symbols: dict[tuple[str, str], object] = {}
         self._batched: dict[tuple[str, str], tuple[codeql_api.ApiAnswer, frozenset[str]]] = {}
+        self._shipping: dict[str, object] = {}
+        self._investigations: dict[tuple, object] = {}
         self.stats = {"resolved": 0, "called": 0, "absent": 0,
                       "not_distributed": 0, "undecided": 0, "out_of_scope": 0,
                       "unaudited_closures": 0, "version_unaffected": 0}
@@ -79,13 +90,28 @@ class ChainSupport:
                 log.info("container config unavailable at %s: %s", root, wiring.problem)
         return self._wirings[key]
 
+    def _shipping_facts(self, dependency):
+        """Does the running application load this package (see sca/shipping.py)."""
+        from ..shipping import ProjectShipping
+
+        if not self._roots or dependency is None or not dependency.package:
+            return None
+        root = self._roots[0]
+        key = str(root)
+        self._placement(dependency.package)
+        with self._dataflow_lock:
+            project = self._shipping.get(key)
+            if project is None:
+                project = self._shipping[key] = ProjectShipping(root, self._graphs.get(key))
+        return project.facts(dependency.package, dependency.ecosystem or "npm")
+
     def _placement(self, package: str) -> Placement | None:
         if not package:
             return None
         for root in self._roots:
             key = str(root)
             if key not in self._graphs:
-                self._graphs[key] = DependencyGraph.from_project(root)
+                self._graphs[key] = DependencyGraph.from_project(root, document=self._sbom)
             placement = self._graphs[key].placement(package)
             if placement.known:
                 return placement
@@ -102,21 +128,33 @@ class ChainSupport:
         def source_of(package: str) -> dict[str, str]:
             return self._resolver._source_for(ecosystem, package, self._graph_version(package))
 
-        best: tuple[BridgeWalk, str] | None = None
-        for intro in sorted(placement.introductions, key=lambda i: len(i.path))[:2]:
+        unknown: tuple[BridgeWalk, str] | None = None
+        closed: tuple[BridgeWalk, str] | None = None
+        for intro in sorted(placement.introductions, key=lambda i: len(i.path)):
             chain_pkgs = list(reversed(intro.path[:-1]))
             if not chain_pkgs:
                 continue
-            walk = walk_bridge(symbol.function, chain_pkgs, source_of)
+            walk = walk_bridge(symbol.function, chain_pkgs, source_of,
+                               origin_package=dependency.package or "")
             through = intro.root_requirement
             if walk.closed:
-                return _walk_as_bridge(walk), [], through
+                closed = closed or (walk, through)
+                continue
             if walk.targets and not walk.unknown:
                 return _walk_as_bridge(walk), _pairs(walk.targets), through
-            best = best or (walk, through)
-        if best is None:
+            unknown = unknown or (walk, through)
+        # placement() stores at most four paths. At that limit, more paths may
+        # exist, so even four closed walks cannot establish a global absence.
+        if closed is not None and unknown is None and len(placement.introductions) < 4:
+            walk, through = closed
+            return _walk_as_bridge(walk), [], through
+        if unknown is None and closed is not None and len(placement.introductions) >= 4:
+            unknown = (BridgeWalk(unknown=True,
+                                  detail="проверены четыре пути установки, другие пути могли быть отсечены"),
+                       closed[1])
+        if unknown is None:
             return None, default, ""
-        walk, through = best
+        walk, through = unknown
         return _walk_as_bridge(walk), (_pairs(walk.targets) or default), through
 
     def _once(self, cache: dict, key, compute):
@@ -199,6 +237,60 @@ class ChainSupport:
     def _engine_name(self, dependency) -> str:
         return psalm_api.ENGINE if self._uses_psalm(dependency) else "CodeQL"
 
+    def _entry_points(self, dependency, symbol) -> list:
+        """Public functions of the vulnerable package that reach its vulnerable one."""
+        if symbol is None or not getattr(symbol, "function", "") or not dependency.package:
+            return []
+        version = dependency.installed_version or ""
+        key = (dependency.package, version, symbol.function)
+
+        def compute():
+            source = self._resolver._source_for(dependency.ecosystem or "", dependency.package, version)
+            return entry_points(symbol.function, source, package=dependency.package)
+
+        found, _ = self._once(self._entries, key, compute)
+        return found
+
+    def _entry_point_check(self, dependency, symbol, advisory, *, record: list[str] | None = None):
+        """Ask the engine about every public entry to the vulnerable function at once.
+
+        Zero calls of each one is a checked fact — the same fact a language server
+        gives when it resolves no reference — so a finding may close on it. Asking only
+        the names the model happened to choose would not be: `load` at zero says
+        nothing about `loadAll`. An entry the advisory itself calls unaffected
+        (`safeLoad`) is not asked. Returns (audit, None) when nothing is called,
+        (None, (presence, label, klass, answer)) for the first call found, and
+        (None, None) when the engine cannot tell.
+        """
+        from .. import unreached as unreached_mod
+        from ..codeql_agent import declared_unaffected
+
+        entries = self._entry_points(dependency, symbol)
+        if not entries:
+            return None, None
+        safe = sorted({e.function for e in entries if declared_unaffected(advisory, e.function)})
+        pairs = [(e.function, e.klass) for e in entries if e.function not in safe]
+        if not pairs:
+            return None, None
+        if self._uses_psalm(dependency):
+            pairs = self._qualify_php_pairs(dependency.package, pairs)
+        answer = self._codeql_api_for(dependency, dependency.package, pairs, record=record,
+                                      asked_by="цепочка (все публичные входы к уязвимой функции)")
+        if answer is None or not answer.usable:
+            return None, None
+        for function, klass in pairs:
+            label = f"{klass}::{function}" if klass else function
+            result = answer.presence(label)
+            if result.found:
+                return None, (result, label, klass, answer)
+        engine = self._engine_name(dependency)
+        asked = ", ".join(f"{k}::{f}" if k else f for f, k in pairs)
+        detail = (f"{engine}: ни один публичный вход к {symbol.function} не вызывается "
+                  f"кодом проекта — спрошены все: {asked}")
+        if safe:
+            detail += f"; {', '.join(safe)} advisory прямо называет незатронутыми"
+        return unreached_mod.Audit(kind="not_called", checked=True, subject=engine, detail=detail), None
+
     def _api_hint(self, dependency, package: str) -> str:
         """The installed PHP package's public methods, for the model's choice of questions."""
         if not self._uses_psalm(dependency) or not self._roots:
@@ -246,6 +338,22 @@ class ChainSupport:
         key = (str(getattr(advisory, "advisory_id", "") or ""), version or "")
         symbol, _ = self._once(self._symbols, key, lambda: self._resolver.resolve(advisory, version))
         return symbol
+
+    def prefill_imports(self, wanted: dict[str, set[str]]) -> None:
+        """Ask each database once about every package of the run: {language: packages}."""
+        for language, packages in wanted.items():
+            database = self._databases.get(language)
+            if database is None or language not in codeql_api.SUPPORTED or not self._roots:
+                continue
+            with self._dataflow_lock:
+                todo = sorted(p for p in packages if p and (language, p) not in self._import_answers)
+            if not todo:
+                continue
+            answers = codeql_api.run_imports_many(database, todo, self._roots[0],
+                                                  binary=self._codeql_binary)
+            with self._dataflow_lock:
+                for package, answer in answers.items():
+                    self._import_answers.setdefault((language, package), answer)
 
     def _imports_absent(self, language: str, package: str) -> bool:
         """CodeQL resolved no import of this package anywhere in the project."""

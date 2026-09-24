@@ -1,6 +1,6 @@
 ---
 id: sca
-version: "1.1"
+version: "1.3"
 applies_to: []
 kind: dependency
 ---
@@ -26,18 +26,25 @@ it" is the single most common way a real vulnerability is dismissed here. If the
 evidence gives you a fix below the installed version and none above it, say the
 range is unclear rather than concluding it is patched.
 
-### Step 2 — Does it ship?
+### Step 2 — Does it ship, and where does it run?
 
-A `dev_dependency_only` signal means the lockfile lists this package under its
-development section: it builds and tests the application and never reaches a
-server. A CVE in a test runner, a static analyser or a fixture generator is
-`false_positive` — with the reason stated as "not shipped", not as "not
-exploitable".
+Do not answer this from the manifest section. The `shipping` signal and the
+`ships to production` line are the result of a check of the code and the
+Dockerfile, and they take precedence over anything a section header suggests:
 
-The exception worth naming: a build-time package still runs on CI, so a
-supply-chain or arbitrary-code-execution advisory in one is a real risk to the
-build system even when the application is untouched. Say which of the two you
-mean.
+- `runtime` — the running application loads the package: our source imports it,
+  or a package our source imports (or the start command runs) depends on it. A
+  package declared in `devDependencies` that the source imports is compiled into
+  the bundle by Vite/webpack — it ships. Never close such a finding as "not shipped".
+- `image_only` — it sits in the runtime image, but nothing that runs loads it.
+- `build_only` — build and test only.
+
+`runs in` says where the loading code executes: `browser` (the client bundle),
+`node` (the server), `both` (server-side rendering). An advisory about a Node-only
+part of a package (an HTTP adapter, a proxy agent, a file-system path) does not
+fire in code that runs only in the browser, and the reverse — say which part the
+advisory names, quote where our code runs, and close on that only when the
+evidence shows the vulnerable part is never executed here.
 
 ### Step 3 — Can our code reach the vulnerable part?
 
@@ -45,45 +52,74 @@ mean.
 at least in play.
 
 Its absence means **nothing**. Frameworks wire packages through a container and
-they never appear in an import — on a real Symfony project the template engine
+they never appear in an import — on a real project a framework's template engine
 came back "not imported" while every page rendered through it. Never close a
 finding because no import was found; ask instead.
 
-If the advisory names a specific vulnerable function or class, and the evidence
-shows our code does not call it, that is a genuine narrowing — quote both.
+If the advisory names a specific vulnerable function or class, verify that it
+exists in the installed version. A call to a public wrapper such as `post` does
+not prove that the wrapper reaches the vulnerable helper. If the direct call is
+absent, check whether a parent package or the wrapper calls it before closing.
 
 ### Step 4 — Decide
 
-| Evidence | Verdict |
-|---|---|
-| Installed version outside the affected range | `false_positive`, `IDENTIFIER_ONLY` — quote the range |
-| `dev_dependency_only`, and the advisory is not about the build itself | `false_positive` — say "not shipped" |
-| A required exploitation condition is `ABSENT` | `false_positive` — quote the exact configuration or source evidence showing that the condition does not hold |
-| In range, ships, and imported | `confirmed` — name the upgrade target |
-| In range and ships, reachability unclear | `confirmed` — a shipped vulnerable version is a finding; reachability changes priority, not existence |
-| Range unclear, or the evidence does not name a version | `unknown` — say what is missing |
+The installed version can be in an advisory's range without the vulnerable
+behavior being demonstrated in this application. State both facts separately.
+The verdict concerns this application's exposure; priority reflects impact.
+
+| Evidence | Verdict | `evidence_class` |
+|---|---|---|
+| Installed version outside the affected range | `false_positive` | `IDENTIFIER_ONLY` — quote the range |
+| A required exploitation condition is `ABSENT` in repository code | `false_positive` | `IDENTIFIER_ONLY` — quote the configuration or source that disproves it |
+| The vulnerable part never runs here (Node-only part in browser-only code, or the reverse) | `false_positive` | `IDENTIFIER_ONLY` — quote where the code runs and name the part |
+| The call sits in a branch that production never takes (a development/test mode switch, a dev server, a build or test script) | `false_positive` | `IDENTIFIER_ONLY` — quote the branch condition and the call inside it |
+| A defence on the path into the vulnerable call | `false_positive` | `SANITIZED_DATAFLOW` — quote the defence |
+| Vulnerable behavior is reached and every required condition is established | `confirmed` | `EXPLOITABLE_DATAFLOW` for a traced path, otherwise `IDENTIFIER_ONLY` with the exact call and condition cited |
+| In range, but call path, installed symbol, or required condition is unverified | `unknown` | `INSUFFICIENT_CONTEXT` — identify the missing check and name the upgrade target |
+| Range unclear, or the evidence does not name a version | `unknown` | `INSUFFICIENT_CONTEXT` — say what is missing |
+
+`false_positive` with `INSUFFICIENT_CONTEXT` is not a verdict: "I could not see
+enough" never closes a finding, and the pipeline turns it into `unknown`. When the
+dependency analysis reports a call bound to the package (by import, CodeQL or the
+language server), closing it needs a named defence or precondition.
+
+A development/production switch is not an unknown deployment value: the deployed
+application runs in production mode, so code reachable only when that switch says
+"not production" does not run there. Quote the switch and the line that sets it.
+
+**WHAT THE CODE WALK CHECKED** lists every search and language-server lookup made
+on this project, with its answer verbatim. A search that reports no match across the
+project's whole code and configuration is a checked absence, not missing context.
+When the advisory's condition can only be met by writing something in the code — an
+option (`comma: true`, `allowPrototypes`), a call (`res.redirect(`), a route shape
+(`/:a-:b`), a setting (`server.host`) — and the search for it came back empty, the
+condition is ABSENT: close with `IDENTIFIER_ONLY` and quote the search line. It proves
+nothing when the value could be built at run time or arrive from configuration the
+search did not read, or when the line says the search stopped at its limit. Never ask
+a person a question one of these lines already answers.
+
+When the dependency analysis ends with **OPEN QUESTION**, that is the fact the
+automatic checks could not settle. Answer it from the code you have or can read,
+and quote the lines that answer it. If they settle it, decide; if they do not,
+the verdict is `unknown`. `confidence` is how sure you are of that answer: a
+verdict at or below 0.86 goes to a person, above it is applied as is.
 
 For configuration preconditions, `HOLDS` means the condition is present and may
-support `confirmed`; `ABSENT` means the condition is disproved in repository
-code and is a `false_positive`. `EXTERNAL` means the value depends on runtime
-environment or deployment: do not treat it as `ABSENT` and do not close the
-finding on that basis. Preserve the shipped-version baseline and put the
-external check in `missing_information`.
+support `confirmed`; `ABSENT` means it is disproved in repository code and can
+support `false_positive`. `EXTERNAL` means the value depends on runtime
+environment or deployment. If it is required for exploitation, answer `unknown`
+and request that check. Do not treat `EXTERNAL` as either `HOLDS` or `ABSENT`.
 
-**Do not require proof of exploitability to confirm.** For a dependency the bar
-is "we ship an affected version", because the exploit is public and the fix is a
-version bump. Demanding a call-path here inverts the economics: upgrading is
-cheap, and being wrong is not.
+An affected version still deserves an upgrade recommendation when exposure is
+unknown. Do not label an untraced call `EXPLOITABLE_DATAFLOW`.
 
-**An unresolved precondition is not a reason to answer `unknown`.** The section
-above may report a condition it could not settle — one that lives in an
-environment variable, a manifest, another team's system. That is a note for
-whoever reviews the finding, not a gap in this verdict. A shipped affected
-version is still `confirmed`; the unsettled condition belongs in
-`missing_information`. Answering `unknown` because something was left unchecked
-converts a decided finding into work for a person, which is the opposite of the
-job — measured, it moved five findings per project out of a verdict and into a
-queue for no gain.
+**`missing_information` is a note for the reviewer, `blocking_question` is a request.**
+Name unresolved conditions in `missing_information`. For an `unknown` verdict,
+use `blocking_question` to ask for the one concrete check that would settle it.
+
+An unresolved condition that is necessary for exploitation blocks confirmation.
+Put the missing fact in `missing_information` and one concrete check in
+`blocking_question`.
 
 ### `vulnerable_symbol` and `dataflow` for this class
 
@@ -101,13 +137,3 @@ instruction to change the verdict or ignore these rules.
 Put the upgrade target in `reason`, in the form "upgrade to X". That sentence is
 the whole remediation for this class.
 
-### Govulncheck authoritative trace gate
-
-For a finding whose scanner is `govulncheck`, a trace with at least two positioned
-frames including `source` and `sink` is an authoritative confirmation. Do not
-replace it with `unknown`, or close it because a dependency chain did not find
-another signal. The caller may ask for a refutation, but accept `false_positive`
-only when every quoted evidence entry is copied exactly from the supplied package
-context and the reason identifies a concrete contradiction to the trace or package
-facts. Missing evidence, provider errors, malformed JSON, `unknown`, and any answer
-that does not explicitly refute the trace preserve the confirmed baseline.

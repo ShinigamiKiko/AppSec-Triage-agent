@@ -13,10 +13,9 @@ only way its answer can be wrong.
 Name plain substrings to grep for. Not regular expressions: they are matched
 literally against this project's source.
 
-Ask for what would show a call the graph could not resolve. Useful in Go:
-`reflect.ValueOf`, `MethodByName`, `plugin.Open`, `//go:generate`, `go:build`,
-`exec.Command`. In other languages the equivalents: `getattr`, `__import__`,
-`eval`, `call_user_func`, `new $`, `require(` with a variable.
+Ask for what would show a call the graph could not resolve: the language's
+reflection, dynamic dispatch, dynamic loading and generated code. The ecosystem
+context lists the constructs for each language of this project.
 
 Also worth asking for the vulnerable function's own name and the package's
 import path — a hit in a file the graph did not compile, behind a build tag or

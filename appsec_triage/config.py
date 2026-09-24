@@ -46,12 +46,12 @@ class ProviderConfig:
     """Common transport/decoding knobs."""
 
     name: str
-    kind: Literal["ollama", "openai", "deepseek"]
+    kind: Literal["ollama", "openai", "deepseek", "mailbox"]
 
     @property
     def leaves_the_perimeter(self) -> bool:
         """Does a prompt sent to this provider reach a third party?"""
-        return self.kind != "ollama"
+        return self.kind not in ("ollama", "mailbox")
     model: str
     base_url: str
     api_key: str | None = None
@@ -180,6 +180,13 @@ class VerificationConfig:
     challenge_on_override: bool = False
     challenge_cwes: list[str] = field(default_factory=list)
     challenge_closures_above_consequence: int = 0
+    # Which kinds of finding get a second pass. A dependency verdict now rests on the
+    # installed version and the chain's facts, not on the model's reading of code, so a
+    # second model reading of it costs as much as the first and changes nothing.
+    challenge_kinds: list[str] = field(default_factory=lambda: ["weakness"])
+    # In advisory mode a refuted `confirmed` on a code weakness becomes `unknown` when the
+    # objection cites a verbatim line — the measured weak spot is exactly that verdict.
+    downgrade_confirmed: bool = True
 
 
 @dataclass(slots=True)
@@ -190,6 +197,9 @@ class TriageQueueConfig:
     review_budget_pct: float = 30.0
     cluster: bool = True
     min_score: int = 50
+    # Share of findings the run is expected to settle without a person. Below it the run
+    # says so at the end — a signal that the configuration or the project needs a look.
+    auto_decide_target_pct: float = 70.0
 
 
 @dataclass(slots=True)
@@ -221,6 +231,18 @@ class PipelineConfig:
     # time: CodeQL, Psalm and the language servers answer on their own threads.
     # 1 keeps a finding strictly sequential; `max_workers` is the separate knob
     # for how many findings run at once.
+    # Сколько вопросов модель может задать по одной находке: проверить пакет,
+    # спросить про функцию, про публичные входы, про места вызова. Восьми не
+    # хватало — на PHP-проекте лимит упирался у 76 находок из 90, и вердикт
+    # выносился по недоисследованному. Число в конфиге, а не в коде: вопросы
+    # стоят времени и денег, и общий раннер может позволить себе меньше.
+    max_tool_calls: int = 20
+    # SBOM, снятый один раз за прогон: тот же документ идёт в граф и на починку имён.
+    sbom_path: str = ""
+    # Does the build process input nobody on the team wrote — pull requests from
+    # forks, uploaded sources? Only then can a code-execution flaw in a build tool
+    # be triggered through the build. A hostile package is a build risk either way.
+    build_untrusted_input: bool = False
     parallel_llm: int = 2
     redact_secrets: bool = False
     secrets_without_model: bool = True

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,7 +13,11 @@ import yaml
 from ..config import REPO_ROOT
 
 PROMPTS_ROOT = REPO_ROOT / "prompts"
-TRAINING_CONTEXT_PATH = PROMPTS_ROOT / "training-context.md"
+# common.md goes to every request; <ecosystem>.md only when APPSEC_ECOSYSTEMS lists it.
+TRAINING_CONTEXT_PATH = PROMPTS_ROOT / "context"
+_COMMON_CONTEXT = "common"
+# Names APPSEC_ECOSYSTEMS accepts for the same ecosystem file.
+_ECOSYSTEM_FILE = {"golang": "go", "packagist": "composer", "python": "pypi", "java": "maven"}
 _FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
@@ -37,16 +42,53 @@ class PromptError(RuntimeError):
     pass
 
 
-@lru_cache(maxsize=1)
-def training_context() -> str:
-    """Load trusted, project-specific context attached to every model request."""
+def _context_part(name: str) -> str:
+    path = TRAINING_CONTEXT_PATH / f"{name}.md"
     try:
-        text = TRAINING_CONTEXT_PATH.read_text(encoding="utf-8").strip()
+        text = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise PromptError(f"{TRAINING_CONTEXT_PATH}: context not read ({exc})") from exc
+        raise PromptError(f"{path}: context not read ({exc})") from exc
     if not text:
-        raise PromptError(f"{TRAINING_CONTEXT_PATH}: context is empty")
+        raise PromptError(f"{path}: context is empty")
     return text
+
+
+def context_ecosystems() -> tuple[str, ...]:
+    """Every ecosystem that has its own context file."""
+    return tuple(sorted(p.stem for p in TRAINING_CONTEXT_PATH.glob("*.md") if p.stem != _COMMON_CONTEXT))
+
+
+def active_ecosystems() -> tuple[str, ...]:
+    """The ecosystem parts this run's prompts carry, from APPSEC_ECOSYSTEMS.
+
+    Unset, every part is carried — the context as it was before it was split.
+    An ecosystem without a file of its own gets the common part only.
+    """
+    raw = os.getenv("APPSEC_ECOSYSTEMS", "")
+    available = context_ecosystems()
+    if not raw.strip():
+        return available
+    wanted = []
+    for name in (e.strip().lower() for e in raw.split(",") if e.strip()):
+        name = _ECOSYSTEM_FILE.get(name, name)
+        if name in available and name not in wanted:
+            wanted.append(name)
+    return tuple(wanted)
+
+
+@lru_cache(maxsize=8)
+def _context(ecosystems: tuple[str, ...]) -> str:
+    return "\n\n".join(_context_part(name) for name in (_COMMON_CONTEXT, *ecosystems))
+
+
+def training_context() -> str:
+    """Trusted project context for model requests: the common part and this run's ecosystems."""
+    return _context(active_ecosystems())
+
+
+def all_training_context() -> str:
+    """Every part, whatever APPSEC_ECOSYSTEMS says — what the agent's own code reads."""
+    return _context(context_ecosystems())
 
 
 # The report is read in Russian, so the model writes its prose in Russian. What
@@ -152,9 +194,23 @@ def render_system(
     return _with_training_context("\n\n---\n\n".join(parts)), prompt
 
 
-@lru_cache(maxsize=32)
+def with_context(system: str) -> str:
+    """Any system prompt with this run's project context: the common part and each ecosystem."""
+    return _with_training_context(system.strip())
+
+
 def step(name: str) -> str:
-    """The system prompt for one dependency-triage step, by file name."""
+    """The system prompt for one dependency-triage step, by file name.
+
+    Built at each call, not at import: modules that hold a step prompt are imported
+    while the CLI parser is built, before `.env` is read, and a prompt frozen then
+    would carry every ecosystem while the rest of the run carries the selected ones.
+    """
+    return _with_training_context(_step_body(name))
+
+
+@lru_cache(maxsize=32)
+def _step_body(name: str) -> str:
     path = PROMPTS_ROOT / "sca" / f"{name}.md"
     try:
         text = path.read_text(encoding="utf-8")
@@ -164,7 +220,7 @@ def step(name: str) -> str:
     body = text[match.end():] if match else text
     if not body.strip():
         raise PromptError(f"{path}: промпт пуст")
-    return _with_training_context(body.strip())
+    return body.strip()
 
 
 def coverage(pack: str = "default") -> dict[str, str]:

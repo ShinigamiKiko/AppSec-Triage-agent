@@ -111,8 +111,10 @@ class TriageRun:
 
     @property
     def triaged_count(self) -> int:
-        """Findings that actually reached the model, excluding scope drops."""
-        return sum(1 for r in self.records if r.decided_by != "scope")
+        """Findings with a model-produced verdict, including corrected verdicts."""
+        return sum(1 for r in self.records
+                   if r.decided_by in {"llm", "challenged"}
+                   or (r.decided_by == "post_validation" and r.original_verdict is not None))
 
     @property
     def verdict_cost_usd(self) -> float:
@@ -219,9 +221,12 @@ class TriagePipeline:
                 reachability=reachability, codeql_databases=databases,
                 codeql_binary=codeql_binary, psalm_binary=psalm_binary,
                 parallel_llm=cfg.parallel_llm,
+                max_tool_calls=cfg.max_tool_calls,
+                sbom_path=getattr(cfg, "sbom_path", ""),
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
+        self._walk_cache: dict[tuple[str, str, str], tuple[list[str], list[str]]] = {}
         self.deployment = deployment_ctx.load(getattr(cfg, "deployment_config", None))
         self.stack_section = stack_detect.render(self.stacks)
         if self.deployment.usable:
@@ -232,6 +237,17 @@ class TriagePipeline:
             log.info("stack conventions in play: %s", ", ".join(s.id for s in self.stacks))
 
     def triage_one(self, finding: Finding) -> TriageRecord:
+        """One finding, with the seconds each stage took written into the record."""
+        timings: dict[str, float] = {}
+        started = time.monotonic()
+        record = self._triage_one(finding, timings)
+        timings["total"] = round(time.monotonic() - started, 1)
+        record.timings = {k: round(v, 1) for k, v in timings.items()}
+        log.info("finding %s stages: %s", finding.finding_id,
+                 ", ".join(f"{k} {v:.0f}s" for k, v in record.timings.items()))
+        return record
+
+    def _triage_one(self, finding: Finding, timings: dict[str, float]) -> TriageRecord:
         if finding.misconfiguration:
             if entry := self.deployment.handled_by_platform(finding.rule_id):
                 return records.platform_handled(finding, entry, provider=self.provider_cfg.name)
@@ -290,6 +306,7 @@ class TriagePipeline:
             "finding_id": finding.finding_id,
             "cwe": finding.cwe,
             "file_path": finding.code_context.file_path,
+            "severity": finding.severity,
             "rule_id": finding.rule_id,
             "kind": "dependency" if finding.dependency else "weakness",
             "start_line": finding.code_context.start_line,
@@ -305,49 +322,52 @@ class TriagePipeline:
 
         mismatch_reason = postvalidation.check_deployment_mismatch(finding, pkg)
         if mismatch_reason:
-            verdict = Verdict(
-                verdict=VerdictLabel.false_positive,
-                evidence_class=EvidenceClass.identifier_only,
-                confidence=0.99,
-                confidence_rationale="Advisory precondition mismatch is deterministic.",
-                exploitability=None,
-                impact=None,
-                cwe=finding.cwe,
-                vulnerable_symbol=None,
-                dataflow=[],
-                evidence=[],
-                reason=mismatch_reason,
-                missing_information=[],
-                blocking_question=None,
-                requires_human_review=False,
-            )
-            return TriageRecord(
-                **base,
-                trace=list(finding.trace),
-                verdict=verdict,
-                decided_by="post_validation",
-                overrides=["advisory precondition contradicts deployment boundary"],
-                latency_ms=0,
-                prompt_tokens=0,
-                completion_tokens=0,
-                cost_usd=0.0,
-                attempts=0,
-            )
+            return _deployment_closed(base, finding, mismatch_reason)
 
         sca_summary = None
         chain = None
+        dep_policy = None
         if self.dep_chain is not None and finding.dependency and not authoritative_gov:
+            # The scanner's title may not name the component ("Misuse of
+            # ServerConfig.PublicKeyCallback" never says SSH); the advisory does. It is
+            # already fetched and cached by the batch pass, so the deployment boundary
+            # is checked against it before the chain spends a single model call.
+            try:
+                advisory = self.dep_chain._advisory_for(finding, finding.dependency)
+            except Exception:  # noqa: BLE001 - a lookup failure only skips this check
+                advisory = None
+            advisory_text = getattr(advisory, "text", "") or ""
+            if advisory_text and (reason := postvalidation.check_deployment_mismatch(
+                    finding, pkg, advisory_text=advisory_text)):
+                return _deployment_closed(base, finding, reason)
+            stage = time.monotonic()
             try:
                 chain = self.dep_chain.run(finding, codeql_findings=self._codeql_findings)
             except Exception:
+                if _fatal_of(self.client) is not None:
+                    raise
                 log.exception("dependency symbol chain failed for %s", finding.finding_id)
             else:
+                timings["chain"] = time.monotonic() - stage
                 sca_summary = chain.summary(finding.dependency)
                 base["sca"] = sca_summary
-                if chain.closes:
+                finding = _with_advisory_severity(finding, chain)
+                base["severity"] = finding.severity
+                dep_policy = self._dependency_policy(finding, chain)
+                sca_summary.priority, sca_summary.policy = dep_policy.priority, dep_policy.rule
+                if chain.closes and dep_policy.label == "false_positive":
                     return records.dependency_closed(finding, chain, sca_summary,
                                                  provider=self.provider_cfg.name)
+                if not dep_policy.needs_model:
+                    return records.dependency_decided(finding, chain, sca_summary, dep_policy,
+                                                      provider=self.provider_cfg.name)
+                builder.apply_shipping(pkg, chain.shipping)
                 pkg.dependency_analysis = _redact(chain.render())
+                if dep_policy.label == "unknown":
+                    sca_summary.open_question = dep_policy.reason
+                    pkg.dependency_analysis += (
+                        f"\n\nOPEN QUESTION — the automatic checks stopped here "
+                        f"({dep_policy.rule}): {dep_policy.reason}")
 
         if self.repository_evidence is not None:
             self.repository_evidence.enrich(pkg, finding, chain)
@@ -395,13 +415,38 @@ class TriagePipeline:
         responses = []
         if self._walk.ready():
             # The walk only adds evidence; a failure leaves the package as it was.
-            try:
-                brief = codewalk.brief(finding, base.get("sca"))
-                if self._walk.retrieve(pkg, f"{brief}\n\n{codewalk.CODE_WALK_QUESTION}", responses, walk=True):
-                    user = builder.render_for_prompt(pkg)
-            except (LLMError, SchemaError, ValueError, TypeError, AttributeError) as exc:
-                pkg.context_notes.append("Code walk before the verdict failed; judged on the collected evidence.")
-                log.warning("code walk failed for %s: %s", finding.finding_id, exc)
+            stage = time.monotonic()
+            walk_key = _walk_key(finding)
+            cached = self._walk_cache.get(walk_key) if walk_key else None
+            if cached is not None:
+                # Same package, same version: what the walk found in the project's code for
+                # one advisory is what it would find for the next one.
+                blocks, questions, facts = cached
+                pkg.evidence_blocks.extend(b for b in blocks if b not in pkg.evidence_blocks)
+                pkg.code_questions.extend(q for q in questions if q not in pkg.code_questions)
+                pkg.code_facts.extend(f for f in facts if f not in pkg.code_facts)
+                pkg.repository_code_collected = pkg.repository_code_collected or bool(blocks)
+                pkg.context_notes.append("Code walk reused from another advisory of the same package and version.")
+                user = builder.render_for_prompt(pkg)
+            else:
+                try:
+                    before_blocks, before_questions = list(pkg.evidence_blocks), list(pkg.code_questions)
+                    before_facts = list(pkg.code_facts)
+                    brief = codewalk.brief(finding, base.get("sca"))
+                    if self._walk.retrieve(pkg, f"{brief}\n\n{codewalk.CODE_WALK_QUESTION}", responses, walk=True):
+                        user = builder.render_for_prompt(pkg)
+                    if walk_key:
+                        self._walk_cache[walk_key] = (
+                            [b for b in pkg.evidence_blocks if b not in before_blocks],
+                            [q for q in pkg.code_questions if q not in before_questions],
+                            [f for f in pkg.code_facts if f not in before_facts])
+                except (LLMError, SchemaError, ValueError, TypeError, AttributeError) as exc:
+                    if _fatal_of(self.client) is not None:
+                        raise
+                    pkg.context_notes.append("Code walk before the verdict failed; judged on the collected evidence.")
+                    log.warning("code walk failed for %s: %s", finding.finding_id, exc)
+            timings["walk"] = time.monotonic() - stage
+        stage = time.monotonic()
         try:
             resp = self.client.complete(system, user, json_schema=VERDICT_SCHEMA)
             responses.append(resp)
@@ -433,12 +478,22 @@ class TriagePipeline:
                 error=str(exc),
             )
 
+        timings["verdict"] = time.monotonic() - stage
+        stage = time.monotonic()
+        asked: set[str] = set()
         for _ in range(max(0, min(self.cfg.context_retrieval_rounds, 3))):
+            # Only a verdict the model could not reach, or a question whose answer would change
+            # it, is worth another walk. `missing_information` is a note for the reviewer: the
+            # SCA prompt tells the model to put unresolved conditions there, so treating it as a
+            # trigger ran every finding through the maximum number of rounds.
+            question = (raw_verdict.blocking_question or "").strip()
             if self.repository_evidence is None or not (
-                raw_verdict.missing_information or raw_verdict.blocking_question
-                or raw_verdict.verdict is VerdictLabel.unknown
+                raw_verdict.verdict is VerdictLabel.unknown or question
             ):
                 break
+            if question and question in asked:
+                break
+            asked.add(question)
             remaining = getattr(self.client, "budget_left_usd", None)
             if remaining is not None and remaining <= 0:
                 pkg.context_notes.append("Additional context retrieval stopped: provider budget exhausted.")
@@ -454,7 +509,8 @@ class TriagePipeline:
                     added = self._walk.retrieve(candidate_pkg, question, responses)
                 else:
                     plan = self.client.complete(
-                        _CONTEXT_REQUEST_SYSTEM, question, json_schema=_CONTEXT_REQUEST_SCHEMA,
+                        registry.with_context(_CONTEXT_REQUEST_SYSTEM), question,
+                        json_schema=_CONTEXT_REQUEST_SCHEMA,
                     )
                     responses.append(plan)
                     requests = json.loads(plan.text).get("requests", [])
@@ -471,28 +527,72 @@ class TriagePipeline:
                 pkg.context_notes = candidate_pkg.context_notes
                 pkg.repository_code_collected = candidate_pkg.repository_code_collected
                 pkg.code_questions = candidate_pkg.code_questions
+                pkg.code_facts = candidate_pkg.code_facts
             except (LLMError, SchemaError, ValueError, TypeError, AttributeError):
                 pkg.context_notes.append("Additional context retrieval failed; retaining the last valid verdict.")
                 log.warning("context retrieval failed for %s", finding.finding_id)
                 break
 
+        if asked:
+            timings["retrieval"] = time.monotonic() - stage
         user = builder.render_for_prompt(pkg)
         outcome = postvalidation.validate(raw_verdict, pkg, finding, self.cfg.post_validation)
-        verdict, overrides, decided_by = outcome.verdict, list(outcome.overrides), (
-            "post_validation" if outcome.changed else "llm"
-        )
+        verdict, overrides = outcome.verdict, list(outcome.overrides)
+        capped = postvalidation.cap_unproven_call(verdict, sca_summary, overrides)
+        guarded = postvalidation.guard_dependency_verdict(capped, sca_summary, overrides)
+        guarded = postvalidation.cap_unproven_dependency_confirmation(
+            guarded, finding, chain, overrides, sca_summary)
+        decided_by = ("post_validation" if outcome.changed or guarded is not verdict else "llm")
+        verdict = guarded
+        if sca_summary is not None:
+            from .sca.policy import priority_for_model_verdict
+            from .sca.verdict import CVEVerdict
+
+            try:
+                outcome_value = CVEVerdict(sca_summary.outcome)
+            except ValueError:
+                outcome_value = None
+            sca_summary.priority = priority_for_model_verdict(
+                verdict.verdict.value, outcome_value, sca_summary.severity, sca_summary.call_evidence)
+            verdict = postvalidation.settle_dependency_review(verdict, finding, sca_summary, overrides)
 
         challenge_note: str | None = None
         record_so_far = TriageRecord(**base, verdict=verdict, overrides=overrides, decided_by=decided_by)
         if verify_pass.should_challenge(record_so_far, self.cfg.verification):
+            stage = time.monotonic()
             result = verify_pass.challenge(
                 self.client, pkg, verdict, user, self.cfg.verification,
                 self.cfg.post_validation.quote_match_threshold,
                 self.cfg.prompt_pack, self.stack_section,
             )
+            objection = " ".join(x for x in (result.counterargument, result.why) if x).strip()
+            if not result.survives and not result.error and objection and self._walk.ready():
+                # An objection is a question about the code ("the evidence does not show
+                # that X reaches Y"). The code can answer it: walk for exactly that, then
+                # let the reviewer look again at what came back.
+                try:
+                    question = (f"{codewalk.brief(finding, base.get('sca'))}\n\n"
+                                f"A reviewer objects to the verdict `{verdict.verdict.value}`:\n"
+                                f"{objection[:1500]}\n\nFind in the code the lines that settle this "
+                                "objection, one way or the other: read the functions it says are unseen.")
+                    if self._walk.retrieve(pkg, question, responses):
+                        user = builder.render_for_prompt(pkg)
+                        result = verify_pass.challenge(
+                            self.client, pkg, verdict, user, self.cfg.verification,
+                            self.cfg.post_validation.quote_match_threshold,
+                            self.cfg.prompt_pack, self.stack_section,
+                        )
+                        overrides.append("challenge_walk: the objection was taken to the code "
+                                         "and the reviewer judged again with what the walk read")
+                except (LLMError, SchemaError, ValueError, TypeError, AttributeError) as exc:
+                    if _fatal_of(self.client) is not None:
+                        raise
+                    log.warning("walk for the challenge failed for %s: %s", finding.finding_id, exc)
             verdict, challenge_overrides, challenge_note = verify_pass.apply(
-                verdict, result, self.cfg.verification.mode
+                verdict, result, self.cfg.verification.mode,
+                downgrade_confirmed=(self.cfg.verification.downgrade_confirmed and not finding.dependency),
             )
+            timings["challenge"] = time.monotonic() - stage
             if challenge_overrides:
                 overrides += challenge_overrides
                 if self.cfg.verification.mode == "authoritative" and not result.survives and not result.error:
@@ -522,6 +622,51 @@ class TriagePipeline:
 
 
 
+    def _dependency_policy(self, finding: Finding, chain):
+        from .sca import policy as policy_mod
+        from .sca.verdict import CVEVerdict
+
+        dependency = finding.dependency
+        advisory = chain.advisory
+        target = dependency.upgrade_target
+        if not target and advisory is not None and getattr(advisory, "fixed_versions", None):
+            target = dependency.model_copy(update={"fixed_versions": list(advisory.fixed_versions)}).upgrade_target
+        shipping = chain.shipping
+        outcome = chain.decision.verdict if chain.decision is not None else None
+        if outcome is not None and not isinstance(outcome, CVEVerdict):
+            outcome = None
+        named_function = getattr(chain.symbol, "function", "") if chain.symbol is not None else ""
+        matched_function = (chain.matched_symbol or "").rsplit("::", 1)[-1]
+        # A call of the vulnerable function itself, or of a public entry of its package
+        # that reaches it inside the package (Yaml::parse over parseBlock).
+        call_bound_to_flaw = bool(named_function and (
+            named_function == matched_function
+            or matched_function in (getattr(chain, "entry_points", None) or ())))
+        return policy_mod.decide(
+            outcome,
+            shipped=getattr(shipping, "shipped", "unknown") or "unknown",
+            severity=finding.severity.value if finding.severity else "",
+            upgrade_target=target,
+            version_known=chain.version_known,
+            via=list(getattr(shipping, "via", []) or []),
+            build_risk=policy_mod.is_build_risk(
+                advisory,
+                untrusted_build_input=getattr(getattr(self, "cfg", None), "build_untrusted_input", False)),
+            # A call graph establishes reachability, but not attacker-controlled input.
+            proven=bool(call_bound_to_flaw and chain.dataflow is not None),
+            parent_calls=(chain.bridge.calls_it if chain.bridge is not None else None),
+            bridge_present=chain.bridge is not None,
+            condition_state=(chain.condition.state.value if chain.condition is not None else ""),
+            installed_symbol_absent=(chain.symbol is not None
+                                     and chain.symbol.declared_in_installed is False),
+            needs_other_vuln=policy_mod.needs_other_vulnerability(
+                advisory, chain.condition.statement if chain.condition is not None else ""),
+        )
+
+    def _raise_if_fatal(self) -> None:
+        if (fatal := _fatal_of(self.client)) is not None:
+            raise fatal
+
     def run(self, findings: Iterable[Finding], *, progress=None, on_record=None) -> TriageRun:
         """Triage every finding."""
         all_findings = list(findings)
@@ -539,6 +684,7 @@ class TriagePipeline:
         workers = max(1, min(self.cfg.max_workers, self.provider_cfg.concurrency))
         if self.dep_chain is not None:
             self.dep_chain.prepare(items, workers=workers, progress=_prepare_progress)
+        self._raise_if_fatal()
         records: list[TriageRecord | None] = [None] * len(items)
         log.info("triaging %d finding(s) on %d worker(s)", len(items), workers)
 
@@ -582,6 +728,13 @@ class TriagePipeline:
             futures = {pool.submit(timed, f): i for i, f in enumerate(items)}
             for done, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
+                if getattr(self.client, "fatal_error", None) is not None:
+                    # A rejected key fails every later call the same way: stop here
+                    # rather than journal the rest of the run as errors.
+                    for pending in futures:
+                        pending.cancel()
+                    finished.set()
+                    self._raise_if_fatal()
                 try:
                     records[index] = future.result()
                 except Exception as exc:
@@ -606,6 +759,62 @@ class TriagePipeline:
             spend_usd=float(getattr(self.client, "spend_usd", 0.0) or 0.0),
             model_calls=int(getattr(self.client, "calls", 0) or 0),
         )
+
+
+def _walk_key(finding: Finding) -> tuple[str, str, str] | None:
+    dependency = finding.dependency
+    if dependency is None or not dependency.package:
+        return None
+    return (dependency.ecosystem or "", dependency.package, dependency.installed_version or "")
+
+
+def _with_advisory_severity(finding: Finding, chain) -> Finding:
+    """The advisory's own severity, when the finding came in without one (or as the default)."""
+    from .models import Severity
+
+    level = getattr(getattr(chain, "advisory", None), "severity_level", "") or ""
+    if not level or finding.severity not in (Severity.medium, Severity.unknown):
+        return finding
+    try:
+        return finding.model_copy(update={"severity": Severity(level)})
+    except ValueError:
+        return finding
+
+
+
+def _deployment_closed(base: dict, finding: Finding, reason: str) -> TriageRecord:
+    """Closed because the advisory's precondition cannot exist in this deployment."""
+    verdict = Verdict(
+        verdict=VerdictLabel.false_positive,
+        evidence_class=EvidenceClass.identifier_only,
+        confidence=0.99,
+        confidence_rationale="Advisory precondition mismatch is deterministic.",
+        exploitability=None,
+        impact=None,
+        cwe=finding.cwe,
+        vulnerable_symbol=None,
+        dataflow=[],
+        evidence=[],
+        reason=reason,
+        missing_information=[],
+        blocking_question=None,
+        requires_human_review=False,
+    )
+    return TriageRecord(
+        **base,
+        trace=list(finding.trace),
+        verdict=verdict,
+        decided_by="post_validation",
+        overrides=["advisory precondition contradicts deployment boundary"],
+        latency_ms=0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost_usd=0.0,
+        attempts=0,
+    )
+
+def _fatal_of(client):
+    return getattr(client, "fatal_error", None)
 
 
 def _is_secret_family(cwe: str | None) -> bool:

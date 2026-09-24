@@ -5,21 +5,26 @@ applies_to: []
 kind: dependency-step
 ---
 You investigate one dependency vulnerability in this application's code. A static
-analyser run on this exact project — CodeQL for JavaScript, Psalm for PHP; the
-material names which — is available to you as tools. You do not read the code
-yourself: you call the tools, and the analyser answers.
+analyser run on this exact project (the material names which) answers call and
+dataflow questions, and you also read the code yourself: files, text search and the
+language server are tools too. The analyser resolves calls; the code shows the
+details it cannot — the branch a call sits in, a flag, a guard, a default. Look at
+them before you stop: a call inside `if (!production)` or behind a disabled option
+is not the same fact as a call on every request.
 
 Tools:
 
 - `check_package()` — whether the vulnerable dependency is used by production
-  code. Call this first. If it says the package is not used in production, stop
-  calling tools; the final decision is made later, outside this step.
+  code. Call this first. It answers about this project's own source only, so for
+  a transitive package the answer is "not used" even when the flaw runs on every
+  request: the project does not name the package, its parent does. Stop on "not
+  used" only for a direct dependency; for a transitive one continue with step 4.
 - `find_calls(name, class, vulnerable)` — every call the application makes to one
   function of the vulnerable package, resolved through the package's own exports,
   and for each call whether untrusted input (an HTTP request and the like) reaches
   its arguments, with the path. One function per call; call it again for another.
-  Set `class` only for a method of a class the package exports — fully qualified
-  for PHP (`Symfony\Component\Yaml\Yaml`); otherwise leave it empty.
+  Set `class` only for a method of a class the package exports, named the way the
+  ecosystem context says; otherwise leave it empty.
 - `check_call_site(file, line)` — whether untrusted input reaches the call at this
   repository-relative file and 1-based line. Offered for CodeQL only.
 
@@ -43,14 +48,51 @@ How to work:
    (`safeLoad` instead of `load`) and anything the text calls unaffected. Only calls
    and paths of functions marked true count as evidence.
 
-When the material says a language server is available (Go, PHP, JS/TS), you also
-have:
+4. Transitive package — the material names the chain (`eslint -> minimatch ->
+   brace-expansion`). The question is not whether this project calls the package;
+   it is whether the parent calls the flawed function, and whether the project
+   reaches that parent function. The parent's own source is installed and readable:
+   `lsp_outline` and `lsp_read_symbol` take any path in the tree, including
+   `node_modules/<parent>/...` and `vendor/<parent>/...`. Read it — do not reason
+   about what a library probably does. In order:
+   a. find where the parent requires or imports the vulnerable package and which
+      of its functions it calls — `lsp_read_symbol` on the parent's entry file, or
+      `lsp_find_symbol` for the flawed function's name;
+   b. if the parent never mentions the package or never calls the flawed function,
+      say exactly that: the chain is broken and nothing downstream can reach it;
+   c. if it does call it, name the parent's own public function that leads there,
+      then ask `find_calls`/`find_usages` whether this project calls that function.
+   Report which of a/b/c you established and on which file and line. "The parent
+   was not read" is itself an answer — say so rather than leaving it implied.
+
+   Whose code a line belongs to decides what it proves. A path under
+   `node_modules/` or `vendor/` is the library's own source: it shows what that
+   library does, never what this project does. Every vulnerable package contains
+   its vulnerable function — finding it there is not a finding. Only a path
+   outside those directories is this project calling something. The reading tools
+   mark each answer `[код проекта]` or `[код зависимости — пакет X]`; quote a
+   dependency line only to say what the parent does, and never as evidence that
+   the application reaches it.
+
+To read the code yourself you always have, when the project's source is available:
+
+- `read_file(path, line)` — 80 lines of any file in the tree from that line, the
+  installed packages included; page through a long function by asking again.
+- `search_code(pattern)` — a literal substring across the project's own files, code
+  and configuration alike: a setting (`'query parser'`), a string, a call you
+  cannot name through the language server.
+
+Test files and local docker-compose files are not production: search and usage
+answers leave them out and say how many they skipped, and a file you read is marked
+`[тестовый код — не продакшен]`. A use found only there is not a use by the
+application.
+
+When the material says a language server is available, you also have:
 
 - `find_usages(name, class, vulnerable)` — every reference from project code to
   one function of the vulnerable package, found by the server from the function's
   declaration in the installed package. Use it to tell a real call of the library
-  from a project function with the same name (`App\DateParser::parse` is not
-  `Symfony\Component\Yaml\Yaml::parse`). Ask it for the vulnerable function and
+  from a project function that only shares its name. Ask it for the vulnerable function and
   for every public entry point an application would call to reach the flaw; "0
   references" for one name says nothing about the names you did not ask.
 - `lsp_find_symbol(query)` — find any declared entity in the project by name, in any

@@ -83,14 +83,15 @@ def _lsp_checked(lsp_audit) -> bool:
 
 
 def _not_called(lsp_audit, *reasons: str) -> CVEDecision:
-    """A false positive with a mark: the version is affected, nothing here calls the flaw."""
+    """A resolving tool found no call from this project: the language server from the
+    declaration, or CodeQL/Psalm across every public entry to the vulnerable function."""
+    subject = getattr(lsp_audit, "subject", "") or "языковой сервер"
+    how = ("ссылки проверены языковым сервером от объявления в пакете" if subject == "языковой сервер"
+           else f"{subject} разрешил вызовы всех публичных входов пакета")
     return CVEDecision(
         CVEVerdict.NOT_CALLED,
-        "ложное срабатывание с пометкой: уязвимую функцию код проекта не вызывает",
-        [*[r for r in reasons if r], lsp_audit.render(),
-         "проверено языковым сервером от объявления в пакете, а не поиском по тексту",
-         "пометка: установленная версия уязвима — если вызов появится, находка вернётся",
-         "не покрыто: вызов через публичный API пакета, который модель не спросила"],
+        f"{subject} не нашёл вызовов из кода проекта",
+        [*[r for r in reasons if r], lsp_audit.render(), how],
     )
 
 
@@ -216,7 +217,7 @@ def decide(
             CVEVerdict.ONLY_TEST_IMPORT,
             "библиотека подключается только в тестовом коде",
             [used_detail or "импорты найдены только в тестовых путях",
-             "тестовые пути заданы в prompts/training-context.md, тот же список видит модель",
+             "тестовые пути заданы в prompts/context/, тот же список видит модель",
              closure_audit.render(),
              "рабочий код пакет не импортирует — в поставляемом приложении он не вызывается"],
         )
@@ -385,7 +386,15 @@ def decide(
     if driven is None:
         from .reach import needs_input_path
 
-        driven = needs_input_path(cwe)
+        if not needs_input_path(cwe):
+            return CVEDecision(
+                CVEVerdict.PRESENT_UNPROVEN,
+                f"{symbol} вызывается, но требование к управляемому вводу не установлено",
+                [*reasons, "неизвестный или не классифицированный CWE не доказывает, "
+                 "что вызова достаточно для эксплуатации"],
+                evidence,
+            )
+        driven = True
 
     if not driven:
         return CVEDecision(

@@ -211,6 +211,9 @@ class PresenceResult:
     files_scanned: int = 0
     truncated: bool = False
     detail: str = ""
+    # How a call was attributed to the package: "import" when its receiver is a name the
+    # file bound to the package, "name" when only the name matched.
+    evidence: str = ""
 
     @property
     def found(self) -> bool:
@@ -403,6 +406,14 @@ def find_symbol(
             SymbolPresence.ABSENT, label, [], 0, truncated,
             detail=(f"в проекте нет файлов на языке пакета "
                     f"({', '.join(sorted(suffixes))}) — вызывать неоткуда"))
+    from . import lang as lang_mod
+
+    rules = lang_mod.rules_for_ecosystem(ecosystem)
+    if rules is not None and package and (function or klass):
+        return _find_with_rules(root, files, truncated, rules, label, function=function, klass=klass,
+                                package=package, ecosystem=ecosystem, file_hint=file_hint,
+                                max_hits=max_hits)
+
     call_re = _call_patterns(function) if function else None
     class_re = _class_pattern(klass) if klass else None
     static_re = (re.compile(rf"(?<![\w$\\])\\?((?:[A-Za-z_]\w*\\)*[A-Za-z_]\w*)\s*::\s*{re.escape(function)}\s*\(",
@@ -474,3 +485,118 @@ def find_symbol(
         detail=(f"вызова {label} нет в {len(files)} файлах проекта; "
                 "функция может вызываться внутри библиотеки"),
     )
+
+
+_CONSTRUCTORS = {"constructor", "__construct", "new"}
+_ALIASES: dict[str, dict[str, list[str]]] = {}
+
+
+def _aliases_for(root: Path) -> dict[str, list[str]]:
+    from . import lang as lang_mod
+
+    key = str(root)
+    if key not in _ALIASES:
+        _ALIASES[key] = lang_mod.project_aliases(root)
+    return _ALIASES[key]
+
+
+def _find_with_rules(root: Path, files: list[Path], truncated: bool, rules, label: str, *,
+                     function: str, klass: str, package: str, ecosystem: str, file_hint: str,
+                     max_hits: int) -> PresenceResult:
+    """Calls attributed through bindings, per language (see `sca/lang`).
+
+    A call counts when its receiver is bound to the package in that file —
+    imported, required, `use`d, or one assignment away from one. Name-only
+    matches of a common method name, or of anything the language or browser
+    owns (`Date.parse`, `Object.assign`, `new FormData()`), are not calls.
+    """
+    import re as _re
+
+    from . import lang as lang_mod
+
+    namespaces = package_namespaces(ecosystem, package)
+    namespaces += [n for n in installed_namespaces(root, ecosystem, package) if n not in namespaces]
+    scans: list[lang_mod.FileScan] = []
+    for path in files:
+        if lang_mod.rules_for_path(path) is not rules:
+            continue
+        try:
+            if path.stat().st_size > _MAX_BYTES:
+                continue
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        scans.append(lang_mod.FileScan(path.relative_to(root).as_posix(), rules.strip_comments(raw), rules))
+    lang_mod.bind_project(scans, package, namespaces=namespaces, aliases=_aliases_for(root))
+
+    constructor = bool(klass) and (not function or function == klass or function.lower() in _CONSTRUCTORS)
+    tail = file_hint.lstrip("./").lower() if file_hint else ""
+    bound: list[Hit] = []
+    unbound: list[Hit] = []
+    refs: list[Hit] = []
+    imported_somewhere = False
+    for scan in scans:
+        in_tests = is_test(scan.rel)
+        if tail and scan.rel.lower().endswith(tail):
+            refs.append(Hit(scan.rel, 1, f"файл совпадает с {file_hint}"))
+        if scan.bindings.import_lines:
+            imported_somewhere = True
+        if constructor:
+            pattern = _re.compile(rf"\bnew\s+(?P<cls>\\?[\w\\.]*?{_re.escape(klass)})\s*\(")
+            for number, line in enumerate(scan.text.splitlines(), 1):
+                for match in pattern.finditer(line):
+                    name = match.group("cls").lstrip("\\")
+                    short = name.rsplit("\\", 1)[-1].rsplit(".", 1)[-1]
+                    root_name = name.split(".")[0]
+                    is_bound = (name in scan.bindings.classes or short in scan.bindings.classes
+                                or root_name in scan.bindings.receivers)
+                    hit = Hit(scan.rel, number, line.strip()[:160], in_tests, match.start())
+                    if is_bound:
+                        bound.append(hit)
+                    elif not rules.is_builtin(short) and not rules.is_builtin(root_name):
+                        unbound.append(hit)
+            if function and function.lower() in _CONSTRUCTORS | {klass.lower()}:
+                continue
+        if function:
+            for match in rules.calls(scan.text, scan.bindings, function, klass):
+                hit = Hit(scan.rel, match.line, match.text, in_tests, match.column)
+                if match.bound:
+                    bound.append(hit)
+                elif not rules.is_ubiquitous(function):
+                    unbound.append(hit)
+        elif klass and (klass in scan.bindings.classes.values()):
+            for number in scan.bindings.import_lines:
+                refs.append(Hit(scan.rel, number, f"импорт {klass}", in_tests))
+        if len(bound) >= max_hits:
+            break
+
+    def unique(hits: list[Hit]) -> list[Hit]:
+        seen: set[tuple[str, int]] = set()
+        out = []
+        for hit in hits:
+            if (hit.file, hit.line) not in seen:
+                seen.add((hit.file, hit.line))
+                out.append(hit)
+        return out
+
+    bound, unbound = unique(bound), unique(unbound)
+    if bound:
+        return PresenceResult(SymbolPresence.CALLED, label, bound[:max_hits], len(scans), truncated,
+                              detail=(f"вызов {label} через имя, связанное с пакетом {package} "
+                                      f"(импорт/require/use), найден в {len(bound)} месте(ах)"),
+                              evidence="import")
+    if unbound:
+        return PresenceResult(
+            SymbolPresence.CALL_UNCONFIRMED, label, unbound[:max_hits], len(scans), truncated,
+            detail=(f"{function or klass} вызывается, но получатель не связан с пакетом {package} в этих файлах — "
+                    "вызов может идти через обёртку, внедрение или глобальный объект"),
+            evidence="name")
+    if refs:
+        return PresenceResult(SymbolPresence.REFERENCED, label, refs[:max_hits], len(scans), truncated,
+                              detail="символ упоминается, но вызова не найдено", evidence="import")
+    where = ("пакет импортируется, но" if imported_somewhere else f"пакет {package} в коде не импортируется, и")
+    return PresenceResult(
+        SymbolPresence.ABSENT, label, [], len(scans), truncated,
+        detail=(f"{where} вызова {label} через связанные с ним имена нет в {len(scans)} файлах; "
+                "функция может вызываться внутри библиотеки"),
+        evidence="import")

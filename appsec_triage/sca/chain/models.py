@@ -43,6 +43,16 @@ class ChainResult:
     # can name the vulnerable function but not say what is wrong with it.
     flaw: str = ""
     flaw_ru: str = ""
+    # Public functions of the vulnerable package that reach the vulnerable one inside
+    # it. A call of one of them is a call of the flaw (`Yaml::parse` over `parseBlock`).
+    entry_points: list[str] = field(default_factory=list)
+    # Whether the package reaches the running application at all (sca/shipping.py).
+    shipping: object = None
+    # The merged advisory, for its severity and its text.
+    advisory: object = None
+    version_known: bool = True
+    # How a call was attributed: "import" (bound receiver), "name" (name only), "codeql", "lsp", "".
+    call_evidence: str = ""
 
     @property
     def needs_a_person(self) -> bool:
@@ -104,6 +114,11 @@ class ChainResult:
             route=self.route,
             codeql_calls=self.codeql_calls[:12],
             problems=self.problems[:4],
+            shipped=getattr(self.shipping, "shipped", "") or "",
+            runtime=getattr(self.shipping, "where", "") or "",
+            loaded_via=list(getattr(self.shipping, "via", []) or [])[:4],
+            call_evidence=self.call_evidence,
+            severity=getattr(self.advisory, "severity_level", "") or "",
         )
 
     def render(self) -> str:
@@ -137,6 +152,15 @@ class ChainResult:
             lines.append(f"- эксплуатируемость: {rendered}")
         if self.dataflow_status:
             lines.append(f"- CodeQL dataflow: {self.dataflow_status}")
+        if self.shipping is not None:
+            lines.append(f"- {self.shipping.render()}")
+        if self.call_evidence:
+            lines.append("- вызов найден: " + {
+                "import": "через имя, связанное с пакетом импортом/require/use",
+                "codeql": "CodeQL по API пакета",
+                "lsp": "языковым сервером от объявления в пакете",
+                "name": "только по совпадению имени — получатель не связан с пакетом",
+            }.get(self.call_evidence, self.call_evidence))
         if self.placement is not None:
             lines.append(f"- положение в графе: {self.placement.describe()}")
             if note := self.placement.upgrade_note():

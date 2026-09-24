@@ -35,6 +35,14 @@ WRONG  {"quote": "user input is concatenated into a shell command", "why": ""}
 - `SANITIZED_DATAFLOW` — a sanitizer, parameterized query, or encoder is present on the reported path.
 - `INSUFFICIENT_CONTEXT` — you cannot tell.
 
+`INSUFFICIENT_CONTEXT` never goes with `false_positive`: "I could not see enough" is not
+a reason to close. When you close a finding for a named reason that is neither a
+sanitizer nor a test file, use `IDENTIFIER_ONLY` and quote the fact that settles it:
+the flagged code runs only outside production (quote the branch or switch that keeps it
+out), or the flagged pattern has no security consequence where it is (a client-side
+format check, a redundant character range, a value no attacker controls). The class
+names what the flagged thing turned out to be; the quote is what makes the closure hold.
+
 **Step 2 — Check the path.** A finding in tests, fixtures, generated code, vendored/third-party code, or docs is weak evidence of a production vulnerability. It is not automatically a false positive if the value is a real credential — a leaked live key in a test file is still a leaked live key.
 
 **Step 3 — Look for the disconfirming fact.** Actively search the evidence for the single fact that would flip your leaning. If you find it, follow it.
@@ -62,8 +70,11 @@ this input only:
    primary control shown in the evidence prevents the attack.
 
 `TRACE` is the scanner's reported path. `RESOLVED SYMBOLS` is additional,
-verbatim LSP evidence about definitions and callers. Use both; neither licenses
-you to invent a missing hop. If a required fact is absent, the gate is
+verbatim LSP evidence about definitions and callers, and `REPOSITORY EVIDENCE` holds
+the code the walk read along the trace — the functions each hop passes through. Use
+them all; none licenses you to invent a missing hop. When the walk read the function
+between two steps, judge the hop from its code: what it does with the value is the
+fact, the scanner's arrow is only the claim. If a required fact is absent, the gate is
 **unproven**, not failed. An unproven gate leads to `unknown`, not to
 `false_positive`.
 
@@ -103,7 +114,7 @@ Only a verdict with confidence **strictly above 0.85** may be applied automatica
 
 Set `blocking_question` to `null` for `confirmed` and `false_positive`. A decided verdict has no blocking question by definition; filling it in there is a contradiction.
 
-Also list the concrete gaps in `missing_information`.
+Also list the concrete gaps in `missing_information`. That list is a note for the human reviewer and does not send you back for more code; only a `blocking_question` on an `unknown` verdict does.
 
 **Step 10 — Set `requires_human_review`.** Always `true` for `unknown`, for `confirmed` on anything that looks production-critical, and for any new or unfamiliar rule.
 

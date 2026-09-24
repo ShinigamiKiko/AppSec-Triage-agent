@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 
 from . import declarations as decl
 
 log = logging.getLogger(__name__)
+
+_JS_NAME = r"[A-Za-z_$][\w$]*"
+
+
+def _default_imports(text: str, package: str) -> dict[str, list[tuple[int, int]]]:
+    """Local names bound to a package's CommonJS/default export."""
+    quoted = rf"(?P<quote>['\"]){re.escape(package)}(?P=quote)"
+    patterns = (
+        rf"\b(?:const|let|var)\s+(?P<alias>{_JS_NAME})\s*=\s*require\s*\(\s*{quoted}\s*\)",
+        rf"\bimport\s+(?P<alias>{_JS_NAME})\s+from\s+{quoted}",
+    )
+    bindings: dict[str, list[tuple[int, int]]] = {}
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            bindings.setdefault(match.group("alias"), []).append(match.span())
+    return bindings
 
 
 @dataclass(slots=True)
@@ -20,10 +37,11 @@ class BridgeSymbol:
     visibility: str = "public"
     file: str = ""
     line: int = 0
+    default_export: bool = False
 
     @property
     def callable_from_outside(self) -> bool:
-        return self.visibility == "public" and not self.function.startswith("_")
+        return self.visibility == "public"
 
     def __str__(self) -> str:
         return f"{self.klass}::{self.function}" if self.klass else self.function
@@ -42,7 +60,7 @@ class BridgeResult:
 
     @property
     def closes(self) -> bool:
-        """The parent was read in full and never calls the vulnerable function."""
+        """All checked paths lack a call or reference to the target."""
         return self.calls_it is False
 
 
@@ -51,9 +69,10 @@ def _callers(
     parent_source: dict[str, str],
     *,
     parent_package: str = "",
+    default_export_from: str = "",
     max_symbols: int = 12,
 ) -> BridgeResult:
-    """Which functions of `parent_source` call any name in `targets`."""
+    """Which functions call or export any name in `targets`."""
     label = ", ".join(sorted(targets)[:3]) or "искомую функцию"
     if not parent_source:
         return BridgeResult(
@@ -74,21 +93,36 @@ def _callers(
 
     found: list[BridgeSymbol] = []
     sites = 0
+    aliases_by_path: dict[str, dict[str, list[tuple[int, int]]]] = {}
     for path, text in parent_source.items():
         language = decl.language_of(path)
         if language is None:
             continue
+        aliases = (_default_imports(text, default_export_from)
+                   if language == decl.JS and default_export_from else {})
+        aliases_by_path[path] = aliases
+        scan_targets = targets | aliases.keys()
+        default_exports = decl.default_export_names(text) if language == decl.JS else set()
         parsed: list | None = None
-        for target in targets:
-            for match in patterns[(language, target)].finditer(text):
+        for target in scan_targets:
+            pattern = patterns.get((language, target)) or decl.call_pattern(target, language)
+            for match in pattern.finditer(text):
                 sites += 1
                 if parsed is None:
                     parsed = decl.declarations(path, text)
                 enclosing = decl.enclosing_in(parsed, match.start())
-                if enclosing is None or enclosing.name in targets:
+                if enclosing is None:
                     continue
+                if enclosing.name in scan_targets:
+                    # A function calling its own name is recursion. A method of another
+                    # class with the same name is a different function: Yaml::parse
+                    # calling $parser->parse() is the entry point, not a loop.
+                    before = text[max(0, match.start() - 10):match.start() + 1]
+                    if not enclosing.owner or re.search(r"(?:\$this->|self::|static::|\bthis\.)\s*$",
+                                                        before[:-1] if before else ""):
+                        continue
                 symbol = BridgeSymbol(enclosing.name, enclosing.owner, enclosing.visibility,
-                                      path, enclosing.line)
+                                      path, enclosing.line, enclosing.name in default_exports)
                 if not any(str(s) == str(symbol) for s in found):
                     found.append(symbol)
                 if len(found) >= max_symbols:
@@ -98,20 +132,97 @@ def _callers(
         if len(found) >= max_symbols:
             break
 
-    if not sites:
+    # Passing an API through is a path too: Express, for example, exposes
+    # bodyParser.urlencoded as exports.urlencoded without calling it here.
+    for path, text in parent_source.items():
+        if decl.language_of(path) != decl.JS:
+            continue
+        aliases = aliases_by_path.get(path, {})
+        default_exports = decl.default_export_names(text)
+        if not any(target in text for target in targets | aliases.keys()):
+            continue
+        for target in targets:
+            name = re.escape(target)
+            forwarded = re.search(
+                rf"\b(?:module\s*\.\s*)?exports\s*\.\s*{name}\s*=\s*"
+                rf"(?:[A-Za-z_$][\w$]*\s*\.\s*)?{name}(?![\w$])", text)
+            if forwarded is not None:
+                found.append(BridgeSymbol(target, file=path,
+                                          line=text.count("\n", 0, forwarded.start()) + 1,
+                                          default_export=target in default_exports))
+        for alias in aliases.keys() & default_exports:
+            exported = re.search(rf"\bmodule\s*\.\s*exports\s*=\s*{re.escape(alias)}\b", text)
+            if exported is not None:
+                found.append(BridgeSymbol(alias, file=path,
+                                          line=text.count("\n", 0, exported.start()) + 1,
+                                          default_export=True))
+        for declaration in decl.declarations(path, text):
+            if declaration.name in targets and declaration.public:
+                found.append(BridgeSymbol(declaration.name, declaration.owner,
+                                          declaration.visibility, path, declaration.line,
+                                          declaration.name in default_exports))
+    found = list({(s.file, str(s)): s for s in found}.values())
+
+    if not sites and not found:
+        # A reference may be a forwarded export or alias that the simple call
+        # parser cannot follow. It must remain unknown, not a negative fact.
+        referenced = any(
+            re.search(rf"(?<![\w$]){re.escape(target)}(?![\w$])", text)
+            for target in targets for text in parent_source.values())
+        if not referenced:
+            referenced = any(
+                any(not any(start <= match.start() < end for start, end in spans)
+                    for match in re.finditer(rf"(?<![\w$]){re.escape(alias)}(?![\w$])",
+                                             parent_source[path]))
+                for path, aliases in aliases_by_path.items() for alias, spans in aliases.items())
+        if referenced:
+            return BridgeResult(
+                detail=f"{parent_package or 'посредник'} упоминает {label}, "
+                       "но статический вызов или реэкспорт не удалось разрешить")
         return BridgeResult(
             calls_it=False, call_sites=0,
             detail=(f"{parent_package or 'пакет-посредник'} нигде не вызывает "
-                    f"{label} — путь к уязвимости через него не идёт; "
-                    "это поиск по имени, он не видит тип получателя, "
-                    "поэтому находку не закрывает"))
+                    f"{label} и не ссылается на него — путь через него не найден"))
 
     public = [s for s in found if s.callable_from_outside]
+    action = (f"вызывает {label} в {sites} месте(ах)" if sites
+              else f"экспортирует или передаёт наружу {label}")
     return BridgeResult(
         calls_it=True, symbols=found, call_sites=sites,
-        detail=(f"{parent_package or 'посредник'} вызывает {label} "
-                f"в {sites} месте(ах); наружу открыто: "
+        detail=(f"{parent_package or 'посредник'} {action}; наружу открыто: "
                 f"{', '.join(str(s) for s in public[:4]) or 'ничего публичного'}"))
+
+
+def entry_points(function: str, source: dict[str, str], *, package: str = "",
+                 max_steps: int = 8, max_symbols: int = 24) -> list[BridgeSymbol]:
+    """Public functions of one package from which `function` is reached inside it.
+
+    The flaw is often in a private helper no application calls; the application
+    calls a public function above it — `Yaml::parse` over `Parser::parseBlock`,
+    `load` over `storeMappingPair`. A call of one of these is a call of the flaw,
+    and they are the names a search of the application has to look for.
+
+    Name-based, like the bridge: a path the package takes only through a callback
+    or a dynamic dispatch is missed, so an empty list proves nothing.
+    """
+    if not function or not source:
+        return []
+    found: list[BridgeSymbol] = []
+    frontier, seen = {function}, {function}
+    for _ in range(max_steps):
+        if not frontier:
+            break
+        result = _callers(frontier, source, parent_package=package, max_symbols=max_symbols)
+        if not result.calls_it:
+            break
+        for symbol in result.public_symbols:
+            if not any(str(s) == str(symbol) for s in found):
+                found.append(symbol)
+        # Public callers keep being followed: an application may call either
+        # `Yaml::parse` or the `Parser::parse` it delegates to.
+        frontier = {s.function for s in result.symbols} - seen
+        seen |= frontier
+    return found
 
 
 @dataclass(slots=True)
@@ -137,6 +248,8 @@ def walk_bridge(
     *,
     max_depth: int = 4,
     max_symbols: int = 12,
+    max_internal_steps: int = 4,
+    origin_package: str = "",
 ) -> BridgeWalk:
     """Follow the flaw outward along `chain`, package by package, toward the app."""
     if not vulnerable_function:
@@ -151,32 +264,58 @@ def walk_bridge(
     def stopped(detail: str, hops: int) -> BridgeWalk:
         return BridgeWalk(targets=carried, hops=hops, unknown=True, detail=detail)
 
-    for depth, package in enumerate(chain, 1):
-        if depth > max_depth:
+    packages = ([origin_package] if origin_package else []) + chain
+    for depth, package in enumerate(packages, 1):
+        parent_depth = depth - bool(origin_package)
+        if parent_depth > max_depth:
             return stopped(
                 f"цепочка глубже {max_depth} посредников — дальше не прослеживаем",
-                depth - 1)
+                parent_depth - 1)
 
         source = source_of(package)
         if not source:
             return stopped(
                 f"{package} не установлен в дереве проекта — "
                 "путь через него не прослежен",
-                depth - 1)
+                max(parent_depth - 1, 0))
 
-        result = _callers(targets, source, parent_package=package, max_symbols=max_symbols)
-        if result.calls_it is False:
-            return BridgeWalk(hops=depth, closed=True, detail=result.detail)
+        frontier = set(targets)
+        seen = set(frontier)
+        public: list[BridgeSymbol] = []
+        steps = 0
+        imported_default = (packages[depth - 2] if depth > 1
+                            and any(s.default_export and s.function in targets for s in carried)
+                            else "")
+        while frontier and steps < max_internal_steps:
+            result = _callers(frontier, source, parent_package=package,
+                              default_export_from=imported_default if frontier & targets else "",
+                              max_symbols=max_symbols)
+            if result.calls_it is None:
+                return stopped(result.detail, max(parent_depth, 0))
+            if result.calls_it is False:
+                if steps == 0:
+                    if origin_package and depth == 1:
+                        return stopped(
+                            f"уязвимая функция не найдена в установленном {package}; "
+                            "публичный вход определить нельзя", 0)
+                    return BridgeWalk(hops=parent_depth, closed=True, detail=result.detail)
+                break
 
-        public = result.public_symbols
+            steps += 1
+            for symbol in result.public_symbols:
+                if not any((s.file, str(s)) == (symbol.file, str(symbol)) for s in public):
+                    public.append(symbol)
+            private = {s.function for s in result.symbols if not s.callable_from_outside}
+            frontier = private - seen
+            seen.update(frontier)
+
         if not public:
-            carried = result.symbols[:max_symbols]
             return stopped(
-                f"{package} вызывает искомое только через непубличные функции — "
-                "снаружи этот путь не адресуем", depth)
+                f"{package} вызывает искомое, но за {steps} внутренних шаг(ов) "
+                "публичный вход не найден", max(parent_depth, 0))
 
         carried = public[:max_symbols]
-        targets = {s.function for s in public}
+        targets = {s.function for s in carried}
 
     return BridgeWalk(
         targets=carried, hops=len(chain),

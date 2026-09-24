@@ -18,3 +18,12 @@ samples/corpus-*.jsonl
 !samples/corpus.jsonl
 !samples/corpus-php.jsonl
 
+
+# Local backups of uncommitted work, not part of the tool.
+*.patch
+
+# Development only, not needed by the job: tests and the local mailbox provider
+# (the evaluator answering as the model through files).
+tests/
+appsec_triage/llm/mailbox.py
+configs/providers/mailbox.yaml

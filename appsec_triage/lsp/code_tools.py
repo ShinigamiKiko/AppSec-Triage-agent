@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
+from ..testpaths import is_test
 from .client import path_to_uri, uri_to_path
 
 log = logging.getLogger(__name__)
@@ -18,6 +19,35 @@ _KINDS = {1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "
 _SKIP = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv", "target"}
 _MAX_LISTED = 20
 _MAX_SCAN = 20000
+_READ_LINES = 80
+_SYMBOL_LINES = 160
+_LINE_CHARS = 300
+_MAX_FILE_BYTES = 1_000_000
+# Never shown to the model, whatever it asks for.
+_SECRET_NAMES = re.compile(r"^(?:\.env(?:\..*)?|id_rsa.*|id_ed25519.*|credentials.*|.*\.(?:pem|key|p12|pfx|keystore))$",
+                           re.IGNORECASE)
+_SEARCHABLE = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".php", ".py", ".go",
+               ".java", ".kt", ".cs", ".rb", ".rs", ".json", ".yaml", ".yml", ".toml", ".xml", ".ini",
+               ".neon", ".twig", ".html", ".conf", ".properties", ".gradle", ".sh"}
+_SEARCHABLE_NAMES = {"dockerfile", "makefile", ".gitlab-ci.yml", "go.mod", "composer.json", "package.json"}
+
+
+def _clip(text: str) -> str:
+    """One line as the model sees it: a minified or base64 line is cut, not dropped."""
+    if len(text) <= _LINE_CHARS:
+        return text
+    return f"{text[:_LINE_CHARS]} …[строка обрезана, ещё {len(text) - _LINE_CHARS} симв.]"
+
+
+def _installed(parts) -> str | None:
+    """The package an installed-tree path belongs to ("" if unnamed); None otherwise."""
+    parts = list(parts)
+    for index, part in enumerate(parts[:-1]):
+        if part in ("node_modules", "vendor"):
+            rest = parts[index + 1:]
+            two = part == "vendor" or rest[0].startswith("@")
+            return "/".join(rest[:2]) if two and len(rest) > 2 else rest[0]
+    return None
 
 
 class CodeTools:
@@ -78,7 +108,15 @@ class CodeTools:
 
     def resolve(self, file: str) -> Path | None:
         """A repository-relative path inside the root, or None."""
-        rel = PurePosixPath(str(file or "").replace("\\", "/"))
+        text = str(file or "").replace("\\", "/")
+        # The material shows paths as the container mounts them (`/src/server.ts`) or
+        # as absolute paths under the root; both name a file of this tree.
+        root = self.root.as_posix().rstrip("/")
+        if root and text.startswith(root + "/"):
+            text = text[len(root) + 1:]
+        elif text.startswith("/src/"):
+            text = text[len("/src/"):]
+        rel = PurePosixPath(text)
         if not str(rel) or rel.is_absolute() or ".." in rel.parts:
             return None
         path = self.root / rel
@@ -97,7 +135,99 @@ class CodeTools:
             return "вне проекта (стандартная библиотека или зависимость)"
         if parts & {"node_modules", "vendor"}:
             return "зависимость"
+        if is_test(rel):
+            return "тестовый код"
         return "код проекта"
+
+    def provenance(self, file: str) -> str:
+        """Whose code this is — said with every read, so no line is taken for another's."""
+        rel = PurePosixPath(str(file or "").replace("\\", "/"))
+        package = _installed(rel.parts)
+        if package is not None:
+            return (f"[код зависимости{f' — пакет {package}' if package else ''}: доказывает только то, "
+                    "что делает сама библиотека, не то, что делает этот проект]")
+        if is_test(rel.as_posix()):
+            return "[тестовый код — не продакшен: что здесь вызывается, приложение не вызывает]"
+        return "[код проекта]"
+
+    def _readable(self, file: str) -> tuple[Path | None, str]:
+        path = self.resolve(file)
+        if path is None:
+            return None, f"файла {file!r} в репозитории нет"
+        if _SECRET_NAMES.match(path.name):
+            return None, f"{file}: файл с секретами не показывается"
+        try:
+            if path.stat().st_size > _MAX_FILE_BYTES:
+                return None, f"{file}: файл больше {_MAX_FILE_BYTES // 1000} КБ — читайте по символам (lsp_read_symbol)"
+        except OSError:
+            return None, f"{file}: не читается"
+        return path, ""
+
+    def read(self, file: str, line: int = 1, count: int = _READ_LINES) -> str:
+        """`count` lines of any file in the tree, installed packages included."""
+        from ..redact import redact_secrets
+
+        path, problem = self._readable(file)
+        if path is None:
+            return problem
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start = max(1, int(line or 1))
+        if start > len(lines):
+            return f"{self.provenance(file)}\n{file}: в файле {len(lines)} строк, строки {start} нет"
+        chunk = lines[start - 1:start - 1 + count]
+        body = "\n".join(f"{start + i}: {_clip(text)}" for i, text in enumerate(chunk))
+        tail = (f"\n…[ещё {len(lines) - (start - 1 + len(chunk))} строк — read_file с line={start + len(chunk)}]"
+                if start - 1 + len(chunk) < len(lines) else "")
+        return f"{self.provenance(file)}\n{redact_secrets(body)[0] or ''}{tail}"
+
+    def read_symbol(self, file: str, name: str) -> str:
+        """The whole declaration, as the server bounds it — not a fixed window from its first line."""
+        start, end, problem = self.symbol_range(file, name)
+        if start is None:
+            return problem
+        count = max(1, min((end or start) - start + 1, _SYMBOL_LINES))
+        return self.read(file, start, count)
+
+    def search(self, pattern: str) -> str:
+        """A literal substring across the project's own files, code and configuration alike."""
+        pattern = str(pattern or "")
+        if not pattern.strip() or len(pattern) > 200 or "\n" in pattern:
+            return "Not run: give one literal substring of at most 200 characters."
+        rows: list[str] = []
+        tests = 0
+        per_file: dict[str, int] = {}
+        for parent, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP and not d.startswith("."))
+            for name in sorted(filenames):
+                path = Path(parent) / name
+                if (path.suffix.lower() not in _SEARCHABLE and name.lower() not in _SEARCHABLE_NAMES
+                        and not name.lower().startswith("dockerfile")) or _SECRET_NAMES.match(name):
+                    continue
+                try:
+                    if path.stat().st_size > _MAX_FILE_BYTES:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if pattern not in text:
+                    continue
+                rel = self.relative(path)
+                if is_test(rel):
+                    tests += text.count(pattern)
+                    continue
+                for number, line in enumerate(text.splitlines(), 1):
+                    if pattern in line and per_file.get(rel, 0) < 3:
+                        per_file[rel] = per_file.get(rel, 0) + 1
+                        rows.append(f"- {rel}:{number}: {_clip(line.strip())}")
+                if len(rows) >= _MAX_LISTED:
+                    break
+            if len(rows) >= _MAX_LISTED:
+                break
+        skipped = (f"\nв тестовых и docker-compose файлах ещё {tests} совпадений — не продакшен, пропущены"
+                   if tests else "")
+        if not rows:
+            return f"«{pattern}»: в коде и конфигурации проекта не найдено{skipped}"
+        return "\n".join(rows[:_MAX_LISTED]) + skipped
 
     def _line(self, path: Path, line: int) -> str:
         try:
@@ -159,6 +289,7 @@ class CodeTools:
             return "Not run: give a name or part of a name."
         lines: list[str] = []
         problems: list[str] = []
+        skipped_tests = 0
         for language in self.languages():
             client = self._client(language)
             if client is None:
@@ -172,6 +303,8 @@ class CodeTools:
                 continue
             for item in reply or []:
                 for path, line in self._locations([item], language):
+                    if self.where(path) == "тестовый код":
+                        skipped_tests += 1
                     if self.where(path) != "код проекта":
                         continue
                     kind = _KINDS.get(item.get("kind"), "symbol")
@@ -179,21 +312,40 @@ class CodeTools:
                     lines.append(f"- {kind} {item.get('name')}{container} — {self.relative(path)}:{line}")
                     if len(lines) >= _MAX_LISTED:
                         break
+        tests = f"\nв тестовом коде ещё {skipped_tests} — не продакшен, пропущены" if skipped_tests else ""
         if not lines:
             tail = f" ({'; '.join(problems)})" if problems else ""
-            return f"LSP: в коде проекта нет объявлений, совпадающих с {query!r}{tail}"
-        return "\n".join(lines[:_MAX_LISTED])
+            return f"LSP: в коде проекта нет объявлений, совпадающих с {query!r}{tail}{tests}"
+        return "\n".join(lines[:_MAX_LISTED]) + tests
 
     def outline(self, file: str) -> str:
         path, language, client, problem = self._for_file(file)
         if problem:
             return problem
+        return f"{self.provenance(file)}\n{self._outline(path, language, client, file)}"
+
+    def _outline(self, path: Path, language: str, client, file: str) -> str:
         reply = client._request("textDocument/documentSymbol",
                                 {"textDocument": {"uri": path_to_uri(path, self._path_map(language))}})
         if reply is None:
             return f"сервер {language} не ответил на documentSymbol для {file}"
         rows = [f"- {kind} {name} — строки {start}-{end}" for kind, name, start, end in _flatten(reply)]
         return "\n".join(rows[:60]) or f"в {file} сервер не нашёл объявлений"
+
+    def symbol_range(self, file: str, name: str) -> tuple[int | None, int | None, str]:
+        """First and last line of the named declaration in `file`."""
+        path, language, client, problem = self._for_file(file)
+        if problem:
+            return None, None, problem
+        reply = client._request("textDocument/documentSymbol",
+                                {"textDocument": {"uri": path_to_uri(path, self._path_map(language))}})
+        if reply is None:
+            return None, None, f"сервер {language} не ответил на documentSymbol для {file}"
+        wanted = str(name or "").split("::")[-1].split(".")[-1].strip()
+        for _, symbol, start, end in _flatten(reply):
+            if symbol.split(".")[-1] == wanted or symbol == name:
+                return start, end, ""
+        return None, None, f"объявления {name!r} в {file} нет"
 
     def symbol_start(self, file: str, name: str) -> tuple[int | None, str]:
         """The first line of the named declaration in `file`, for `read_file` to show."""
@@ -220,6 +372,7 @@ class CodeTools:
         rows: list[str] = []
         unresolved = 0
         scanned = 0
+        tests = 0
         for parent, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
             for filename in sorted(filenames):
@@ -230,6 +383,9 @@ class CodeTools:
                 try:
                     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                 except OSError:
+                    continue
+                if is_test(self.relative(path)):
+                    tests += sum(1 for text in lines if pattern.search(text))
                     continue
                 scanned += 1
                 for number, text in enumerate(lines, 1):
@@ -255,12 +411,13 @@ class CodeTools:
                     break
             if len(rows) >= _MAX_LISTED:
                 break
+        skipped = (f"\nв тестовых файлах ещё {tests} упоминаний — не продакшен, пропущены" if tests else "")
         if not rows:
             return (f"LSP: {short!r} не встречается ни в одном из {scanned} файлов кода проекта "
-                    f"({', '.join(self.available())})")
+                    f"({', '.join(self.available())}){skipped}")
         tail = (f"\n{unresolved} мест не разрешено: без установленных зависимостей сервер не видит их "
                 "объявлений — это не значит, что вызова нет") if unresolved else ""
-        return "\n".join(rows) + tail
+        return "\n".join(rows) + tail + skipped
 
     def definition(self, file: str, line: int, name: str) -> str:
         path, language, client, problem = self._for_file(file)
@@ -288,10 +445,14 @@ class CodeTools:
         reply = self._request(client, language, "textDocument/references", path, line, column)
         if reply is None:
             return f"сервер {language} не ответил на references"
-        places = [(p, ln) for p, ln in self._locations(reply, language) if self.where(p) == "код проекта"]
+        located = self._locations(reply, language)
+        places = [(p, ln) for p, ln in located if self.where(p) == "код проекта"]
+        tests = sum(1 for p, _ in located if self.where(p) == "тестовый код")
+        skipped = f"\nв тестовом коде ещё {tests} — не продакшен, пропущены" if tests else ""
         if not places:
-            return f"LSP: ссылок на {name} из кода проекта нет (сервер ответил)"
-        return "\n".join(f"- {self.relative(p)}:{ln}: {self._line(p, ln)}" for p, ln in places[:_MAX_LISTED])
+            return f"LSP: ссылок на {name} из кода проекта нет (сервер ответил){skipped}"
+        return "\n".join(f"- {self.relative(p)}:{ln}: {self._line(p, ln)}"
+                         for p, ln in places[:_MAX_LISTED]) + skipped
 
     def callers(self, file: str, line: int) -> str:
         path, language, client, problem = self._for_file(file)
@@ -320,6 +481,24 @@ def _flatten(reply, prefix: str = ""):
         yield _KINDS.get(item.get("kind"), "symbol"), name, start, end
         if item.get("children"):
             yield from _flatten(item["children"], f"{name}.")
+
+
+def reading_tools(function_tool) -> list[dict]:
+    """Plain reading and search, for a conversation that has no evidence reader of its own."""
+    return [
+        function_tool("read_file",
+                      "Read 80 lines of any file in the tree from a 1-based line — the project's code and "
+                      "configuration, or an installed package under node_modules/ or vendor/. Ask again with a "
+                      "later line to read on.",
+                      {"path": {"type": "string", "description": "Repository-relative path."},
+                       "line": {"type": "integer", "description": "1-based start line."}},
+                      ["path", "line"]),
+        function_tool("search_code",
+                      "Literal substring search across the project's own code and configuration (tests, "
+                      "docker-compose and installed packages left out): a setting, a string, a call.",
+                      {"pattern": {"type": "string", "description": "Plain substring, not a regular expression."}},
+                      ["pattern"]),
+    ]
 
 
 def function_tools(function_tool) -> list[dict]:

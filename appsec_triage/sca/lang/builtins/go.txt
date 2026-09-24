@@ -1,0 +1,8 @@
+# Go builtins and standard-library package names: `len(`, `append(`, `strings.Split(` and
+# `json.Unmarshal(` are never a module's function unless the file binds that name itself.
+append cap clear close complex copy delete imag len make max min new panic print println real recover
+
+fmt strings strconv bytes bufio errors io ioutil os exec filepath path url http json xml yaml
+time context sync atomic sort slices maps regexp log slog math rand big hex base64 binary
+utf8 unicode reflect runtime debug testing net netip tls x509 sha256 sha1 md5 hmac aes
+cipher subtle signal syscall template html zip gzip tar embed flag csv sql

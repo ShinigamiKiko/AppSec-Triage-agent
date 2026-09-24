@@ -78,8 +78,22 @@ def write_summary(run: TriageRun, path: Path) -> Path:
         "noise_reduction_pct": round(100 * counts["false_positive"] / len(run.records), 1) if run.records else 0.0,
         "decided_by": {
             k: sum(1 for r in run.records if r.decided_by == k)
-            for k in ("scope", "heuristics", "llm", "post_validation", "error")
+            for k in ("scope", "heuristics", "policy", "llm", "post_validation", "challenged", "error")
         },
+        "decided_without_person": sum(1 for r in run.records if not r.verdict.requires_human_review),
+        "decided_without_person_pct": (
+            round(100 * sum(1 for r in run.records if not r.verdict.requires_human_review) / len(run.records), 1)
+            if run.records else 0.0),
+        "dependency_priority": {
+            p: sum(1 for r in run.records if r.sca is not None and r.sca.priority == p)
+            for p in ("critical", "high", "medium", "low", "none")
+        },
+        "dependency_shipping": {
+            k: sum(1 for r in run.records if r.sca is not None and r.sca.shipped == k)
+            for k in ("runtime", "image_only", "build_only", "unknown")
+        },
+        "stage_seconds": _stage_seconds(run.records),
+        "confidence_spread": _confidence_spread(run.records),
         "latency_ms": {
             "p50": latencies[len(latencies) // 2] if latencies else None,
             "p95": latencies[int(len(latencies) * 0.95)] if latencies else None,
@@ -141,3 +155,30 @@ class Journal:
             except (json.JSONDecodeError, ValueError):
                 continue
         return records
+
+
+def _stage_seconds(records) -> dict[str, dict[str, float]]:
+    """Median and total seconds per pipeline stage: where the run's time went."""
+    stages: dict[str, list[float]] = {}
+    for record in records:
+        for stage, seconds in (getattr(record, "timings", None) or {}).items():
+            stages.setdefault(stage, []).append(float(seconds))
+    out = {}
+    for stage, values in stages.items():
+        values.sort()
+        out[stage] = {"median": values[len(values) // 2], "total": round(sum(values), 1), "n": len(values)}
+    return out
+
+
+def _confidence_spread(records) -> dict[str, float | None]:
+    """How much the calibrated confidence varies across model verdicts.
+
+    Near zero means the number says nothing: forty verdicts at exactly 0.80 is a
+    constant, not a measurement, and the auto-apply threshold then never moves.
+    """
+    import statistics
+
+    values = [r.verdict.confidence for r in records if r.decided_by in ("llm", "post_validation", "challenged")]
+    if len(values) < 5:
+        return {"n": len(values), "stdev": None, "distinct": len(set(values))}
+    return {"n": len(values), "stdev": round(statistics.pstdev(values), 3), "distinct": len(set(values))}

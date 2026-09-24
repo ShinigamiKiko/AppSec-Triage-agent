@@ -1,0 +1,17 @@
+# PHP internal functions (lowercase) that open-source packages also define as method names.
+# A bare call to one of these is the engine's function, not a package's.
+array_filter array_key_exists array_keys array_map array_merge array_merge_recursive
+array_replace array_search array_slice array_splice array_values array_walk base64_decode
+base64_encode basename call_user_func call_user_func_array count ctype_digit curl_exec
+curl_init curl_setopt date dirname escapeshellarg escapeshellcmd exec explode file
+file_exists file_get_contents file_put_contents filter_input filter_var fopen fread fwrite
+get_class gettype hash hash_hmac header html_entity_decode htmlentities htmlspecialchars
+implode in_array is_array is_callable is_numeric is_object is_string json_decode json_encode
+ltrim mail max mb_strlen mb_strtolower mb_substr md5 method_exists min mt_rand parse_ini_file
+parse_ini_string parse_str parse_url passthru popen preg_match preg_match_all preg_quote
+preg_replace preg_replace_callback preg_split print_r proc_open property_exists random_bytes
+random_int rand rawurlencode readfile realpath rtrim serialize session_start setcookie sha1
+shell_exec simplexml_load_file simplexml_load_string sort sprintf str_contains str_ends_with
+str_pad str_repeat str_replace str_starts_with strip_tags stripslashes strlen strpos
+strtolower strtotime strtoupper substr system trim uniqid unlink unserialize urldecode
+urlencode usort var_dump var_export yaml_parse yaml_parse_file yaml_emit

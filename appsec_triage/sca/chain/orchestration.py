@@ -25,6 +25,20 @@ from ..verdict import CVEVerdict, decide
 
 log = logging.getLogger(__name__)
 
+
+def _call_evidence(found, api_answer, *, investigation_used: bool = False) -> str:
+    """How the call site that the verdict rests on was attributed to the package."""
+    if found is None or not getattr(found, "found", False):
+        return ""
+    if api_answer is not None:
+        return "codeql" if getattr(api_answer, "engine", "codeql") == "codeql" else "psalm"
+    evidence = getattr(found, "evidence", "")
+    if evidence:
+        return evidence
+    presence = getattr(found, "presence", None)
+    return "import" if getattr(presence, "value", "") == "called" else "name"
+
+
 if TYPE_CHECKING:
     from ..models import Finding
 
@@ -37,7 +51,7 @@ class DependencyChain(ChainSupport):
         """Ask the database once per package, before any finding is triaged."""
         if not self._roots or not self._databases:
             return
-        todo: list[tuple[Finding, object, str, str]] = []
+        candidates: list[tuple[Finding, object, str, str]] = []
         for finding in findings:
             dependency = getattr(finding, "dependency", None)
             if dependency is None or not dependency.package:
@@ -45,10 +59,13 @@ class DependencyChain(ChainSupport):
             language = _CODEQL_LANGUAGE.get((dependency.ecosystem or "").strip().lower())
             if language not in codeql_api.SUPPORTED or language not in self._databases:
                 continue
-            package = dependency.package
-            if self._imports_absent(language, package):
-                continue
-            todo.append((finding, dependency, language, package))
+            candidates.append((finding, dependency, language, dependency.package))
+        # One imports query per database for the whole run, not one per package.
+        wanted: dict[str, set[str]] = {}
+        for _, _, language, package in candidates:
+            wanted.setdefault(language, set()).add(package)
+        self.prefill_imports(wanted)
+        todo = [item for item in candidates if not self._imports_absent(item[2], item[3])]
 
         def resolve(item):
             finding, dependency, _, _ = item
@@ -145,17 +162,21 @@ class DependencyChain(ChainSupport):
         if version_check.unaffected:
             self.stats["version_unaffected"] += 1
             return ChainResult(verdict_mod.version_unaffected(version_check), problems=problems,
-                               route="version", flaw=_flaw_of(advisory))
-        if version_check.state == versions_mod.UNKNOWN:
+                               route="version", flaw=_flaw_of(advisory), advisory=advisory)
+        version_known = version_check.state != versions_mod.UNKNOWN
+        if not version_known:
             problems.append(f"сверка версии не выполнена: {version_check.detail}")
         else:
             problems.append(f"сверка версии: {version_check.detail}")
+        shipping = self._shipping_facts(dependency)
+        build_only = bool(shipping is not None and shipping.shipped == "build_only")
+        not_loaded = bool(shipping is not None and shipping.shipped in ("build_only", "image_only"))
 
         exclusion = components_mod.classify(advisory, self._deployment, self._client, self._roots)
         if exclusion is not None:
             self.stats["out_of_scope"] += 1
             return ChainResult(exclusion.decision(), problems=problems, route="excluded",
-                               flaw=_flaw_of(advisory),
+                               flaw=_flaw_of(advisory), advisory=advisory,
                                audit=exclusion.render(), owner=exclusion.component.owner)
 
         context_parts = []
@@ -283,10 +304,15 @@ class DependencyChain(ChainSupport):
                       if self._lsp is not None and self._roots else None)
         code_ok = code_tools is not None and bool(code_tools.languages())
         if (self._client is not None and symbol.function and (engine_ok or lsp_ok or code_ok)
-                and not (bridge is not None and bridge.closes) and not symbol.not_distributed):
+                and not (bridge is not None and bridge.closes) and not symbol.not_distributed
+                and not not_loaded):
             engine = self._engine_name(dependency)
             asker = f"модель (запрос к {engine})"
-            investigation = codeql_agent.investigate(
+            # One investigation per package, version and vulnerable function: nineteen
+            # advisories of one HTTP client name the same `get` and `post` over and over.
+            investigation_key = (dependency.package or "", dependency.installed_version or "",
+                                 api_package, symbol.function, symbol.klass or "")
+            investigation, reused = self._once(self._investigations, investigation_key, lambda: codeql_agent.investigate(
                 self._client, advisory, symbol, api_package, engine=engine,
                 api_hint=self._api_hint(dependency, api_package),
                 ask_package=lambda: self._package_usage(
@@ -296,7 +322,11 @@ class DependencyChain(ChainSupport):
                 ask_sites=lambda sites: self._dataflow_for(
                     None, dependency, sites, record=codeql_calls, asked_by=asker),
                 lsp_tools=lsp_tools if lsp_ok else None, engine_available=engine_ok,
-                code_tools=code_tools, parallel=self._parallel_llm)
+                code_tools=code_tools, parallel=self._parallel_llm,
+                max_calls=self._max_tool_calls, placement=placement))
+            if reused:
+                codeql_calls.append(f"модель → исследование {symbol} для {dependency.package} взято из "
+                                    "другой находки этого пакета (тот же символ, та же версия)")
             codeql_calls.extend(f"модель → {line}" for line in investigation.lsp_log)
             if investigation.lsp_called:
                 problems.append("LSP нашёл вызовы уязвимой функции из кода проекта: "
@@ -324,6 +354,20 @@ class DependencyChain(ChainSupport):
             entry = self._resolver._last_resort(advisory, dependency.installed_version or "")
             if entry is not None:
                 search(entry.candidates, lead=True)
+
+        # The vulnerable function is often a private helper nobody calls by name. Ask
+        # the engine about every public entry that reaches it: a call of one of them
+        # is a call of the flaw, and zero calls of all of them is a checked absence.
+        if (found is not None and found.presence is presence_mod.SymbolPresence.ABSENT
+                and symbol.function and not symbol.not_distributed
+                and api_package == (dependency.package or "")
+                and not (bridge is not None and bridge.closes)):
+            entry_audit, hit = self._entry_point_check(dependency, symbol, advisory, record=codeql_calls)
+            if hit is not None:
+                found, matched_symbol, receiver_class, api_answer = hit
+                searched.append(f"{matched_symbol} (публичный вход к {symbol.function})")
+            elif entry_audit is not None and lsp_audit is None:
+                lsp_audit = entry_audit
 
         if not self._roots:
             problems.append("не задан ни один корень исходников — поиск не выполнялся")
@@ -379,7 +423,7 @@ class DependencyChain(ChainSupport):
         if bridge is not None and bridge.calls_it and bridge.symbols and walked_through:
             used_package = walked_through
         direct = placement.direct if placement is not None else None
-        settled_earlier = receiver_disproved or bool(dependency.dev_only)
+        settled_earlier = receiver_disproved or build_only
         package_used, package_used_detail = None, ""
         if self._roots and symbol.package_paths and not settled_earlier:
             package_used, package_used_detail = presence_mod.import_path_used(
@@ -397,9 +441,9 @@ class DependencyChain(ChainSupport):
             if receiver_disproved:
                 closure_kind, claim = "wrong_receiver", (
                     f"языковой сервер разрешил все вызовы {symbol} вне пакета {dependency.package}")
-            elif dependency.dev_only:
+            elif build_only:
                 closure_kind, claim = "not_shipped", (
-                    f"пакет {dependency.package} помечен в SBOM как нужный только для сборки или тестов")
+                    f"пакет {dependency.package} нужен только для сборки и тестов: {shipping.render()}")
             elif used is False and test_only and direct:
                 closure_kind, claim = "test_only", f"пакет {used_package} импортируется только в тестовом коде"
             elif reachability is None and dataflow is False and input_driven:
@@ -438,9 +482,17 @@ class DependencyChain(ChainSupport):
         else:
             route = "unknown"
 
+        entry_names: list[str] = []
+        # A transitive package is reached through its parent's call of a public
+        # entry; which entries reach the flaw is what the verdict is checked against.
+        transitive = placement is not None and not getattr(placement, "direct", False)
+        if symbol is not None and symbol.function and (transitive or (
+                matched_symbol and matched_symbol.rsplit("::", 1)[-1] != symbol.function)):
+            entry_names = [e.function for e in self._entry_points(dependency, symbol)]
+
         result = ChainResult(
             decide(symbol, found, reached, cwe=finding.cwe, closure_audit=closure_audit,
-                   dev_only=dependency.dev_only, used=used, used_detail=used_detail, test_only=test_only,
+                   dev_only=build_only, used=used, used_detail=used_detail, test_only=test_only,
                    package_used=package_used, package_used_detail=package_used_detail,
                    receiver_disproved=receiver_disproved, reachability=reachability,
                    call_site=call_site, graph_audit=graph_audit, dataflow=dataflow,
@@ -452,7 +504,10 @@ class DependencyChain(ChainSupport):
              dataflow=(dataflow if dataflow not in (None, False) else None),
              dataflow_status=dataflow_status, route=route, codeql_calls=codeql_calls,
              flaw=_flaw_of(advisory),
-             flaw_ru=(symbol.flaw_ru if symbol is not None else ""))
+             flaw_ru=(symbol.flaw_ru if symbol is not None else ""),
+             shipping=shipping, advisory=advisory, version_known=version_known,
+             call_evidence=_call_evidence(found, api_answer, investigation_used=bool(matched_symbol and api_answer)),
+             entry_points=entry_names)
         checked = closure_audit or graph_audit
         if result.decision.verdict is CVEVerdict.NOT_CALLED:
             checked = lsp_audit

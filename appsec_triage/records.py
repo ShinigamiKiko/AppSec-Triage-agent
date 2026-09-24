@@ -32,6 +32,7 @@ def dependency_closed(finding: Finding, result, sca, *, provider: str) -> Triage
         finding_id=finding.finding_id,
         cwe=finding.cwe,
         file_path=finding.code_context.file_path,
+        severity=finding.severity,
         rule_id=finding.rule_id,
         kind="dependency",
         start_line=finding.code_context.start_line,
@@ -55,12 +56,56 @@ def dependency_closed(finding: Finding, result, sca, *, provider: str) -> Triage
         trace=list(finding.trace),
     )
 
+def dependency_decided(finding: Finding, result, sca, decision, *, provider: str) -> TriageRecord:
+    """Decided by the dependency policy (sca/policy.py) on the chain's facts, without a verdict call.
+
+    `confirmed` here means "an affected version reaches the shipped artifact";
+    how urgent that is lives in `sca.priority`, not in the verdict label.
+    """
+    label = VerdictLabel(decision.label)
+    actual = decision.rule == "actual"
+    headline = result.decision.headline if result is not None else ""
+    reasons = list(result.decision.reasons[:2]) if result is not None else []
+    return TriageRecord(
+        finding_id=finding.finding_id,
+        cwe=finding.cwe,
+        file_path=finding.code_context.file_path,
+        severity=finding.severity,
+        rule_id=finding.rule_id,
+        kind="dependency",
+        start_line=finding.code_context.start_line,
+        fingerprint=reuse_mod.fingerprint(finding),
+        verdict=Verdict(
+            verdict=label,
+            evidence_class=(EvidenceClass.exploitable_dataflow if actual else
+                            EvidenceClass.insufficient_context if label is VerdictLabel.unknown else
+                            EvidenceClass.identifier_only),
+            confidence=0.9 if label is not VerdictLabel.unknown else 0.5,
+            confidence_band="high" if label is not VerdictLabel.unknown else "low",
+            confidence_rationale=(
+                "Decided by the dependency policy on checked facts — installed version against the "
+                f"advisory ranges, shipping and the chain outcome ({decision.rule}) — without a model call."),
+            cwe=finding.cwe,
+            reason=" ".join(x for x in [decision.reason, headline, *reasons] if x)[:1500],
+            missing_information=([decision.reason] if label is VerdictLabel.unknown else []),
+            blocking_question=(decision.reason if label is VerdictLabel.unknown else None),
+            requires_human_review=decision.needs_person,
+        ),
+        decided_by="policy",
+        provider=provider,
+        model=None,
+        sca=sca,
+        trace=list(finding.trace),
+    )
+
+
 def platform_handled(finding: Finding, entry, *, provider: str) -> TriageRecord:
     """Closed because the deployment owns the check, with the fact named."""
     return TriageRecord(
         finding_id=finding.finding_id,
         cwe=finding.cwe,
         file_path=finding.code_context.file_path,
+        severity=finding.severity,
         rule_id=finding.rule_id,
         kind="misconfiguration",
         start_line=finding.code_context.start_line,
@@ -109,6 +154,7 @@ def misconfiguration(finding: Finding, *, provider: str) -> TriageRecord:
         finding_id=finding.finding_id,
         cwe=finding.cwe,
         file_path=finding.code_context.file_path,
+        severity=finding.severity,
         rule_id=finding.rule_id,
         start_line=finding.code_context.start_line,
         fingerprint=reuse_mod.fingerprint(finding),
@@ -161,6 +207,7 @@ def secret(finding: Finding, *, provider: str) -> TriageRecord | None:
         finding_id=finding.finding_id,
         cwe=finding.cwe,
         file_path=finding.code_context.file_path,
+        severity=finding.severity,
         rule_id=finding.rule_id,
         start_line=finding.code_context.start_line,
         fingerprint=reuse_mod.fingerprint(finding),

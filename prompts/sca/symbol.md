@@ -10,8 +10,8 @@ vulnerable library version, given a known vulnerability.
 You get the advisory text, and usually the commit that fixed it. Name the
 **one** function or method whose own code was wrong in the *vulnerable* version.
 
-For npm, you may also receive function names extracted mechanically from the
-advisory or fix diff. Treat them as search candidates only. They are not proof
+You may also receive function names extracted mechanically from the advisory or
+fix diff. Treat them as search candidates only. They are not proof
 that the scanned application uses the package, calls the function, or is
 affected. This step extracts the library-side context; project reachability and
 the final verdict happen later.

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -57,6 +58,8 @@ class Advisory:
     cwe_ids: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     severity: str = ""
+    # critical / high / medium / low, from the database's own label or the CVSS score.
+    severity_level: str = ""
     problem: str = ""
     affected: list[dict] = field(default_factory=list)
 
@@ -109,6 +112,66 @@ def _severity_of(entry: dict) -> str:
         if value.startswith("CVSS:"):
             return value
     return ""
+
+
+_LABELS = {"critical": "critical", "high": "high", "moderate": "medium", "medium": "medium",
+           "low": "low", "none": "low"}
+
+_CVSS3_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+
+
+def _roundup(value: float) -> float:
+    scaled = round(value * 100000)
+    return scaled / 100000.0 if scaled % 10000 == 0 else (scaled // 10000 + 1) / 10.0
+
+
+def cvss3_base_score(vector: str) -> float | None:
+    """Base score of a CVSS 3.x vector, per the FIRST specification."""
+    if not vector.startswith("CVSS:3"):
+        return None
+    try:
+        metrics = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        scope_changed = metrics["S"] == "C"
+        pr = {"N": 0.85, "L": 0.68 if scope_changed else 0.62, "H": 0.5 if scope_changed else 0.27}[metrics["PR"]]
+        w = {k: _CVSS3_WEIGHTS[k][metrics[k]] for k in _CVSS3_WEIGHTS}
+    except (KeyError, ValueError):
+        return None
+    iss = 1 - (1 - w["C"]) * (1 - w["I"]) * (1 - w["A"])
+    impact = (7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15) if scope_changed else 6.42 * iss
+    exploitability = 8.22 * w["AV"] * w["AC"] * pr * w["UI"]
+    if impact <= 0:
+        return 0.0
+    raw = impact + exploitability
+    return _roundup(min(1.08 * raw, 10) if scope_changed else min(raw, 10))
+
+
+def level_from_score(score: float | None) -> str:
+    if score is None:
+        return ""
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    return "low"
+
+
+def _severity_level_of(entry: dict) -> str:
+    """critical/high/medium/low: the database's own label first, then the CVSS 3 score."""
+    labels = [(entry.get("database_specific") or {}).get("severity")]
+    labels += [(a.get("database_specific") or {}).get("severity") for a in entry.get("affected") or []]
+    for label in labels:
+        if isinstance(label, str) and label.strip().lower() in _LABELS:
+            return _LABELS[label.strip().lower()]
+    return level_from_score(cvss3_base_score(_severity_of(entry)))
 
 
 def _refs(entry: dict) -> list[tuple[str, str]]:
@@ -252,8 +315,23 @@ def _fixed_versions_of(entry: dict) -> list[str]:
     return out
 
 
+_OSV_MEMO: dict[tuple[str, str, str], list[dict]] = {}
+_OSV_MEMO_LOCK = threading.Lock()
+
+
 def from_osv(package: str, ecosystem: str, version: str) -> list[Advisory]:
-    """Every advisory affecting this exact version."""
+    """Every advisory affecting this exact version.
+
+    Memoised per (package, ecosystem, version) for the run: nineteen advisories
+    of one package used to be nineteen identical queries.
+    """
+    key = (package, (ecosystem or "").lower(), version)
+    with _OSV_MEMO_LOCK:
+        cached = _OSV_MEMO.get(key)
+    if cached is not None:
+        out = [_advisory_from_osv(vuln, package, ecosystem) for vuln in cached]
+        out.sort(key=lambda a: not a.symbols)
+        return out
     osv_name = osv_ecosystem(ecosystem)
     if not (package and osv_name and version):
         return []
@@ -263,20 +341,103 @@ def from_osv(package: str, ecosystem: str, version: str) -> list[Advisory]:
                      {"Content-Type": "application/json"})
     if not data:
         return []
-    out = []
-    for vuln in data.get("vulns") or []:
-        out.append(Advisory(
-            advisory_id=vuln.get("id", ""), package=package, ecosystem=ecosystem,
-            summary=(vuln.get("summary") or "")[:300],
-            details=(vuln.get("details") or "")[:8000],
-            aliases=list(vuln.get("aliases") or []),
-            fix_refs=_rank_refs(_refs(vuln)), symbols=_symbols_of(vuln),
-            fixed_versions=_fixed_versions_of(vuln), affected=_affected_of(vuln),
-            import_paths=_import_paths_of(vuln), cwe_ids=_cwes_of(vuln),
-            sources=["osv"], severity=_severity_of(vuln),
-        ))
+    vulns = list(data.get("vulns") or [])
+    with _OSV_MEMO_LOCK:
+        _OSV_MEMO[key] = vulns
+    out = [_advisory_from_osv(vuln, package, ecosystem) for vuln in vulns]
     out.sort(key=lambda a: not a.symbols)
     return out
+
+
+def _advisory_from_osv(vuln: dict, package: str, ecosystem: str) -> Advisory:
+    return Advisory(
+        advisory_id=vuln.get("id", ""), package=package, ecosystem=ecosystem,
+        summary=(vuln.get("summary") or "")[:300],
+        details=(vuln.get("details") or "")[:8000],
+        aliases=list(vuln.get("aliases") or []),
+        fix_refs=_rank_refs(_refs(vuln)), symbols=_symbols_of(vuln),
+        fixed_versions=_fixed_versions_of(vuln), affected=_affected_of(vuln),
+        import_paths=_import_paths_of(vuln), cwe_ids=_cwes_of(vuln),
+        sources=["osv"], severity=_severity_of(vuln),
+        severity_level=_severity_level_of(vuln),
+    )
+
+
+_BATCH = 1000
+
+
+def from_osv_batch(items: list[tuple[str, str, str]], *, workers: int = 8
+                   ) -> dict[tuple[str, str, str], list[Advisory] | DatabaseUnavailable]:
+    """Advisories for many (package, ecosystem, version) at once.
+
+    `/v1/querybatch` answers up to a thousand packages per request with the ids
+    only; the full records are then fetched once per id, in parallel. 890
+    packages used to be 890 sequential requests — about seven minutes.
+    A package whose batch answer is paged or missing is asked on its own.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: dict[tuple[str, str, str], list[Advisory] | DatabaseUnavailable] = {}
+    queries: list[tuple[tuple[str, str, str], dict]] = []
+    for package, ecosystem, version in items:
+        osv_name = osv_ecosystem(ecosystem)
+        if not (package and osv_name and version):
+            results[(package, ecosystem, version)] = []
+            continue
+        queries.append(((package, ecosystem, version),
+                        {"package": {"name": package, "ecosystem": osv_name}, "version": version}))
+
+    ids_for: dict[tuple[str, str, str], list[str]] = {}
+    single: list[tuple[str, str, str]] = []
+    for start in range(0, len(queries), _BATCH):
+        chunk = queries[start:start + _BATCH]
+        payload = json.dumps({"queries": [q for _, q in chunk]}).encode()
+        data = _get_json("https://api.osv.dev/v1/querybatch", payload,
+                         {"Content-Type": "application/json"})
+        answers = (data or {}).get("results") or []
+        if len(answers) != len(chunk):
+            single.extend(key for key, _ in chunk)
+            continue
+        for (key, _), answer in zip(chunk, answers):
+            if (answer or {}).get("next_page_token"):
+                single.append(key)
+                continue
+            ids_for[key] = [v.get("id", "") for v in (answer or {}).get("vulns") or [] if v.get("id")]
+
+    wanted = sorted({vid for ids in ids_for.values() for vid in ids})
+    records: dict[str, dict | DatabaseUnavailable] = {}
+
+    def fetch(vid: str):
+        try:
+            return vid, _get_json(f"https://api.osv.dev/v1/vulns/{vid}")
+        except DatabaseUnavailable as exc:
+            return vid, exc
+
+    def ask_alone(key: tuple[str, str, str]):
+        try:
+            return key, from_osv(*key)
+        except DatabaseUnavailable as exc:
+            return key, exc
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for vid, record in pool.map(fetch, wanted):
+            records[vid] = record
+        for key, answer in pool.map(ask_alone, single):
+            results[key] = answer
+
+    for key, ids in ids_for.items():
+        package, ecosystem, _ = key
+        failed = next((records[v] for v in ids if isinstance(records.get(v), DatabaseUnavailable)), None)
+        if failed is not None:
+            results[key] = failed
+            continue
+        vulns = [records[v] for v in ids if isinstance(records.get(v), dict)]
+        with _OSV_MEMO_LOCK:
+            _OSV_MEMO[(package, (ecosystem or "").lower(), key[2])] = vulns
+        found = [_advisory_from_osv(v, package, ecosystem) for v in vulns]
+        found.sort(key=lambda a: not a.symbols)
+        results[key] = found
+    return results
 
 
 def from_ghsa(advisory_id: str) -> Advisory | None:
@@ -297,6 +458,7 @@ def from_ghsa(advisory_id: str) -> Advisory | None:
         fixed_versions=_fixed_versions_of(data), affected=_affected_of(data),
         import_paths=_import_paths_of(data), cwe_ids=_cwes_of(data),
         sources=["ghsa"], severity=_severity_of(data),
+        severity_level=_severity_level_of(data),
     )
 
 
@@ -334,6 +496,7 @@ def collect(
     tried: list[str] = []
     failures: list[str] = []
 
+    wanted = advisory_id.strip().upper()
     candidates: list[Advisory] = []
     if package and version:
         try:
@@ -342,28 +505,33 @@ def collect(
             found = []
             failures.append(f"osv: {exc}")
         tried.append("osv")
-        if advisory_id:
-            wanted = advisory_id.strip().upper()
-            found = [a for a in found
-                     if wanted in {a.advisory_id.upper(), *(x.upper() for x in a.aliases)}]
-        candidates.extend(found[:1] if advisory_id else found)
+        if wanted:
+            # Two advisories can list each other as aliases — an "incomplete fix"
+            # follow-up and the original do. The record whose own id was asked for
+            # is the one to read; an alias match is only the fallback.
+            exact = [a for a in found if a.advisory_id.upper() == wanted]
+            found = exact or [a for a in found if wanted in {x.upper() for x in a.aliases}]
+        candidates.extend(found[:1] if wanted else found)
 
-    ids = {advisory_id, *(a.advisory_id for a in candidates)}
-    ids |= {alias for a in candidates for alias in a.aliases}
-    for ident in [i for i in ids if i]:
-        if ident.upper().startswith("GHSA-"):
-            tried.append("ghsa")
-            try:
-                entry = from_ghsa(ident)
-            except DatabaseUnavailable as exc:
-                failures.append(f"ghsa: {exc}")
-                break
-            if entry:
-                candidates.append(entry)
-                break
+    # Look further only under this advisory's own ids. A GHSA alias may be a
+    # different advisory, and its text would win the "longest text" merge below.
+    own = [wanted] if wanted else []
+    own += [a.advisory_id.upper() for a in candidates if a.advisory_id.upper() not in own]
+    cves = [i for i in own if i.startswith("CVE-")]
+    cves += sorted({x.upper() for a in candidates for x in a.aliases if x.upper().startswith("CVE-")} - set(cves))
+    for ident in [i for i in own if i.startswith("GHSA-")]:
+        tried.append("ghsa")
+        try:
+            entry = from_ghsa(ident)
+        except DatabaseUnavailable as exc:
+            failures.append(f"ghsa: {exc}")
+            break
+        if entry:
+            candidates.append(entry)
+            break
 
     if not any(c.details for c in candidates):
-        for ident in [i for i in ids if i and i.upper().startswith("CVE-")]:
+        for ident in cves:
             tried.append("nvd")
             try:
                 entry = from_nvd(ident, nvd_api_key)
@@ -384,6 +552,7 @@ def collect(
             if alias not in merged.aliases:
                 merged.aliases.append(alias)
         merged.severity = merged.severity or entry.severity
+        merged.severity_level = merged.severity_level or entry.severity_level
         for symbol in entry.symbols:
             if symbol not in merged.symbols:
                 merged.symbols.append(symbol)
@@ -404,7 +573,8 @@ def collect(
         merged.sources.extend(s for s in entry.sources if s not in merged.sources)
 
     if ecosystem.lower() in {"npm", "node", "javascript", "yarn"} and not merged.fix_refs:
-        for ident in [merged.advisory_id, *merged.aliases]:
+        # the fix of an aliased GHSA may be the fix of a different flaw
+        for ident in [merged.advisory_id, *(a for a in merged.aliases if not a.upper().startswith("GHSA-"))]:
             for ref in _github_fix_refs(ident):
                 if ref not in merged.fix_refs:
                     merged.fix_refs.append(ref)
@@ -417,4 +587,6 @@ def collect(
         merged.problem = (f"базы ответили, но по {advisory_id or package} "
                           f"нет ни текста, ни ссылки на фикс "
                           f"(опрошены: {', '.join(tried) or 'нет'})")
+    if not merged.severity_level:
+        merged.severity_level = level_from_score(cvss3_base_score(merged.severity))
     return merged

@@ -96,7 +96,6 @@ def _by_configuration(
     return None
 
 
-SYSTEM = registry.step("receiver")
 
 _SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -164,7 +163,7 @@ def _by_model(
             continue
         material = _context(root, hit, klass, package, wiring)
         try:
-            raw = client.complete(SYSTEM, material, json_schema=_SCHEMA).text
+            raw = client.complete(registry.step("receiver"), material, json_schema=_SCHEMA).text
             answer = json.loads(raw)
         except Exception as exc:  # noqa: BLE001 - one failed call, not the run
             log.debug("receiver question failed at %s: %s", hit, exc)

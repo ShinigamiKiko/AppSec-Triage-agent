@@ -14,7 +14,6 @@ from .verdict import CVEDecision, CVEVerdict
 
 log = logging.getLogger(__name__)
 
-SYSTEM = registry.step("component")
 
 _SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -137,7 +136,7 @@ def classify(advisory, deployment, client, roots) -> Exclusion | None:
         *(f"- {component.id}: {component.describe}" for component in found),
     ])
     try:
-        answer = json.loads(client.complete(SYSTEM, material, json_schema=_SCHEMA).text)
+        answer = json.loads(client.complete(registry.step("component"), material, json_schema=_SCHEMA).text)
     except Exception as exc:  # noqa: BLE001 - a failed question leaves the finding to the normal chain
         log.warning("component question failed for %s: %s", advisory.advisory_id, exc)
         return None

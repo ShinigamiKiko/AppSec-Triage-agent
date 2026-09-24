@@ -35,6 +35,18 @@ def _is_a_version(value: str) -> bool:
     return bool(value) and bool(_VERSION.match(value))
 
 
+def _severity(level: str) -> Severity:
+    """The advisory's own severity; `medium` only when the database gives none.
+
+    Every dependency finding used to be `medium`, so the high/critical
+    escalation and the priority order never saw a difference between them.
+    """
+    try:
+        return Severity(level) if level else Severity.medium
+    except ValueError:
+        return Severity.medium
+
+
 def _one_per_flaw(found: list) -> list:
     """One finding per vulnerability, not one per database that described it."""
     groups: dict[str, list] = {}
@@ -74,6 +86,7 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
     log.info("SBOM: %d components at %s", len(parts), root)
 
     seen: set[tuple[str, str]] = set()
+    wanted: list[dict] = []
     for item in parts.values():
         name, version = item["name"], item["version"]
         if not version or (name, version) in seen:
@@ -89,11 +102,25 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
             break
         seen.add((name, version))
         out.packages_checked += 1
+        wanted.append(item)
 
-        try:
-            found = adv.from_osv(name, item["ecosystem"], version)
-        except adv.DatabaseUnavailable as exc:
-            out.problems.append(f"{name}@{version}: {exc}")
+    try:
+        answers = adv.from_osv_batch([(i["name"], i["ecosystem"], i["version"]) for i in wanted])
+    except adv.DatabaseUnavailable as exc:
+        log.warning("OSV querybatch недоступен (%s) — опрос по одному пакету", exc)
+        answers = {}
+        for i in wanted:
+            key = (i["name"], i["ecosystem"], i["version"])
+            try:
+                answers[key] = adv.from_osv(*key)
+            except adv.DatabaseUnavailable as single_exc:
+                answers[key] = single_exc
+
+    for item in wanted:
+        name, version = item["name"], item["version"]
+        found = answers.get((name, item["ecosystem"], version), [])
+        if isinstance(found, adv.DatabaseUnavailable):
+            out.problems.append(f"{name}@{version}: {found}")
             continue
 
         for entry in _one_per_flaw(found):
@@ -102,7 +129,7 @@ def discover(root: Path | str, *, sbom_path: Path | None = None,
                 scanner="cdxgen+osv",
                 rule_id=entry.advisory_id,
                 title=(entry.summary or entry.advisory_id)[:200],
-                severity=Severity.medium,
+                severity=_severity(entry.severity_level),
                 code_context=CodeContext(file_path=_manifest_for(item["ecosystem"])),
                 dependency=DependencyInfo(
                     package=name,

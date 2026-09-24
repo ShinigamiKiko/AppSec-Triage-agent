@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import logging
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -67,15 +68,72 @@ select sink.getNode(), source, sink, "reaches " + label
 
 
 _IMPORTS_QUERY = """/**
- * @name Imports of a dependency package
+ * @name Imports of dependency packages
  * @kind table
  * @id wolfee/sca-api-imports
  */
 import javascript
 
-from DataFlow::ModuleImportNode n, string path
-where path = n.getPath() and (path = @PACKAGE@ or path.prefix(@LENGTH@) = @PREFIX@)
-select n.getFile().getRelativePath() as file, n.getStartLine() as line
+external predicate wantedPackage(string name);
+
+from DataFlow::ModuleImportNode n, string path, string pkg
+where
+  wantedPackage(pkg) and path = n.getPath() and
+  (path = pkg or path.prefix(pkg.length() + 1) = pkg + "/")
+select n.getFile().getRelativePath() as file, n.getStartLine() as line, pkg
+"""
+
+
+# The functions asked about arrive as rows of `target(package, function, class, label)`,
+# so the query text — and therefore its compiled form — is the same for every question.
+_JS_CALL_PREDICATE = """external predicate target(string pkg, string fn, string klass, string label);
+
+predicate vulnerableCall(DataFlow::CallNode c, string label) {
+  exists(string pkg, string fn, string klass | target(pkg, fn, klass, label) |
+    klass = "" and
+    (
+      c = API::moduleImport(pkg).getMember(fn).getACall()
+      or
+      // Per-method packages: `require('lodash/template')`.
+      c = API::moduleImport(pkg + "/" + fn).getACall()
+    )
+    or
+    klass = "@default" and
+    (
+      // The package is the function: `module.exports = serveStatic`, called as
+      // `serveStatic(...)` after `require('serve-static')`.
+      c = API::moduleImport(pkg).getACall()
+      or
+      // The same through a default import: `import serveStatic from 'serve-static'`.
+      c = API::moduleImport(pkg).getMember("default").getACall()
+    )
+    or
+    klass != "" and klass != "@default" and
+    (
+      c = API::moduleImport(pkg).getMember(klass).getInstance().getMember(fn).getACall()
+      or
+      c = API::moduleImport(pkg).getMember(klass).getMember(fn).getACall()
+    )
+  )
+}
+"""
+
+_GO_CALL_PREDICATE = """external predicate target(string pkg, string fn, string klass, string label);
+
+predicate vulnerableCall(DataFlow::CallNode c, string label) {
+  exists(string pkg, string fn, string klass | target(pkg, fn, klass, label) |
+    klass != "" and
+    exists(Method m, string p |
+      m = c.getTarget() and m.hasQualifiedName(p, klass, fn) and inModule(p, pkg)
+    )
+    or
+    klass = "" and
+    exists(Function f, string p |
+      f = c.getTarget() and not f instanceof Method and
+      f.hasQualifiedName(p, fn) and inModule(p, pkg)
+    )
+  )
+}
 """
 
 
@@ -96,25 +154,120 @@ def _ql_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "") + '"'
 
 
-def _javascript_call_predicate(targets: list[Target]) -> str:
-    """`vulnerableCall(c, label)` for every shape the package is imported in."""
-    clauses = []
+DEFAULT_EXPORT = "@default"
+_JS_NAME = r"[A-Za-z_$][\w$]*"
+_REEXPORT = re.compile(r"""\bmodule\s*\.\s*exports\s*=\s*require\s*\(\s*['"](\.{1,2}/[^'"]+)['"]\s*\)""")
+_ESM_DEFAULT = re.compile(
+    rf"\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*|class\s+)?({_JS_NAME})|"
+    rf"\bexports\s*\.\s*default\s*=\s*({_JS_NAME})\s*(?:;|$)|"
+    rf"\bexport\s*\{{[^}}]*?\b({_JS_NAME})\s+as\s+default\b", re.MULTILINE)
+
+
+def _entry_files(directory: Path) -> list[Path]:
+    """The files `require(pkg)` and `import … from pkg` resolve to."""
+    try:
+        manifest = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    wanted: list[str] = []
+    exports = manifest.get("exports")
+    if isinstance(exports, dict):
+        exports = exports.get(".", exports)
+    if isinstance(exports, str):
+        wanted.append(exports)
+    elif isinstance(exports, dict):
+        for condition in ("require", "node", "import", "default"):
+            value = exports.get(condition)
+            if isinstance(value, dict):
+                value = value.get("default")
+            if isinstance(value, str):
+                wanted.append(value)
+    for key in ("main", "module"):
+        if isinstance(manifest.get(key), str):
+            wanted.append(manifest[key])
+    wanted.append("index.js")
+    found: list[Path] = []
+    for rel in wanted:
+        for candidate in (directory / rel, directory / f"{rel}.js", directory / rel / "index.js"):
+            if candidate.is_file() and candidate not in found:
+                found.append(candidate)
+                break
+    return found
+
+
+def _package_as_name(package: str) -> str:
+    """`serve-static` -> `serveStatic`, `@scope/cookie-parser` -> `cookieParser`."""
+    parts = [p for p in re.split(r"[-_.]", package.rsplit("/", 1)[-1]) if p]
+    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:]) if parts else ""
+
+
+def default_exports(root: Path | str, package: str) -> set[str] | None:
+    """Names the package's entry file exports as the module itself; None when not installed.
+
+    Calling such a package calls that function: `serveStatic(...)` after
+    `import serveStatic from 'serve-static'` is a call of the module, not of a member
+    named `serveStatic`, and an API-graph query for the member never sees it.
+    """
+    from . import declarations as decl
+    from . import registries
+
+    directory = registries.locate(Path(root), "npm", package, "")
+    if directory is None:
+        return None
+    names: set[str] = set()
+    files = _entry_files(directory)
+    seen: set[Path] = set()
+    while files:
+        entry = files.pop(0)
+        if entry in seen or len(seen) > 4:
+            continue
+        seen.add(entry)
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names |= decl.default_export_names(text)
+        names |= {name for match in _ESM_DEFAULT.finditer(text) for name in match.groups() if name}
+        # `module.exports = require('./lib/express')`: the export lives one file further.
+        for rel in _REEXPORT.findall(text):
+            target = (entry.parent / rel).resolve()
+            for candidate in (target, target.with_suffix(".js"), target / "index.js"):
+                if candidate.is_file():
+                    files.append(candidate)
+                    break
+    return names
+
+
+def target_rows(targets: list[Target], language: str = "javascript",
+                defaults: dict[str, set[str] | None] | None = None) -> list[tuple[str, str, str, str]]:
+    """Rows for the `target` external predicate.
+
+    A function that is the package's default export is asked a second time in the
+    form the application calls it — the module itself — under the same label.
+    Where the package is not installed, its name is the only hint: `serve-static`
+    exports `serveStatic` by the convention nearly every such package follows.
+    """
+    rows = []
     for target in targets:
-        package, function = _ql_string(target.package), _ql_string(target.function)
-        if target.klass:
-            klass = f"API::moduleImport({package}).getMember({_ql_string(target.klass)})"
-            shapes = [f"{klass}.getInstance().getMember({function}).getACall()",
-                      f"{klass}.getMember({function}).getACall()"]
-        else:
-            shapes = [
-                f"API::moduleImport({package}).getMember({function}).getACall()",
-                # Per-method packages: `require('lodash/template')`.
-                f"API::moduleImport({_ql_string(target.package + '/' + target.function)}).getACall()",
-            ]
-        alternatives = "\n    or ".join(f"c = {shape}" for shape in shapes)
-        clauses.append(f"  label = {_ql_string(target.label)} and (\n    {alternatives}\n  )")
-    return ("predicate vulnerableCall(DataFlow::CallNode c, string label) {\n"
-            + "\n  or\n".join(clauses) + "\n}\n")
+        klass = target.klass
+        if language == "go":
+            klass = klass.lstrip("*").split(".")[-1]
+        rows.append((target.package, target.function, klass, target.label))
+        if language != "javascript" or klass or defaults is None:
+            continue
+        # Calling the module calls its default export whatever it is called inside;
+        # the package name is how applications and advisories name it.
+        known = defaults.get(target.package) or set()
+        is_default = (target.function in known
+                      or target.function == _package_as_name(target.package))
+        if is_default:
+            rows.append((target.package, target.function, DEFAULT_EXPORT, target.label))
+    return rows
+
+
+def call_predicate(targets: list[Target] | None = None, language: str = "javascript") -> str:
+    """`vulnerableCall(c, label)`, driven by the `target` rows rather than inlined names."""
+    return _GO_CALL_PREDICATE if language == "go" else _JS_CALL_PREDICATE
 
 
 _GO_MODULE_PREDICATE = """bindingset[path, mod]
@@ -180,9 +333,11 @@ _GO_IMPORTS_QUERY = """/**
 import go
 
 """ + _GO_MODULE_PREDICATE + """
-from ImportSpec s
-where inModule(s.getPath(), @PACKAGE@)
-select s.getFile().getRelativePath() as file, s.getLocation().getStartLine() as line
+external predicate wantedPackage(string name);
+
+from ImportSpec s, string pkg
+where wantedPackage(pkg) and inModule(s.getPath(), pkg)
+select s.getFile().getRelativePath() as file, s.getLocation().getStartLine() as line, pkg
 """
 
 
@@ -196,34 +351,6 @@ def database_language(database: Path | str) -> str:
         return ""
     match = re.search(r'^primaryLanguage:\s*"?([A-Za-z]+)"?\s*$', text, re.M)
     return match.group(1).lower() if match else ""
-
-
-def _go_call_predicate(targets: list[Target]) -> str:
-    """`vulnerableCall(c, label)` for Go: a package function, or a method of a named type."""
-    clauses = []
-    for target in targets:
-        package, function = _ql_string(target.package), _ql_string(target.function)
-        klass = target.klass.lstrip("*").split(".")[-1]
-        if klass:
-            body = ("exists(Method m, string p |\n"
-                    "      m = c.getTarget() and\n"
-                    f"      m.hasQualifiedName(p, {_ql_string(klass)}, {function}) and inModule(p, {package})\n"
-                    "    )")
-        else:
-            body = ("exists(Function f, string p |\n"
-                    "      f = c.getTarget() and not f instanceof Method and\n"
-                    f"      f.hasQualifiedName(p, {function}) and inModule(p, {package})\n"
-                    "    )")
-        clauses.append(f"  label = {_ql_string(target.label)} and\n    {body}")
-    return ("predicate vulnerableCall(DataFlow::CallNode c, string label) {\n"
-            + "\n  or\n".join(clauses) + "\n}\n")
-
-
-def call_predicate(targets: list[Target], language: str = "javascript") -> str:
-    """`vulnerableCall(c, label)` in this language's way of naming a package member."""
-    if language == "go":
-        return _go_call_predicate(targets)
-    return _javascript_call_predicate(targets)
 
 
 def _queries(language: str) -> tuple[str, str]:
@@ -345,13 +472,84 @@ class ImportAnswer:
         return [hit for hit in self.sites if hit.in_tests]
 
 
-def imports_query(package: str, language: str = "javascript") -> str:
-    """The package itself and any subpath of it (`lodash/template`), nothing that merely starts alike."""
-    if language == "go":
-        return _GO_IMPORTS_QUERY.replace("@PACKAGE@", _ql_string(package))
-    prefix = package + "/"
-    return (_IMPORTS_QUERY.replace("@PACKAGE@", _ql_string(package))
-            .replace("@PREFIX@", _ql_string(prefix)).replace("@LENGTH@", str(len(prefix))))
+def imports_query(language: str = "javascript") -> str:
+    """The package itself and any subpath of it (`lodash/template`), for every wanted package."""
+    return _GO_IMPORTS_QUERY if language == "go" else _IMPORTS_QUERY
+
+
+def _source_prefix(database: Path) -> list[str]:
+    """`--source-location-prefix` so interpreted paths come out relative, as `analyze` gave them."""
+    import re
+
+    try:
+        text = (database / "codeql-database.yml").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    match = re.search(r'^sourceLocationPrefix:\s*"?([^"\n]+?)"?\s*$', text, re.M)
+    if not match:
+        return []
+    archive = next((c for c in (database / "src.zip", database / "src") if c.exists()), None)
+    if archive is None:
+        return []
+    return [f"--source-archive={archive}", f"--source-location-prefix={match.group(1)}"]
+
+
+def _database_problem(database: Path) -> tuple[str, str]:
+    """(language, problem) for a database about to be queried."""
+    if not (database / "codeql-database.yml").is_file():
+        return "", f"база CodeQL не найдена или недостроена: {database}"
+    language = database_language(database)
+    if language not in SUPPORTED:
+        return language, f"запросы для языка {language or 'неизвестен'} не написаны"
+    return language, ""
+
+
+def run_imports_many(database: Path | str, packages: list[str], root: Path | str, *,
+                     binary: str = "codeql", timeout_s: float = _TIMEOUT_S) -> dict[str, ImportAnswer]:
+    """Every import of every one of `packages`, in one query.
+
+    One question per package was 43 compilations and 43 evaluations at the
+    start of a 43-package run — 12 to 23 minutes before the first verdict.
+    """
+    from .codeql_runner import query_file, write_external
+
+    wanted = sorted({p for p in packages if p})
+    if not wanted:
+        return {}
+    database = Path(database)
+    language, problem = _database_problem(database)
+    if problem:
+        return {p: ImportAnswer(problem=problem) for p in wanted}
+    query = query_file(language, imports_query(language))
+    with tempfile.TemporaryDirectory(prefix="sca-imports-") as work:
+        work_dir = Path(work)
+        rows = write_external(work_dir, "wantedPackage", [(p,) for p in wanted])
+        results = work_dir / "imports.bqrs"
+        _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
+                              f"--external=wantedPackage={rows}",
+                              f"--output={results}", str(query)], timeout_s, "поиск импортов")
+        if problem:
+            return {p: ImportAnswer(problem=problem) for p in wanted}
+        decoded, problem = _codeql([binary, "bqrs", "decode", "--format=csv", "--no-titles",
+                                    str(results)], 180, "чтение импортов")
+        if problem:
+            return {p: ImportAnswer(problem=problem) for p in wanted}
+
+    answers = {p: ImportAnswer() for p in wanted}
+    seen: set[tuple[str, str, int]] = set()
+    for row in csv.reader(io.StringIO(decoded)):
+        if len(row) < 3 or row[2] not in answers:
+            continue
+        try:
+            site = (row[2], row[0], int(row[1]))
+        except ValueError:
+            continue
+        if site not in seen:
+            seen.add(site)
+            answers[row[2]].sites.append(_hit(Path(root), row[0], int(row[1])))
+    log.info("codeql imports: %d package(s) in one query, %d imported", len(wanted),
+             sum(1 for a in answers.values() if a.sites))
+    return answers
 
 
 def run_imports(database: Path | str, package: str, root: Path | str, *,
@@ -359,69 +557,36 @@ def run_imports(database: Path | str, package: str, root: Path | str, *,
     """Every import of `package` in this database, as positions in the project."""
     if not package:
         return ImportAnswer(problem="пакет не указан")
-    database = Path(database)
-    if not (database / "codeql-database.yml").is_file():
-        return ImportAnswer(problem=f"база CodeQL не найдена или недостроена: {database}")
-    language = database_language(database)
-    if language not in SUPPORTED:
-        return ImportAnswer(problem=f"запрос импортов для языка {language or 'неизвестен'} не написан")
-    with tempfile.TemporaryDirectory(prefix="sca-imports-") as work:
-        pack = Path(work)
-        (pack / "qlpack.yml").write_text(
-            "name: wolfee/sca-imports\nversion: 0.0.1\n"
-            f"dependencies:\n  codeql/{language}-all: \"*\"\n", encoding="utf-8")
-        (pack / "imports.ql").write_text(imports_query(package, language), encoding="utf-8")
-        results = pack / "imports.bqrs"
-        _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
-                              f"--output={results}", str(pack / "imports.ql")], timeout_s, "поиск импортов")
-        if problem:
-            return ImportAnswer(problem=problem)
-        decoded, problem = _codeql([binary, "bqrs", "decode", "--format=csv", "--no-titles",
-                                    str(results)], 180, "чтение импортов")
-        if problem:
-            return ImportAnswer(problem=problem)
-
-    answer = ImportAnswer()
-    seen: set[tuple[str, int]] = set()
-    for row in csv.reader(io.StringIO(decoded)):
-        if len(row) < 2:
-            continue
-        try:
-            site = (row[0], int(row[1]))
-        except ValueError:
-            continue
-        if site not in seen:
-            seen.add(site)
-            answer.sites.append(_hit(Path(root), *site))
-    return answer
+    return run_imports_many(database, [package], root, binary=binary, timeout_s=timeout_s)[package]
 
 
 def run(database: Path | str, targets: list[Target], root: Path | str, *,
         binary: str = "codeql", timeout_s: float = _TIMEOUT_S) -> ApiAnswer:
     """Find the calls of these functions and the paths from user input into them."""
+    from .codeql_runner import query_file, write_external
+
     targets = [t for t in targets if t.package and t.function]
     if not targets:
         return ApiAnswer(problem="нет функций для поиска")
     database = Path(database)
-    if not (database / "codeql-database.yml").is_file():
-        return ApiAnswer(problem=f"база CodeQL не найдена или недостроена: {database}")
-
-    language = database_language(database)
-    if language not in SUPPORTED:
-        return ApiAnswer(problem=f"запросы по функциям пакета для языка {language or 'неизвестен'} не написаны")
+    language, problem = _database_problem(database)
+    if problem:
+        return ApiAnswer(problem=problem)
     calls = call_predicate(targets, language)
     calls_query, path_query = _queries(language)
+    calls_file = query_file(language, calls_query.replace("@CALLS@", calls))
+    reach_file = query_file(language, path_query.replace("@CALLS@", calls))
     with tempfile.TemporaryDirectory(prefix="sca-api-") as work:
-        pack = Path(work)
-        (pack / "qlpack.yml").write_text(
-            "name: wolfee/sca-api\nversion: 0.0.1\n"
-            f"dependencies:\n  codeql/{language}-all: \"*\"\n", encoding="utf-8")
-        (pack / "calls.ql").write_text(calls_query.replace("@CALLS@", calls), encoding="utf-8")
-        (pack / "reach.ql").write_text(path_query.replace("@CALLS@", calls), encoding="utf-8")
-        results, sarif = pack / "calls.bqrs", pack / "reach.sarif"
+        work_dir = Path(work)
+        defaults = ({package: default_exports(root, package)
+                     for package in {t.package for t in targets if not t.klass}}
+                    if language == "javascript" else None)
+        rows = write_external(work_dir, "target", target_rows(targets, language, defaults))
+        external = f"--external=target={rows}"
+        results, reach_bqrs, sarif = work_dir / "calls.bqrs", work_dir / "reach.bqrs", work_dir / "reach.sarif"
 
         _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
-                              f"--output={results}", str(pack / "calls.ql")], timeout_s, "поиск вызовов")
+                              external, f"--output={results}", str(calls_file)], timeout_s, "поиск вызовов")
         if problem:
             return ApiAnswer(problem=problem)
         decoded, problem = _codeql([binary, "bqrs", "decode", "--format=csv", "--no-titles",
@@ -440,10 +605,17 @@ def run(database: Path | str, targets: list[Target], root: Path | str, *,
                 continue
 
         if answer.calls:
-            _, problem = _codeql([binary, "database", "analyze",
-                                  str(database), str(pack / "reach.ql"), *query_flags(),
-                                  "--format=sarif-latest", f"--output={sarif}", "--rerun"],
+            # `query run` + `bqrs interpret` is what `database analyze` does inside,
+            # but it takes the external predicate and keeps the compiled query cached.
+            _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
+                                  external, f"--output={reach_bqrs}", str(reach_file)],
                                  timeout_s, "поиск пути")
+            if problem:
+                return ApiAnswer(problem=problem)
+            _, problem = _codeql([binary, "bqrs", "interpret", "--format=sarif-latest",
+                                  "-t=kind=path-problem", f"-t=id=wolfee/sca-api-reach-{language}",
+                                  *_source_prefix(database),
+                                  f"--output={sarif}", str(reach_bqrs)], 300, "чтение пути")
             if problem:
                 return ApiAnswer(problem=problem)
             try:

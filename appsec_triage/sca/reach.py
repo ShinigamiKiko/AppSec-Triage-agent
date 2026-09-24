@@ -187,7 +187,6 @@ def _taint_into(
     return "", "no matching CodeQL/Psalm source-to-sink trace supplied; coverage unknown", ""
 
 
-TAINT_SYSTEM = registry.step("taint")
 
 _TAINT_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -226,7 +225,7 @@ def _taint_by_model(hits, root: Path, client, symbol: str) -> tuple[str, str, st
         ])
         try:
             answer = json.loads(
-                client.complete(TAINT_SYSTEM, material, json_schema=_TAINT_SCHEMA).text)
+                client.complete(registry.step("taint"), material, json_schema=_TAINT_SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - one failed call, not the run
             log.debug("taint question failed at %s: %s", hit, exc)
             continue

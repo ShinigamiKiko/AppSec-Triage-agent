@@ -44,10 +44,10 @@ class DependencyIndex:
         key = package.strip().lower()
         if not self.usable:
             return None
-        if key in self.dev_only:
-            return True
         if key in self.production:
             return False
+        if key in self.dev_only:
+            return True
         return None
 
 
@@ -75,6 +75,20 @@ def _package_lock(path: Path, index: DependencyIndex) -> None:
             (index.dev_only if meta.get("dev") else index.production).add(name.lower())
 
 
+def _manifests(path: Path, index: DependencyIndex) -> None:
+    """What the project itself declares — the only source when the lock file is
+    one nothing here parses (yarn.lock, pnpm-lock.yaml). It covers direct
+    dependencies only, and a package named in both halves counts as shipped."""
+    from ..sca.graph import declared_dependencies
+
+    declared = declared_dependencies(path)
+    if declared is None:
+        return
+    prod, dev = declared
+    index.production.update(prod)
+    index.dev_only.update(dev - prod)
+
+
 _READERS = {"composer.lock": _composer, "package-lock.json": _package_lock}
 
 
@@ -91,6 +105,13 @@ def build_index(roots: list[Path]) -> DependencyIndex:
                 index.lockfiles_read.append(str(path))
             except (OSError, json.JSONDecodeError, KeyError) as exc:
                 log.warning("cannot read %s: %s — dev/production split unavailable", path, exc)
+        try:
+            before = len(index.production) + len(index.dev_only)
+            _manifests(root, index)
+            if len(index.production) + len(index.dev_only) > before:
+                index.lockfiles_read.append(f"{root} (манифесты)")
+        except (OSError, ValueError) as exc:
+            log.warning("cannot read manifests under %s: %s", root, exc)
     return index
 
 

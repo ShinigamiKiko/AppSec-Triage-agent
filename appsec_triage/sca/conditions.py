@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
 from ..prompts import registry
+from ..testpaths import is_test
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +68,6 @@ class Condition:
                 f"    почему нельзя решить здесь: {self.reason}")
 
 
-DEPLOYMENT_SYSTEM = registry.step("deployment")
 
 _DEPLOY_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -94,7 +94,7 @@ def check_against_deployment(condition: Condition, deployment, client) -> Condit
     ])
     try:
         answer = json.loads(
-            client.complete(DEPLOYMENT_SYSTEM, material, json_schema=_DEPLOY_SCHEMA).text)
+            client.complete(registry.step("deployment"), material, json_schema=_DEPLOY_SCHEMA).text)
     except Exception as exc:  # noqa: BLE001 - one failed call, not the run
         log.debug("deployment question failed: %s", exc)
         return condition
@@ -130,6 +130,10 @@ def _files(root: Path, suffixes: set[str]):
             continue
         if (_SKIP_DIRS.intersection(path.parts)
                 or any(part.lower().startswith("appsec-out") for part in path.parts)):
+            continue
+        # A condition met only in tests or in a local compose file is not met in
+        # production: `--host` in docker-compose is a developer's `yarn dev`.
+        if is_test(path.relative_to(root).as_posix()):
             continue
         out.append(path)
     return out

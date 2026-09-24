@@ -27,6 +27,18 @@ table.findings .ext-cell{font-size:12px}
 span.ext{display:inline-block;padding:1px 6px;border-radius:3px;background:#ddf4ff;
   color:#0969da;font-weight:600;font-size:11px}
 table.findings .cond-cell{font-size:12px;max-width:26rem}
+table.findings .prio-cell{width:5rem;text-align:center}
+.prio{font-weight:700;font-size:12px;padding:2px 8px;border-radius:999px;cursor:help}
+.prio.p1{background:#b32020;color:#fff}
+.prio.p2{background:#ffebe9;color:#b32020}
+.prio.p3{background:#fff8c5;color:#9a6700}
+.prio.p4{background:#eef1f4;color:#57606a}
+.section-note{color:#57606a;font-size:13px;margin:.2rem 0 .6rem}
+.tallies{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.6rem}
+.tally{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;background:#f0f2f5;color:#3d444d}
+.tally.yes{background:#ffebe9;color:#b32020}
+.tally.no{background:#dafbe1;color:#1a7f37}
+.tally.maybe{background:#fff8c5;color:#9a6700}
 span.cond{display:inline-block;padding:1px 6px;border-radius:3px;font-weight:600;font-size:11px}
 span.cond.holds{background:#ffebe9;color:#b32020}
 span.cond.absent{background:#dafbe1;color:#1a7f37}
@@ -48,9 +60,11 @@ _ORDER = {VerdictLabel.confirmed: 0, VerdictLabel.unknown: 1, VerdictLabel.false
 
 _CSS = """
 :root{--bg:#fff;--fg:#16181d;--muted:#666e7a;--line:#e3e6ea;--card:#fff;
---confirmed:#c0392b;--unknown:#b7791f;--fp:#2f855a;--accent:#2b6cb0}
+--confirmed:#c0392b;--unknown:#b7791f;--fp:#2f855a;--accent:#2b6cb0;
+--k-sca:#0f766e;--k-sast:#7c3aed;--k-config:#64748b}
 @media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--muted:#98a1ae;
---line:#2a2f37;--card:#1b1e24;--confirmed:#ff6b5e;--unknown:#e2b33c;--fp:#5fcf8e;--accent:#6aa9f0}}
+--line:#2a2f37;--card:#1b1e24;--confirmed:#ff6b5e;--unknown:#e2b33c;--fp:#5fcf8e;--accent:#6aa9f0;
+--k-sca:#2dd4bf;--k-sast:#a78bfa;--k-config:#94a3b8}}
 *{box-sizing:border-box}
 body{margin:0;padding:2rem 1.25rem;background:var(--bg);color:var(--fg);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -71,6 +85,17 @@ border:1px solid currentColor;text-transform:uppercase;white-space:nowrap}
 overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 .cwe{font-size:.78rem;font-weight:600;color:var(--accent)}
 .body{padding:0 .9rem .9rem;border-top:1px solid var(--line)}
+details.k-dependency{border-bottom:4px solid var(--k-sca)}
+details.k-weakness{border-bottom:4px solid var(--k-sast)}
+details.k-misconfiguration{border-bottom:4px solid var(--k-config)}
+.ktag{font-size:.68rem;font-weight:800;letter-spacing:.08em;padding:.12rem .5rem;border-radius:4px;
+color:#fff;white-space:nowrap;margin-left:auto}
+.ktag.k-dependency,.kfoot.k-dependency{background:var(--k-sca)}
+.ktag.k-weakness,.kfoot.k-weakness{background:var(--k-sast)}
+.ktag.k-misconfiguration,.kfoot.k-misconfiguration{background:var(--k-config)}
+.kfoot{margin:.9rem -.9rem -.9rem;padding:.35rem .9rem;color:#fff;font-size:.75rem;font-weight:700;
+letter-spacing:.04em}
+.kfoot span{font-weight:400;opacity:.9;margin-left:.4rem}
 .body h4{margin:.9rem 0 .3rem;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
 pre{background:rgba(127,127,127,.09);padding:.6rem .75rem;border-radius:7px;overflow-x:auto;
 font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;margin:0}
@@ -231,6 +256,13 @@ def _trace(r: TriageRecord) -> str:
     parts = []
     if route:
         parts.append(f"<em>маршрут: {_e(_ROUTES.get(route, route))}</em>")
+    evidence = r.sca.call_evidence if r.sca else ""
+    if evidence:
+        parts.append("<em>вызов: " + _e({
+            "import": "через имя, связанное с пакетом (импорт/require/use)",
+            "codeql": "CodeQL по API пакета", "psalm": "Psalm по типам",
+            "name": "только совпадение имени — не доказан",
+        }.get(evidence, evidence)) + "</em>")
     if body != "—":
         parts.append(body)
     if calls:
@@ -314,40 +346,173 @@ def _flaw_step(sca, *, russian: bool) -> str:
     return body
 
 
-def _summary_table(run: TriageRun, *, russian: bool = False) -> str:
-    """One row per finding, in the order a queue should be worked."""
-    rank = {"confirmed": 0, "unknown": 1, "false_positive": 2}
-    ordered = sorted(run.records, key=lambda r: (rank.get(r.verdict.verdict.value, 3),
-                                                 r.file_path or ""))
-    rows = []
-    for r in ordered:
-        answer, css = _ANSWER.get(r.verdict.verdict.value, ("—", "maybe"))
-        if r.sca and r.sca.package:
-            what = f"<strong>{_e(r.sca.package)}</strong>"
-            if r.sca.installed_version:
-                what += f" {_e(r.sca.installed_version)}"
-            kind = _e(r.sca.placement or "зависимость")
-        else:
-            what = f"<strong>{_e(r.cwe or r.rule_id or '—')}</strong>"
-            kind = _e(r.rule_id or "код проекта")
-        note = _e(r.sca.outcome_note) if r.sca and r.sca.outcome_note else _e(r.verdict.reason)
-        rows.append(
-            f"<tr class='{css}'>"
-            f"<td>{what}<br><span class='kind'>{kind}</span></td>"
-            f"<td class='answer {css}'>{answer}</td>"
-            f"<td>{_where(r)}</td>"
-            f"<td class='trace'>{_trace(r)}</td>"
-            f"<td class='ext-cell'>{_external_cell(r)}</td>"
-            f"<td class='why'>{note[:400]}</td>"
-            f"<td class='cond-cell'>{_condition_cell(r, russian=russian)}</td>"
-            f"</tr>"
-        )
+_KINDS = (
+    ("dependency", "Зависимости (SCA)", "чужой код: уязвимость в пакете, вопрос — доходит ли до неё этот проект"),
+    ("weakness", "Свой код (SAST)", "код проекта: вопрос — является ли отмеченное место дефектом"),
+    ("misconfiguration", "Конфигурация", "образ и окружение: настройка, прочитанная сканером буквально"),
+)
+
+
+# The marker every finding carries, so a reader never has to work out from the
+# section heading which of the two questions a card answers.
+_KIND_TAG = {
+    "dependency": ("SCA", "уязвимость в зависимости: доходит ли до неё этот проект"),
+    "weakness": ("SAST", "код проекта: является ли отмеченное место дефектом"),
+    "misconfiguration": ("CONFIG", "конфигурация образа или окружения"),
+}
+
+
+def _kind_tag(r: TriageRecord) -> str:
+    kind = _kind_of(r)
+    label, _ = _KIND_TAG[kind]
+    return f'<span class="ktag k-{kind}">{label}</span>'
+
+
+def _kind_foot(r: TriageRecord) -> str:
+    kind = _kind_of(r)
+    label, meaning = _KIND_TAG[kind]
+    return f'<div class="kfoot k-{kind}">{label}<span>{_e(meaning)}</span></div>'
+
+
+def _kind_of(r: TriageRecord) -> str:
+    """Which half of the report a finding belongs to.
+
+    The two halves answer different questions — a dependency finding asks
+    whether this project reaches someone else's flaw, a code finding asks
+    whether the flagged line is a flaw at all — and reading them in one list
+    means re-deciding which question you are looking at on every row.
+    """
+    kind = (getattr(r, "kind", "") or "").strip()
+    if kind in ("dependency", "weakness", "misconfiguration"):
+        return kind
+    return "dependency" if (r.sca and r.sca.package) else "weakness"
+
+
+
+_SEVERE = ("critical", "high")
+
+
+def _proven_reach(r: TriageRecord) -> bool:
+    """Did something beyond a name match show the flaw is reached?"""
+    sca = r.sca
+    if sca and (sca.trace or sca.route == "codeql" and sca.codeql_calls):
+        return True
+    return r.verdict.evidence_class.value == "EXPLOITABLE_DATAFLOW"
+
+
+def _priority(r: TriageRecord) -> tuple[int, str, list[str]]:
+    """Order of work, with the signals that set it.
+
+    Severity alone sorts an advisory, not a queue: a critical CVE in a package
+    nothing reaches waits behind a high one on a proven path.
+    """
+    answer = r.verdict.verdict.value
+    severity = (r.severity.value if r.severity else "unknown")
+    severe = severity in _SEVERE
+    signals = [f"серьёзность: {severity}"]
+
+    # A dependency carries its priority from the policy (sca/policy.py): shipping, the
+    # chain outcome and the advisory severity, already combined.
+    if r.sca is not None and r.sca.priority and answer == "false_positive":
+        signals.append(f"закрыто: {r.sca.policy or 'проверка'}; рекомендация по обновлению — {r.sca.priority}")
+        return 4, "P4", signals
+    if r.sca is not None and r.sca.priority and answer != "unknown":
+        rank = {"critical": 1, "high": 1, "medium": 2, "low": 3, "none": 4}.get(r.sca.priority, 3)
+        signals.append(f"приоритет по политике: {r.sca.priority} ({r.sca.policy or 'модель'})")
+        if r.sca.shipped:
+            signals.append(f"поставка: {r.sca.shipped}")
+        return rank, f"P{rank}", signals
+
+    if answer == "false_positive":
+        signals.append("закрыто проверкой")
+        return 4, "P4", signals
+
+    reached = _proven_reach(r)
+    signals.append("путь до уязвимости доказан анализатором" if reached
+                   else "доказанного пути до уязвимости нет")
+    transitive = bool(r.sca and r.sca.placement.startswith("транзитивная"))
+    if r.sca and r.sca.placement:
+        signals.append("транзитивная зависимость" if transitive else r.sca.placement[:60])
+
+    if answer == "confirmed":
+        if severe and reached:
+            return 1, "P1", signals
+        if severe or reached:
+            return 2, "P2", signals
+        return 3, "P3", signals
+
+    signals.append("вердикт не вынесен — нужен человек")
+    if severe and not transitive:
+        return 2, "P2", signals
+    return 3, "P3", signals
+
+
+def _priority_cell(r: TriageRecord) -> str:
+    rank, label, signals = _priority(r)
+    title = _e("; ".join(signals))
+    return f"<span class='prio p{rank}' title='{title}'>{label}</span>"
+
+
+def _finding_row(r: TriageRecord, *, russian: bool = False) -> str:
+    answer, css = _ANSWER.get(r.verdict.verdict.value, ("—", "maybe"))
+    if r.sca and r.sca.package:
+        what = f"<strong>{_e(r.sca.package)}</strong>"
+        if r.sca.installed_version:
+            what += f" {_e(r.sca.installed_version)}"
+        kind = _e(r.sca.placement or "зависимость")
+        shipped = {"runtime": "загружается приложением", "image_only": "в образе, не загружается",
+                   "build_only": "только сборка/тесты"}.get(r.sca.shipped, "")
+        where = {"browser": "браузер", "node": "Node", "both": "браузер и Node (SSR)"}.get(r.sca.runtime, "")
+        if shipped:
+            kind += f"<br>{_e(shipped)}" + (f" · {_e(where)}" if where and r.sca.shipped == "runtime" else "")
+    else:
+        what = f"<strong>{_e(r.cwe or r.rule_id or '—')}</strong>"
+        kind = _e(r.rule_id or "код проекта")
+    note = _e(r.sca.outcome_note) if r.sca and r.sca.outcome_note else _e(r.verdict.reason)
     return (
-        '<h2>Находки</h2><table class="findings"><thead><tr>'
-        "<th>Что</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
-        "<th>Вне кода</th><th>Почему</th><th>В чём уязвимость</th>"
-        f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+        f"<tr class='{css}'>"
+        f"<td class='prio-cell'>{_priority_cell(r)}</td>"
+        f"<td>{_kind_tag(r)} {what}<br><span class='kind'>{kind}</span></td>"
+        f"<td class='answer {css}'>{answer}</td>"
+        f"<td>{_where(r)}</td>"
+        f"<td class='trace'>{_trace(r)}</td>"
+        f"<td class='ext-cell'>{_external_cell(r)}</td>"
+        f"<td class='why'>{note[:400]}</td>"
+        f"<td class='cond-cell'>{_condition_cell(r, russian=russian)}</td>"
+        f"</tr>"
     )
+
+
+def _kind_counts(records) -> str:
+    """Verdicts of one half, so each section carries its own score."""
+    tally = {"confirmed": 0, "unknown": 0, "false_positive": 0}
+    for r in records:
+        tally[r.verdict.verdict.value] = tally.get(r.verdict.verdict.value, 0) + 1
+    return (f"<span class='tally yes'>{tally['confirmed']} подтверждено</span>"
+            f"<span class='tally maybe'>{tally['unknown']} человеку</span>"
+            f"<span class='tally no'>{tally['false_positive']} закрыто</span>"
+            f"<span class='tally total'>{len(records)} всего</span>")
+
+
+def _summary_table(run: TriageRun, *, russian: bool = False) -> str:
+    """One table per kind of finding, in the order a queue should be worked."""
+    ordered = sorted(run.records, key=lambda r: (_priority(r)[0], r.file_path or ""))
+    blocks = []
+    for kind, title, subtitle in _KINDS:
+        part = [r for r in ordered if _kind_of(r) == kind]
+        if not part:
+            continue
+        rows = "".join(_finding_row(r, russian=russian) for r in part)
+        blocks.append(
+            f'<h2 id="table-{kind}">{title}</h2>'
+            f'<p class="section-note">{subtitle}</p>'
+            f'<div class="tallies">{_kind_counts(part)}</div>'
+            '<table class="findings"><thead><tr>'
+            "<th>Приоритет</th><th>Что</th><th>Уязвимо</th><th>Где</th><th>Трасса</th>"
+            "<th>Вне кода</th><th>Почему</th><th>В чём уязвимость</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>"
+        )
+    return "".join(blocks)
 
 
 _DECIDED_BY = {
@@ -370,7 +535,7 @@ _OUTCOMES = {
     "wrong_receiver": "вызовы этого имени ведут в другой класс",
     "not_applicable": "уязвимого пути нет в поставляемом пакете",
     "present": "вызов есть, путь от ввода не доказан",
-    "call_unconfirmed": "вызов есть, получатель не подтверждён",
+    "call_unconfirmed": "вызов не подтверждён: совпало имя, объект не разрешён",
     "mentioned": "имя только упоминается, вызова нет",
     "only_in_tests": "вызовы есть только в тестовом коде",
     "infrastructure": "решается на чужой инфраструктуре",
@@ -502,7 +667,7 @@ def _record_html(r: TriageRecord, *, russian: bool = False) -> str:
     sym = v.vulnerable_symbol
     sym_summary = f'<span class="sym">{_e(sym.name)}</span>' if sym else ""
     parts = [
-        (f'<details><summary>'
+        (f'<details class="k-{_kind_of(r)}"><summary>'
         f'<span class="badge {v.verdict.value}">{v.verdict.value.replace("_", " ")}</span>'
         f'<span class="cwe">{_e(r.cwe or "—")}</span>'
         f"{sym_summary}"
@@ -515,6 +680,7 @@ def _record_html(r: TriageRecord, *, russian: bool = False) -> str:
             if v.self_reported_confidence is not None
             else ""
         )
+        + _kind_tag(r)
         + '</summary><div class="body">'),
         _why_html(r, russian=russian),
     ]
@@ -581,6 +747,7 @@ def _record_html(r: TriageRecord, *, russian: bool = False) -> str:
     if r.cost_usd:
         meta.append(f"cost: ${r.cost_usd:.5f}")
     parts.append('<div class="meta">' + "".join(f"<span>{m}</span>" for m in meta) + "</div>")
+    parts.append(_kind_foot(r))
     parts.append("</div></details>")
     return "".join(parts)
 
@@ -618,6 +785,7 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage", russian: bool = Fa
         ("Не решено", counts["unknown"], "unknown"),
         ("Закрыто автоматически", counts["false_positive"], "false_positive"),
         ("На человека", review, ""),
+        ("Решено без человека", f"{100 * (len(run.records) - review) / total:.0f}%", ""),
         ("Шума убрано", f'{100 * counts["false_positive"] / total:.0f}%', ""),
         ("Вне области", scoped_out, ""),
     ]
@@ -637,7 +805,14 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage", russian: bool = Fa
     )
 
     ordered = sorted(run.records, key=lambda r: (_ORDER[r.verdict.verdict], -r.verdict.confidence))
-    findings_html = "".join(_record_html(r, russian=russian) for r in ordered)
+    parts = []
+    for kind, title, _subtitle in _KINDS:
+        section = [r for r in ordered if _kind_of(r) == kind]
+        if not section:
+            continue
+        parts.append(f'<h2 id="cards-{kind}">{title} — подробно</h2>')
+        parts.extend(_record_html(r, russian=russian) for r in section)
+    findings_html = "".join(parts)
 
     coverage_html = _coverage_html(run)
     generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -657,7 +832,6 @@ cost ${run.total_cost_usd:.4f}</p>
 <table><thead><tr><th>CWE</th><th>Confirmed</th><th>Unknown</th><th>Closed</th><th>Total</th></tr></thead>
 <tbody>{rows}</tbody></table>
 {_summary_table(run, russian=russian)}
-<h2>Findings — highest priority first</h2>
 {findings_html}
 </main></body></html>"""
 

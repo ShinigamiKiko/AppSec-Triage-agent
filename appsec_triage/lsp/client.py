@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import statistics
 import subprocess
 import threading
 import time
@@ -77,6 +79,17 @@ class LSPClient:
     started: bool = field(default=False, init=False)
     error: str | None = field(default=None, init=False)
     capabilities: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # Health guard: a server that times out again and again, or answers slowly,
+    # is switched off for the run with one ERROR line instead of costing every
+    # finding its full timeout on every question.
+    max_consecutive_timeouts: int = 3
+    slow_median_s: float = 5.0
+    disabled: str | None = field(default=None, init=False)
+    _timeouts_in_row: int = field(default=0, init=False, repr=False)
+    _latencies: list[float] = field(default_factory=list, init=False, repr=False)
+    _slow_reported: bool = field(default=False, init=False, repr=False)
+    _inbox: Any = field(default=None, init=False, repr=False)
+    _reader: threading.Thread | None = field(default=None, init=False, repr=False)
 
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -87,49 +100,99 @@ class LSPClient:
         self._proc.stdin.write(header + body)
         self._proc.stdin.flush()
 
-    def _read(self, deadline: float) -> dict[str, Any] | None:
-        """Read one framed message, or None on timeout / EOF."""
-        if not self._proc or not self._proc.stdout:
-            return None
-        stream = self._proc.stdout
+    def _pump(self) -> None:
+        """Reader thread: frames from the server's stdout into the inbox.
 
-        length = 0
-        while True:
-            if time.monotonic() > deadline:
-                return None
-            line = stream.readline()
-            if not line:
-                return None
-            line = line.strip()
-            if not line:
-                break
-            if line.lower().startswith(b"content-length:"):
-                length = int(line.split(b":", 1)[1])
-        if not length:
+        `readline()` on a pipe blocks; reading inline meant a silent server held
+        the request past its deadline indefinitely. The deadline now lives on
+        the queue, where it can actually expire.
+        """
+        stream = self._proc.stdout if self._proc else None
+        inbox = self._inbox
+        while stream is not None:
+            try:
+                length = 0
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        inbox.put(None)
+                        return
+                    line = line.strip()
+                    if not line:
+                        break
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1])
+                if not length:
+                    continue
+                raw = stream.read(length)
+                if not raw:
+                    inbox.put(None)
+                    return
+                try:
+                    inbox.put(json.loads(raw.decode("utf-8")))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    log.debug("undecodable LSP message: %s", exc)
+            except (OSError, ValueError):
+                inbox.put(None)
+                return
+
+    def _read(self, deadline: float) -> dict[str, Any] | None:
+        """One message from the reader thread, or None on timeout / EOF."""
+        if self._inbox is None:
             return None
-        raw = stream.read(length)
-        if not raw:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return None
         try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            log.debug("undecodable LSP message: %s", exc)
+            return self._inbox.get(timeout=remaining)
+        except queue.Empty:
             return None
 
-    def _request(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any:
+    def _note_latency(self, method: str, elapsed: float, answered: bool) -> None:
+        """Count timeouts in a row and watch the median; switch off a server that stalls."""
+        if method in ("initialize", "shutdown"):
+            return
+        if not answered:
+            self._timeouts_in_row += 1
+            if self._timeouts_in_row >= self.max_consecutive_timeouts and not self.disabled:
+                self.disabled = (f"{self._timeouts_in_row} запроса подряд без ответа "
+                                 f"(последний {method}, {elapsed:.0f} с)")
+                log.error("LSP %s отключён до конца прогона: %s — ответы по коду пойдут без него",
+                          self.command[0], self.disabled)
+            return
+        self._timeouts_in_row = 0
+        self._latencies.append(elapsed)
+        recent = self._latencies[-20:]
+        if len(recent) >= 10 and not self._slow_reported:
+            median = statistics.median(recent)
+            if median > self.slow_median_s:
+                self._slow_reported = True
+                log.error("LSP %s тормозит: медиана ответа %.1f с на последних %d запросах "
+                          "(проект на /mnt/c, нет node_modules/vendor или сервер без индекса)",
+                          self.command[0], median, len(recent))
+
+    def _request(self, method: str, params: dict[str, Any], timeout: float | None = None,
+                 *, track: bool = True) -> Any:
         """Send a request and wait for its reply, skipping unrelated traffic."""
+        if self.disabled and method != "shutdown":
+            return None
         with self._lock:
             self._next_id += 1
             request_id = self._next_id
-            deadline = time.monotonic() + (timeout or self.timeout_s)
+            started = time.monotonic()
+            deadline = started + (timeout or self.timeout_s)
             try:
                 self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
                 while True:
                     message = self._read(deadline)
                     if message is None:
                         log.debug("%s timed out or the server closed the stream", method)
+                        if track:
+                            self._note_latency(method, time.monotonic() - started, answered=False)
                         return None
-                    if message.get("id") == request_id:
+                    if message.get("id") == request_id and "method" not in message:
+                        if track:
+                            self._note_latency(method, time.monotonic() - started, answered=True)
                         if "error" in message:
                             log.debug("%s returned an error: %s", method, message["error"])
                             return None
@@ -159,6 +222,9 @@ class LSPClient:
         except OSError as exc:
             self.error = f"cannot start {self.command[0]!r}: {exc}"
             return False
+        self._inbox = queue.Queue()
+        self._reader = threading.Thread(target=self._pump, name=f"lsp-{self.command[0]}", daemon=True)
+        self._reader.start()
 
         result = self._request(
             "initialize",
@@ -201,14 +267,16 @@ class LSPClient:
         deadline = time.monotonic() + self.index_timeout_s
         attempt = 0
         while time.monotonic() < deadline:
-            if (self._request("workspace/symbol", {"query": "a"}, timeout=10)
-                    or self._request("workspace/symbol", {"query": ""}, timeout=10)):
+            if (self._request("workspace/symbol", {"query": "a"}, timeout=10, track=False)
+                    or self._request("workspace/symbol", {"query": ""}, timeout=10, track=False)):
                 self.index_ready = True
                 return
             attempt += 1
             time.sleep(min(0.5 * attempt, 3.0))
-        log.warning(
-            "%s: index still empty after %.0fs — answers will be sparse",
+        log.error(
+            "LSP %s: индекс пуст через %.0f с — ответы о коде будут неполными. Частые причины: "
+            "не установлены зависимости (node_modules/vendor), проект на /mnt/c под WSL, "
+            "у сервера нет открытого файла проекта",
             self.command[0],
             self.index_timeout_s,
         )

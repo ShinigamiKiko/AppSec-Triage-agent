@@ -13,3 +13,18 @@ tools/semgrep-venv/
 .env
 .agents/
 .codex/
+
+# Development only: the job runs the agent, it never runs its tests, scripts or docs.
+# Kept: appsec_triage/, configs/, prompts/, pyproject.toml and LICENSE (pyproject's
+# license-files needs it for `pip install -e .`).
+tests/
+tools/
+docs/
+ci/
+*.patch
+*.md
+.env.example
+.ruff_cache/
+Dockerfile
+appsec_triage/llm/mailbox.py
+configs/providers/mailbox.yaml

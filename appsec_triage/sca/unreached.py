@@ -13,11 +13,7 @@ from ..llm.tools import TOOL_MODE_NOTE, function_tool, run_tool_loop, supports_t
 
 log = logging.getLogger(__name__)
 
-SEARCH_SYSTEM = registry.step("unreachable-search")
-SYSTEM = registry.step("unreachable-audit")
 
-CLOSURE_SEARCH_SYSTEM = registry.step("closure-search")
-CLOSURE_SYSTEM = registry.step("closure-audit")
 
 _BLIND_SPOTS = {
     "not_shipped": (
@@ -54,7 +50,7 @@ _BLIND_SPOTS = {
         "уязвимого вызова приходит в этих формах."
     ),
     "test_only": (
-        "Утверждение получено по списку тестовых путей из prompts/training-context.md: "
+        "Утверждение получено по списку тестовых путей из prompts/context/: "
         "пакет импортируется только в файлах, которые этот список считает тестовыми. "
         "Мимо него проходит тестовый хелпер или фикстура, которую рабочий код "
         "подключает сам (require из директории tests в обработчике, сидер, "
@@ -64,7 +60,7 @@ _BLIND_SPOTS = {
     "only_in_tests": (
         "Утверждение получено так: найдены все места вызова уязвимой функции, и "
         "каждое лежит в файле, который список тестовых путей из "
-        "prompts/training-context.md считает тестовым. Мимо такой проверки "
+        "prompts/context/ считает тестовым. Мимо такой проверки "
         "проходит вызов через обёртку — рабочий код зовёт свою функцию, а уже "
         "она зовёт уязвимую, и имени уязвимой в рабочем файле нет; тестовый "
         "хелпер или фабрика, которую подключает рабочий код (сидер, фикстура, "
@@ -169,10 +165,10 @@ def audit(reachability, root: Path | str, advisory, symbol, client, parallel: in
 
     try:
         if supports_tools(client):
-            patterns = _patterns_by_tools(client, SEARCH_SYSTEM, header, root, 4, parallel)
+            patterns = _patterns_by_tools(client, registry.step("unreachable-search"), header, root, 4, parallel)
         else:
             asked = json.loads(client.complete(
-                SEARCH_SYSTEM, header, json_schema=_SEARCH_SCHEMA).text)
+                registry.step("unreachable-search"), header, json_schema=_SEARCH_SCHEMA).text)
             patterns = [str(p) for p in (asked.get("patterns") or [])][:4]
     except Exception as exc:  # noqa: BLE001 - a failed audit is not a failed run
         log.debug("audit search failed for %s: %s", advisory.advisory_id, exc)
@@ -193,7 +189,7 @@ def audit(reachability, root: Path | str, advisory, symbol, client, parallel: in
     ])
 
     try:
-        answer = json.loads(client.complete(SYSTEM, material, json_schema=_SCHEMA).text)
+        answer = json.loads(client.complete(registry.step("unreachable-audit"), material, json_schema=_SCHEMA).text)
     except Exception as exc:  # noqa: BLE001 - one dead call, not the run
         log.warning("audit of graph closure failed for %s: %s", advisory.advisory_id, exc)
         return Audit(kind="not_reached", detail=f"закрытие графом не проверено: {exc}")
@@ -251,10 +247,10 @@ def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, cli
 
     try:
         if supports_tools(client):
-            patterns = _patterns_by_tools(client, CLOSURE_SEARCH_SYSTEM, header, root, 8, parallel)
+            patterns = _patterns_by_tools(client, registry.step("closure-search"), header, root, 8, parallel)
         else:
             asked = json.loads(client.complete(
-                CLOSURE_SEARCH_SYSTEM, header, json_schema=_SEARCH_SCHEMA).text)
+                registry.step("closure-search"), header, json_schema=_SEARCH_SCHEMA).text)
             patterns = [str(p) for p in (asked.get("patterns") or [])][:8]
     except Exception as exc:  # noqa: BLE001 - a failed audit is not a failed run
         log.debug("closure search failed for %s: %s", advisory.advisory_id, exc)
@@ -274,7 +270,7 @@ def audit_closure(kind: str, claim: str, root: Path | str, advisory, symbol, cli
 
     try:
         answer = json.loads(client.complete(
-            CLOSURE_SYSTEM, material, json_schema=_CLOSURE_SCHEMA).text)
+            registry.step("closure-audit"), material, json_schema=_CLOSURE_SCHEMA).text)
     except Exception as exc:  # noqa: BLE001 - one dead call, not the run
         log.warning("closure audit failed for %s: %s", advisory.advisory_id, exc)
         return Audit(kind=kind, detail=f"закрытие не проверено: {exc}")

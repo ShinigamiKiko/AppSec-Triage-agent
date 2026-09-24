@@ -55,12 +55,31 @@ _JS_DECL = re.compile(
     r"|(?P<meth>[A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{)", re.MULTILINE)
 _JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
 _JS_KEYWORD = {"if", "for", "while", "switch", "catch", "return", "do", "else", "function"}
+_JS_NAME = r"[A-Za-z_$][\w$]*"
+_JS_CJS_DEFAULT = re.compile(r"\bmodule\s*\.\s*exports\s*=\s*")
+# A module whose export is a function with no name of its own: `module.exports =
+# function (str, opts) {` in qs's parse.js, `export default function () {`.
+_JS_ANON_EXPORT = re.compile(
+    r"(?:\bmodule\s*\.\s*exports\s*=|^[ \t]*export\s+default)\s*(?:async\s+)?"
+    r"(?:function\s*\*?\s*\(|\([^)]*\)\s*=>)", re.MULTILINE)
+_JS_CJS_NAMED = re.compile(rf"\b(?:module\s*\.\s*)?exports\s*\.\s*{_JS_NAME}\s*=\s*({_JS_NAME})(?![\w$])")
 
 _PY_DECL = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
 _PY_OWNER = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z_]\w*)", re.MULTILINE)
 
 _GO_DECL = re.compile(
     r"^func\s*(?:\(\s*\w+\s+\*?(?P<recv>[A-Za-z_]\w*)\s*\)\s*)?(?P<fn>[A-Za-z_]\w*)\s*\(", re.MULTILINE)
+
+
+def default_export_names(text: str) -> set[str]:
+    """Local names assigned directly to CommonJS ``module.exports``."""
+    names = set()
+    for assignment in _JS_CJS_DEFAULT.finditer(text):
+        rhs = text[assignment.end():]
+        match = re.match(rf"({_JS_NAME})\s*(?=;|$|\n|//)", rhs)
+        if match:
+            names.add(match.group(1))
+    return names
 
 
 def _php(text: str) -> list[Declaration]:
@@ -78,9 +97,22 @@ def _php(text: str) -> list[Declaration]:
 
 def _js(text: str) -> list[Declaration]:
     owners = [(m.start(), m.group(1)) for m in _JS_OWNER.finditer(text)]
-    exported = set(re.findall(r"(?:module\.)?exports(?:\.(\w+))?\s*=", text))
-    exported |= set(re.findall(r"export\s*\{([^}]*)\}", text))
-    exported = {part.strip().split(" as ")[0] for chunk in exported for part in chunk.split(",")}
+    exported = {m.group(1) for m in _JS_CJS_NAMED.finditer(text)}
+    exported.update(default_export_names(text))
+    exported.update(m.group(1) for m in _JS_OWNER.finditer(text)
+                    if m.group().lstrip().startswith("export "))
+    for chunk in re.findall(r"\bexport\s*\{([^}]*)\}", text):
+        exported.update(part.strip().split(" as ")[0] for part in chunk.split(","))
+    for match in _JS_CJS_DEFAULT.finditer(text):
+        rhs = text[match.end():]
+        if rhs.startswith("{"):
+            # CommonJS shorthand and aliases: { a, publicName: b }.
+            # An incomplete or nested expression is left unclassified.
+            body = rhs[1:rhs.find("}")] if "}" in rhs else ""
+            for part in body.split(","):
+                item = re.fullmatch(rf"\s*(?:{_JS_NAME}\s*:\s*)?({_JS_NAME})\s*", part)
+                if item:
+                    exported.add(item.group(1))
 
     out = []
     for match in _JS_DECL.finditer(text):
@@ -99,7 +131,7 @@ def _js(text: str) -> list[Declaration]:
         elif match.group("exp") or name in exported:
             visibility = "public"
         elif owner:
-            visibility = "public" if not name.startswith("_") else "private"
+            visibility = "public" if owner in exported and not name.startswith("_") else "private"
         else:
             visibility = "private"
         out.append(Declaration(name.lstrip("#"), owner, visibility,
@@ -147,10 +179,34 @@ def _go(text: str) -> list[Declaration]:
 _PARSERS = {PHP: _php, JS: _js, PYTHON: _python, GO: _go}
 
 
+def _anonymous_export(path: str, text: str) -> list[Declaration]:
+    """The module's own export when it is an unnamed function.
+
+    Without it, a call inside that function counts for whatever is declared above
+    it — in qs, a private helper instead of the `parse` the package exposes — and
+    the path from a public entry to the flaw breaks there. Such a function is
+    known by its module: `require('./parse')` is how the package itself imports
+    lib/parse.js, so it takes the file's name. An index file is the package itself.
+    """
+    match = _JS_ANON_EXPORT.search(text)
+    if match is None:
+        return []
+    stem = Path(path).stem
+    if stem in ("index", "main") or not re.fullmatch(_JS_NAME, stem):
+        return []
+    return [Declaration(stem, "", "public", text.count("\n", 0, match.start()) + 1, match.start())]
+
+
 def declarations(path: str, text: str) -> list[Declaration]:
     """Every function declared in `text`, ordered by position."""
-    parser = _PARSERS.get(language_of(path) or "")
-    return parser(text) if parser else []
+    language = language_of(path) or ""
+    parser = _PARSERS.get(language)
+    if not parser:
+        return []
+    out = parser(text)
+    if language == JS:
+        out = sorted(out + _anonymous_export(path, text), key=lambda d: d.offset)
+    return out
 
 
 def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:

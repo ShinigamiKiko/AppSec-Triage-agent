@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +13,12 @@ from urllib.parse import unquote
 
 log = logging.getLogger(__name__)
 
-_TIMEOUT_S = 600
+# Сколько ждать cdxgen. Шестисот секунд хватает, пока он читает только
+# манифесты и лок-файлы. С установленным деревом (на landing-develop это 892
+# пакета) рекурсивный обход по смонтированному диску Windows в них не уложился,
+# и SBOM вышел пустым — то есть SCA-часть прогона потерялась целиком. Значение
+# настраивается, потому что зависит не от проекта, а от того, где он лежит.
+_TIMEOUT_S = int(os.environ.get("APPSEC_SBOM_TIMEOUT_S", "600"))
 
 _PURL_ECOSYSTEM = {
     "composer": "composer", "npm": "npm", "pypi": "pypi", "golang": "go",
@@ -35,6 +41,17 @@ def parse_purl(purl: str) -> tuple[str, str, str]:
     if not name:
         name, version = rest, ""
     return _PURL_ECOSYSTEM.get(kind.lower(), kind.lower()), unquote(name), unquote(version)
+
+
+def load(path: Path | str) -> tuple[dict | None, str]:
+    """An SBOM produced earlier in the run, so cdxgen is not asked twice."""
+    path = Path(path)
+    if not path.is_file():
+        return None, f"SBOM не найден: {path}"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), ""
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"SBOM нечитаем ({path}): {exc}"
 
 
 def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None, str]:

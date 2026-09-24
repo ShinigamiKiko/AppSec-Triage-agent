@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,18 +44,31 @@ def database_lock(database: str | Path) -> threading.Lock:
         return _DATABASE_LOCKS.setdefault(key, threading.Lock())
 
 
+def _execute(argv: list[str], **kwargs):
+    """Through the long-lived cli-server when it can answer, else a process of its own."""
+    from .codeql_runner import via_server
+
+    timeout = kwargs.get("timeout") or _TIMEOUT_S
+    done = via_server(argv, timeout)
+    if done is not None:
+        if done.returncode == 124:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return done
+    return subprocess.run(argv, **kwargs)
+
+
 def run_codeql(argv: list[str], *, finding_id: str = "", **kwargs) -> subprocess.CompletedProcess:
-    """`subprocess.run` for a CodeQL command, holding its database's lock while it runs."""
+    """Run a CodeQL command, holding its database's lock while it runs."""
     database = _database_of(argv)
     if database is None:
-        return subprocess.run(argv, **kwargs)
-    
+        return _execute(argv, **kwargs)
+
     lock = database_lock(database)
     prefix = f"[{finding_id}] " if finding_id else ""
     log.debug("%sacquiring database lock: %s", prefix, database)
     with lock:
         log.debug("%sdatabase lock acquired: %s", prefix, database)
-        return subprocess.run(argv, **kwargs)
+        return _execute(argv, **kwargs)
 
 _TIMEOUT_S = 1800
 
@@ -90,9 +104,7 @@ _QUERY = """/**
 {imports}
 
 {helpers}
-predicate target(string path, int line) {{
-{targets}
-}}
+external predicate target(string path, int line);
 
 module Cfg implements DataFlow::ConfigSig {{
   predicate isSource(DataFlow::Node n) {{ {source} }}
@@ -127,9 +139,7 @@ _EVALUATED_QUERY = """/**
  */
 {imports}
 
-predicate target(string path, int line) {{
-{targets}
-}}
+external predicate target(string path, int line);
 
 from {call} c
 where
@@ -208,71 +218,50 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
     if not (database / "codeql-database.yml").is_file():
         return Answer(problem=f"база CodeQL не найдена или недостроена: {database}")
 
-    query = _QUERY.format(
+    from .codeql_runner import query_file, write_external
+
+    query = query_file(language, _QUERY.format(
         imports=dialect["imports"], helpers=dialect["helpers"],
         source=dialect["source"], call=dialect["call"],
         argument=dialect["argument"],
         argument_sink=dialect["argument"].replace("n.", "sink."),
-        targets=_predicate(wanted),
-    )
+    ))
+    evaluated_query = query_file(language, _EVALUATED_QUERY.format(
+        imports=dialect["imports"], call=dialect["call"]))
 
     prefix = f"[{finding_id}] " if finding_id else ""
     log.info("%scodeql reachability: checking %d call sites", prefix, len(wanted))
 
     with tempfile.TemporaryDirectory(prefix="sca-reach-") as work:
-        pack = Path(work)
-        (pack / "qlpack.yml").write_text(
-            f"name: wolfee/sca-reachability\nversion: 0.0.1\n"
-            f"dependencies:\n  codeql/{language}-all: \"*\"\n", encoding="utf-8")
-        query_file = pack / "reach.ql"
-        query_file.write_text(query, encoding="utf-8")
-        evaluated_file = pack / "evaluated.ql"
-        evaluated_file.write_text(_EVALUATED_QUERY.format(
-            imports=dialect["imports"], call=dialect["call"], targets=_predicate(wanted)
-        ), encoding="utf-8")
-        results = pack / "results.bqrs"
-        evaluated_results = pack / "evaluated.bqrs"
+        work_dir = Path(work)
+        rows = write_external(work_dir, "target", wanted)
+        results = work_dir / "results.bqrs"
+        evaluated_results = work_dir / "evaluated.bqrs"
 
-        # Run both queries in parallel using ThreadPoolExecutor
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time
-        
         def run_query(query_path: Path, output_path: Path, query_name: str):
             argv = [binary, "query", "run", *query_flags(), f"--database={database}",
-                    f"--output={output_path}", str(query_path)]
+                    f"--external=target={rows}", f"--output={output_path}", str(query_path)]
             start = time.monotonic()
-            log.info("%sstarting %s", prefix, query_name)
             try:
                 proc = run_codeql(argv, capture_output=True, text=True,
                                   timeout=timeout_s, encoding="utf-8", errors="replace", check=False,
                                   finding_id=finding_id)
-                elapsed = time.monotonic() - start
-                if proc.returncode != 0:
-                    tail = "\n".join((proc.stderr or "").strip().splitlines()[-4:])
-                    log.warning("%s%s failed after %.2fs", prefix, query_name, elapsed)
-                    return None, f"{query_name} не выполнился: {tail[:300]}"
-                log.info("%s%s completed in %.2fs", prefix, query_name, elapsed)
-                return proc, None
             except subprocess.TimeoutExpired:
-                elapsed = time.monotonic() - start
-                log.warning("%s%s timed out after %.2fs", prefix, query_name, elapsed)
-                return None, f"{query_name} не уложился в {timeout_s}с"
+                return f"{query_name} не уложился в {timeout_s}с"
             except OSError as exc:
-                elapsed = time.monotonic() - start
-                log.error("%s%s failed to start after %.2fs: %s", prefix, query_name, elapsed, exc)
-                return None, f"codeql не запустился для {query_name}: {exc}"
-        
-        batch_start = time.monotonic()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            main_future = pool.submit(run_query, query_file, results, "запрос достижимости")
-            eval_future = pool.submit(run_query, evaluated_file, evaluated_results, "проверка позиций")
-            
-            for future in as_completed([main_future, eval_future]):
-                proc, error = future.result()
-                if error:
-                    return Answer(problem=error)
-        batch_elapsed = time.monotonic() - batch_start
-        log.info("%sboth reachability queries completed in %.2fs", prefix, batch_elapsed)
+                return f"codeql не запустился для {query_name}: {exc}"
+            if proc.returncode != 0:
+                tail = "\n".join((proc.stderr or "").strip().splitlines()[-4:])
+                return f"{query_name} не выполнился: {tail[:300]}"
+            log.info("%s%s completed in %.2fs", prefix, query_name, time.monotonic() - start)
+            return None
+
+        # Both queries open the same database and would wait for its lock anyway:
+        # running them one after the other is the same wall time without the threads.
+        for query_path, output_path, name in ((query, results, "запрос достижимости"),
+                                              (evaluated_query, evaluated_results, "проверка позиций")):
+            if error := run_query(query_path, output_path, name):
+                return Answer(problem=error)
 
         decode = [binary, "bqrs", "decode", "--format=csv", "--no-titles", str(results)]
         try:

@@ -52,6 +52,10 @@ class DependencyInfo(BaseModel):
     advisory_url: str | None = None
     dev_only: bool | None = None
     imported: bool | None = None
+    # runtime | image_only | build_only | unknown, from the shipping check (sca/shipping.py).
+    shipped: str | None = None
+    # browser | node | both | unknown — where the code that loads the package runs.
+    runtime: str | None = None
     reachability: str | None = None
     call_site: str | None = None
     call_line: str | None = None
@@ -153,6 +157,9 @@ class EvidencePackage(BaseModel):
     repository_code_collected: bool = False
     repository_bytes_read: int = 0
     code_questions: list[str] = Field(default_factory=list)
+    # Searches and language-server lookups the walk made, with their answers verbatim —
+    # a "no match" among them. Shown to the verdict, so an absence can be quoted.
+    code_facts: list[str] = Field(default_factory=list)
 
     def quotable_text(self) -> str:
         """Exactly the text the model was shown, used to verify its quotes."""
@@ -276,6 +283,20 @@ class SCASummary(BaseModel):
     route: str = ""
     codeql_calls: list[str] = Field(default_factory=list)
     problems: list[str] = Field(default_factory=list)
+    # runtime | image_only | build_only | unknown — does the running application load it.
+    shipped: str = ""
+    # browser | node | both | unknown — where the code that loads it runs.
+    runtime: str = ""
+    loaded_via: list[str] = Field(default_factory=list)
+    # import | codeql | lsp | name — how a call site was attributed to the package.
+    call_evidence: str = ""
+    severity: str = ""
+    # critical | high | medium | low | none — how urgent the fix is, separate from the verdict.
+    priority: str = ""
+    # Which rule of sca/policy.py decided it.
+    policy: str = ""
+    # What the policy could not settle and handed to the model.
+    open_question: str = ""
 
 
 class TriageRecord(BaseModel):
@@ -287,6 +308,7 @@ class TriageRecord(BaseModel):
     cwe: str | None
     file_path: str
     kind: Literal["weakness", "dependency", "misconfiguration"] = "weakness"
+    severity: Severity = Severity.unknown
     rule_id: str | None = None
     start_line: int | None = None
     trace: list[TraceStep] = Field(default_factory=list)
@@ -296,7 +318,7 @@ class TriageRecord(BaseModel):
     verdict: Verdict
     original_verdict: Verdict | None = None
     overrides: list[str] = Field(default_factory=list)
-    decided_by: Literal["scope", "heuristics", "llm", "post_validation", "challenged", "error"] = "llm"
+    decided_by: Literal["scope", "heuristics", "policy", "llm", "post_validation", "challenged", "error"] = "llm"
     provider: str | None = None
     model: str | None = None
     prompt_id: str | None = None
@@ -311,3 +333,5 @@ class TriageRecord(BaseModel):
     reused: bool = False
     sca: SCASummary | None = None
     code_questions: list[str] = Field(default_factory=list)
+    # Seconds per stage (chain, walk, verdict, retrieval, challenge, total) — where the time went.
+    timings: dict[str, float] = Field(default_factory=dict)

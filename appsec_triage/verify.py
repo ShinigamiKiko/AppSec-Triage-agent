@@ -62,7 +62,10 @@ class ChallengeResult:
 
 def should_challenge(record: TriageRecord, cfg: VerificationConfig) -> bool:
     """Second passes cost as much as first ones, so spend them where they pay."""
-    if not cfg.enabled or record.decided_by in ("scope", "heuristics", "error"):
+    if not cfg.enabled or record.decided_by in ("scope", "heuristics", "policy", "error"):
+        return False
+    kinds = getattr(cfg, "challenge_kinds", None)
+    if kinds and record.kind not in kinds:
         return False
     if record.verdict.verdict.value in cfg.challenge_verdicts:
         return True
@@ -159,9 +162,15 @@ def challenge(
 
 
 def apply(
-    verdict: Verdict, result: ChallengeResult, mode: str = "advisory"
+    verdict: Verdict, result: ChallengeResult, mode: str = "advisory", *, downgrade_confirmed: bool = False
 ) -> tuple[Verdict, list[str], str | None]:
-    """Merge the second pass into the first."""
+    """Merge the second pass into the first.
+
+    Advisory mode keeps the verdict and records the objection — except a `confirmed`
+    that the objection refutes with a verbatim line, when `downgrade_confirmed` is set:
+    that becomes `unknown`, because a confirmation nobody can defend is the one verdict
+    measured to be wrong most often.
+    """
     if result.error:
         return verdict, [f"challenge_skipped: {result.error[:120]}"], None
     if result.survives:
@@ -171,6 +180,9 @@ def apply(
     if result.grounded_quotes:
         note += f"  [cites: {result.grounded_quotes[0].quote[:80]!r}]"
 
+    if mode == "advisory" and downgrade_confirmed and verdict.verdict is VerdictLabel.confirmed \
+            and result.grounded_quotes:
+        mode = "authoritative"
     if mode == "advisory":
         return (
             verdict,

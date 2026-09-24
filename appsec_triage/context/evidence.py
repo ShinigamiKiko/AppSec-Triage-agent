@@ -16,6 +16,10 @@ MAX_ENTRIES = 4000
 MAX_FILE_BYTES = 256_000
 MAX_TOTAL_BYTES = 2_000_000
 MAX_LOCATIONS = 48
+# A search reads files, it does not keep them: its limits are far above the walk's,
+# so that "no match" can mean the whole project rather than its first 500 files.
+SEARCH_FILES = 8000
+SEARCH_ENTRIES = 80000
 _EXTENSIONS = frozenset({
     ".php", ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rb", ".java", ".kt", ".kts",
     ".cs", ".c", ".h", ".cpp", ".hpp", ".cc", ".rs", ".swift", ".scala", ".vue", ".svelte", ".twig", ".sh",
@@ -30,6 +34,10 @@ _EXCLUDED = frozenset({
     "__pycache__", ".venv", "venv",
 })
 _CODE_EXTENSIONS = _EXTENSIONS - {".yaml", ".yml", ".xml", ".json"}
+# Where package managers install dependencies. Never walked, but an explicit read of
+# one file there is allowed: the open question is often "what does the installed
+# version do", and only its source answers that.
+_INSTALLED = frozenset({"vendor", "node_modules"})
 _SECRET_NAME = r"(?:[\w.-]+[_.-])?(?:passwords?|secrets?|tokens?|api_keys?|private_keys?)"
 _SECRET_HEAD = re.compile(
     rf'''(?<![\w.-])["']?{_SECRET_NAME}["']?[ \t]*(?:=>|:=|:|=)[ \t]*''', re.IGNORECASE,
@@ -42,8 +50,38 @@ _PLACEHOLDER = re.compile(r"%env\([^\r\n]*?\)%|\$\{[^\r\n}]+\}")
 _STATIC_NOTE = (
     "Repository evidence is static, not effective runtime configuration. File order is preserved; "
     "environment overrides are labeled, not merged. Imports are text only, never executed. "
-    "Absent evidence is not proof a feature is disabled; bounded scans may omit files."
+    "Absent evidence is not proof a feature is disabled, unless a search under WHAT THE CODE WALK "
+    "CHECKED read the project's whole code and configuration and says so."
 )
+
+
+def _installed_package(path) -> str | None:
+    """The package an installed-tree path belongs to ("" if unnamed); None for project code."""
+    parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+    for index, part in enumerate(parts):
+        if part.lower() not in _INSTALLED:
+            continue
+        rest = parts[index + 1:]
+        two = part.lower() == "vendor" or bool(rest and rest[0].startswith("@"))
+        return "/".join(rest[:2]) if two and len(rest) > 1 else (rest[0] if rest else "")
+    return None
+
+
+def _search_fact(pattern: str, matches: int, files_hit: int, scanned: int, in_tests: int,
+                 *, truncated: bool) -> str:
+    """One quotable line: what a search read and what it found — an absence included."""
+    scope = ("the project's own code and configuration (tests, docker-compose and installed "
+             "packages excluded)")
+    if matches:
+        found = f"{matches} match(es) in {files_hit} of {scanned} files of {scope}; the lines are under REPOSITORY EVIDENCE"
+    else:
+        found = f"no match in {scanned} files of {scope}"
+    tail = ""
+    if in_tests:
+        tail += f"; {in_tests} more in test and docker-compose files, not production"
+    if truncated:
+        tail += "; the search stopped at its file limit, so an absence is not established"
+    return f"search_code «{pattern}» → {found}{tail}"
 
 
 def _redact(text: str) -> str:
@@ -164,11 +202,13 @@ class RepositoryEvidence:
             pkg.context_notes.append(text)
 
     @staticmethod
-    def _safe(path: Path, root: Path) -> bool:
+    def _safe(path: Path, root: Path, installed: bool = False) -> bool:
         try:
             relative = path.relative_to(root)
             for part in relative.parts:
                 name = part.lower()
+                if installed and name in _INSTALLED:
+                    continue
                 if (name in _EXCLUDED or
                         name.endswith((".pem", ".key", ".p12", ".pfx", ".keystore")) or
                         name.startswith((".env", "id_rsa", "id_ed25519", "credentials"))):
@@ -186,7 +226,7 @@ class RepositoryEvidence:
         except (OSError, ValueError):
             return False
 
-    def _resolve(self, pkg, raw) -> Path | None:
+    def _resolve(self, pkg, raw, installed: bool = False) -> Path | None:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             self._note(pkg, "Read rejected: invalid source path.")
             return None
@@ -204,12 +244,12 @@ class RepositoryEvidence:
             candidates.extend(root / path for root in self.source.roots)
         for candidate in candidates:
             for root in self.source.roots:
-                if self._safe(candidate, root):
+                if self._safe(candidate, root, installed):
                     return candidate.resolve()
         self._note(pkg, "Source path unavailable, excluded, unreadable, or outside configured roots.")
         return None
 
-    def _paths(self, pkg):
+    def _paths(self, pkg, files_limit: int = MAX_FILES, entries_limit: int = MAX_ENTRIES):
         paths = set()
         entries = 0
 
@@ -223,7 +263,7 @@ class RepositoryEvidence:
         for root, start in walks:
             for directory, dirs, files in os.walk(start, followlinks=False, onerror=error):
                 entries += 1 + len(dirs) + len(files)
-                if entries > MAX_ENTRIES:
+                if entries > entries_limit:
                     self._note(pkg, "Repository traversal truncated at entry limit.")
                     return sorted(paths, key=self._priority)
                 dirs[:] = sorted(
@@ -237,7 +277,7 @@ class RepositoryEvidence:
                     path = Path(directory) / name
                     if self._safe(path, root):
                         paths.add(path)
-                        if len(paths) >= MAX_FILES:
+                        if len(paths) >= files_limit:
                             self._note(pkg, "Repository traversal truncated at file limit.")
                             return sorted(paths, key=self._priority)
         return sorted(paths, key=self._priority)
@@ -271,6 +311,34 @@ class RepositoryEvidence:
             return None, len(data)
         return _redact(text).splitlines(), len(data)
 
+    @staticmethod
+    def _fact(pkg, fact: str) -> None:
+        facts = getattr(pkg, "code_facts", None)
+        if facts is not None and fact not in facts:
+            facts.append(fact)
+
+    def _relative(self, path) -> str:
+        for root in self.source.roots:
+            try:
+                return Path(path).resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+        return str(path)
+
+    def _is_test(self, path) -> bool:
+        from ..testpaths import is_test
+
+        return is_test(self._relative(path))
+
+    def _scan(self, path):
+        """A file's lines for a search, outside the evidence budget; None if unreadable or too big."""
+        try:
+            if path.stat().st_size > MAX_FILE_BYTES:
+                return None
+            return path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+
     def _add(self, pkg, path, lines, lo, hi, label="source", limit=None) -> bool:
         header = _redact("File: " + json.dumps(str(path), ensure_ascii=True))
         covered = set()
@@ -281,6 +349,14 @@ class RepositoryEvidence:
         if not selected:
             return False
         remaining = min(self.max_chars, limit if limit is not None else self.max_chars) - sum(map(len, pkg.evidence_blocks))
+        package = _installed_package(path)
+        if package is None and self._is_test(path):
+            label = "test code — not production: what is called here the application does not call"
+        if package is not None:
+            # Read as the project's own, a library line confirms every CVE: every
+            # vulnerable package contains its vulnerable function.
+            label = (f"installed dependency source — package {package or 'unknown'}; "
+                     "shows what the library does, not what this project does")
         block = header + "\n[" + _redact(label) + "]"
         added = False
         for n in selected:
@@ -292,7 +368,7 @@ class RepositoryEvidence:
             added = True
         if added:
             pkg.evidence_blocks.append(block)
-            if path.suffix.lower() in _CODE_EXTENSIONS:
+            if path.suffix.lower() in _CODE_EXTENSIONS and package is None:
                 pkg.repository_code_collected = True
         return added
 
@@ -409,7 +485,7 @@ class RepositoryEvidence:
                 if not isinstance(line, int) or isinstance(line, bool) or line < 1:
                     self._note(pkg, "Read rejected: line must be a positive integer.")
                     continue
-                path = self._resolve(pkg, request.get("path"))
+                path = self._resolve(pkg, request.get("path"), installed=True)
                 if path:
                     lines = load(path)
                     if lines is not None:
@@ -426,21 +502,40 @@ class RepositoryEvidence:
                 matches = 0
                 skip = tuple(s.lower() for s in (request.get("skip_suffixes") or []))
                 skipped = 0
-                for path in self._paths(pkg):
+                in_tests = 0
+                scanned = 0
+                files_hit = 0
+                candidates = self._paths(pkg, SEARCH_FILES, SEARCH_ENTRIES)
+                for path in candidates:
                     if skip and path.name.lower().endswith(skip):
                         skipped += 1
                         continue
-                    lines = load(path)
-                    if lines is not None:
-                        for n, text in enumerate(lines, 1):
-                            if pattern in text:
-                                added = self._add(pkg, path, lines, n - 10, n + 10) or added
-                                matches += 1
-                                if matches >= MAX_LOCATIONS:
-                                    break
+                    # Scanning is not reading: only the windows it adds count against the
+                    # evidence budget, or one search over the code would exhaust it.
+                    lines = self._scan(path)
+                    if lines is None:
+                        continue
+                    if self._is_test(path):
+                        in_tests += sum(1 for text in lines if pattern in text)
+                        continue
+                    scanned += 1
+                    if not any(pattern in text for text in lines):
+                        continue
+                    files_hit += 1
+                    for n, text in enumerate(lines, 1):
+                        if pattern in text:
+                            added = self._add(pkg, path, lines, n - 10, n + 10) or added
+                            matches += 1
+                            if matches >= MAX_LOCATIONS:
+                                break
                     if matches >= MAX_LOCATIONS:
                         self._note(pkg, "Search windows truncated at match limit.")
                         break
+                if in_tests:
+                    self._note(pkg, f"search_code skipped {in_tests} match(es) of {pattern!r} in test and "
+                                    "docker-compose files: not production code.")
+                self._fact(pkg, _search_fact(pattern, matches, files_hit, scanned, in_tests,
+                                             truncated=len(candidates) >= SEARCH_FILES))
                 if skipped:
                     # Never a silent "nothing found" over code the search did not read.
                     self._note(pkg, f"search_code did not read {skipped} source file(s) a language server "

@@ -27,6 +27,8 @@ def _triage_options(p: argparse.ArgumentParser) -> None:
     p.set_defaults(resolve_symbols=None)
     p.add_argument("--no-lsp", action="store_true")
     p.add_argument("--fail-on", choices=["none", "confirmed", "review"], default="none")
+    p.add_argument("--no-preflight", action="store_true",
+                   help="skip the provider check before the run (offline tests only)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,7 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("target"); sc.add_argument("-s", "--scanner", action="append"); sc.add_argument("-o", "--out", default="out/scans"); sc.set_defaults(func=scan.cmd_scan)
     r = sub.add_parser("run", help="scan a source tree and triage the findings in one pass")
     r.add_argument("target"); r.add_argument("-s", "--scanner", action="append"); _triage_options(r)
-    r.add_argument("--lsp-config", type=Path); r.add_argument("--sbom", type=Path); r.add_argument("--no-deps", action="store_true"); r.set_defaults(func=scan.cmd_run)
+    r.add_argument("--lsp-config", type=Path); r.add_argument("--sbom", type=Path); r.add_argument("--no-deps", action="store_true")
+    r.add_argument("--install-deps", action="store_true",
+                   help="install npm dependencies from the public registry into a copy of the project, "
+                        "at the lock file's versions, so transitive paths can be traced")
+    r.set_defaults(func=scan.cmd_run)
     v = sub.add_parser("variants"); v.add_argument("verdicts"); v.add_argument("-f", "--findings"); v.add_argument("--source-root", action="append"); v.add_argument("-o", "--out"); v.set_defaults(func=reports.cmd_variants)
     q = sub.add_parser("queue"); q.add_argument("verdicts"); q.add_argument("-f", "--findings"); q.add_argument("-b", "--budget", type=float); q.add_argument("--no-cluster", action="store_true"); q.add_argument("--config", type=Path); q.add_argument("-o", "--out"); q.set_defaults(func=reports.cmd_queue)
     s = sub.add_parser("sbom"); s.add_argument("target"); s.add_argument("-o", "--out", required=True); s.add_argument("--sbom"); s.add_argument("--limit", type=int); s.set_defaults(func=scan.cmd_sbom)

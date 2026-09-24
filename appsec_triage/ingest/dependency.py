@@ -141,6 +141,56 @@ def _composer_packages(root: Path) -> list[tuple[str, str]]:
     return out
 
 
+def qualify_npm_names(findings, document) -> int:
+    """Restore `@scope/name` for npm packages a scanner reported without the scope.
+
+    wolfee writes `ui` for `@nuxt/ui` and `core` for `@vue/core`; no vulnerability
+    database knows an npm package called `ui`, and two stripped names can collide.
+    The run's own SBOM carries full purl names, and the scope is taken only when
+    exactly one candidate fits.
+    """
+    from ..sca import sbom as sbom_mod
+
+    if not document:
+        return 0
+    catalogue: list[tuple[str, str]] = []
+    known: set[str] = set()
+    for item in sbom_mod.components(document).values():
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        known.add(name.lower())
+        # @types/* ships type declarations, never the code a CVE is about, so it is
+        # not a candidate for any bare name.
+        if name.startswith("@") and "/" in name and not name.lower().startswith("@types/"):
+            catalogue.append((name, (item.get("version") or "").strip()))
+    if not catalogue:
+        return 0
+
+    fixed = 0
+    for finding in findings:
+        dep = getattr(finding, "dependency", None)
+        if dep is None or not dep.package or "/" in dep.package:
+            continue
+        if (dep.ecosystem or "").strip().lower() not in ("npm", "node", "javascript"):
+            continue
+        short = dep.package.lower()
+        # The decisive test: a package the SBOM lists under this very name is not a
+        # stripped scope, it is that package. `express` is not `@types/express`.
+        if short in known:
+            continue
+        matches = {name for name, _ in catalogue if name.lower().endswith("/" + short)}
+        if len(matches) > 1:
+            version = (dep.installed_version or "").lstrip("vV")
+            matches = {name for name, v in catalogue
+                       if name.lower().endswith("/" + short) and v.lstrip("vV") == version}
+        if len(matches) != 1:
+            continue
+        finding.dependency = dep.model_copy(update={"package": matches.pop()})
+        fixed += 1
+    return fixed
+
+
 def qualify_composer_names(findings, roots) -> int:
     """Restore `vendor/name` for Composer packages a scanner reported by the bare name.
 

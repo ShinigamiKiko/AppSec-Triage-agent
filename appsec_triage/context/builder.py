@@ -244,13 +244,17 @@ def _enrich_dependency(dep, index, roots, signals):
         imported = is_imported(dep.package, dep.ecosystem, list(roots))
 
     if dev_only:
+        # Declared for development — which is not the same as "does not ship": a bundler
+        # compiles imported devDependencies into the build, and an image built without
+        # `--production` carries all of them. The shipping check in the dependency chain
+        # replaces this signal with the answer; until then it only says what the manifest says.
         signals.append(
             HeuristicSignal(
-                name="dev_dependency_only",
-                detail=f"{dep.package} is listed in the lockfile's development section — it builds and "
-                "tests the application and does not ship",
-                direction="toward_fp",
-                weight=0.6,
+                name="declared_dev_dependency",
+                detail=f"{dep.package} is declared in a development section (devDependencies/require-dev/"
+                "lockfile dev). That alone does not prove it stays out of the shipped artifact.",
+                direction="neutral",
+                weight=0.0,
             )
         )
     if imported:
@@ -263,6 +267,36 @@ def _enrich_dependency(dep, index, roots, signals):
             )
         )
     return dep.model_copy(update={"dev_only": dev_only, "imported": imported})
+
+
+def _ships_text(dep) -> str:
+    shipped = getattr(dep, "shipped", None)
+    if shipped:
+        return {
+            "runtime": "yes — the running application loads it",
+            "image_only": "in the runtime image, but nothing that runs loads it",
+            "build_only": "no — build and test only",
+        }.get(shipped, "unknown")
+    return "unknown (declared in a development section)" if dep.dev_only else ("yes" if dep.dev_only is False else "unknown")
+
+
+def apply_shipping(pkg: EvidencePackage, facts) -> None:
+    """Replace the manifest-section guess with what the shipping check established."""
+    if facts is None or pkg.dependency is None:
+        return
+    from ..models import HeuristicSignal
+
+    pkg.heuristic_signals = [s for s in pkg.heuristic_signals
+                             if s.name not in ("declared_dev_dependency", "dev_dependency_only")]
+    direction = {"runtime": "toward_confirmed", "build_only": "toward_fp"}.get(facts.shipped, "neutral")
+    pkg.heuristic_signals.append(HeuristicSignal(
+        name="shipping", detail=facts.render(), direction=direction,
+        weight=0.5 if facts.shipped in ("runtime", "build_only") else 0.0))
+    pkg.dependency = pkg.dependency.model_copy(update={
+        "dev_only": facts.shipped == "build_only",
+        "shipped": facts.shipped,
+        "runtime": facts.where,
+    })
 
 
 def render_for_prompt(pkg: EvidencePackage) -> str:
@@ -328,9 +362,11 @@ def render_for_prompt(pkg: EvidencePackage) -> str:
             f"installed: {dep.installed_version or 'not reported'}",
             f"fixed in: {', '.join(dep.fixed_versions) if dep.fixed_versions else 'no fix published'}",
             f"upgrade target for this branch: {dep.upgrade_target or 'none above the installed version'}",
-            f"ships to production: {'no — development only' if dep.dev_only else ('yes' if dep.dev_only is False else 'unknown')}",
+            f"ships to production: {_ships_text(dep)}",
             f"named in our source: {'yes' if dep.imported else ('not found — see the note in the prompt' if dep.imported is False else 'unknown')}",
         ]
+        if getattr(dep, "runtime", None) and dep.shipped == "runtime":
+            lines.append(f"runs in: {dep.runtime} (browser = client bundle, node = server, both = SSR)")
         if dep.advisory_url:
             lines.append(f"advisory: {dep.advisory_url}")
 
@@ -347,6 +383,9 @@ def render_for_prompt(pkg: EvidencePackage) -> str:
                   *pkg.evidence_blocks]
         if pkg.repository_code_collected:
             lines.append("Source code was read from the repository; the original scanner snippet may be absent.")
+    if getattr(pkg, "code_facts", None):
+        lines += ["", "=== WHAT THE CODE WALK CHECKED (searches and language-server lookups, verbatim answers) ===",
+                  *(f"- {fact}" for fact in pkg.code_facts)]
     if pkg.context_notes:
         lines += ["", "=== CONTEXT LIMITATIONS ===", *pkg.context_notes]
     return "\n".join(lines)

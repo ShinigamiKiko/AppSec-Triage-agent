@@ -22,7 +22,6 @@ _SKIP_IN_DIFF = re.compile(
     r"(^|/)(tests?|spec|fixtures?|samples?|docs?)/|CHANGELOG|\.md$", re.IGNORECASE)
 _NOT_SHIPPED = re.compile(r"(^|/)(samples?|tests?|docs?|examples?)/", re.IGNORECASE)
 
-SYSTEM = registry.step("symbol")
 
 SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -232,8 +231,78 @@ def _declared(name: str, files: dict[str, str]) -> list[str]:
     return [path for path, text in files.items() if pattern.search(text)]
 
 
+def _declaration_state(name: str, files: dict[str, str]) -> bool | None:
+    """Is `name` part of the installed package: yes, no, or cannot tell.
+
+    A declaration pattern sees `function post(` and `post(…) {`, but not a method
+    stamped onto a prototype in a loop — axios builds get/post/put that way:
+    `['get', 'post'].forEach(m => Axios.prototype[m] = …)`. Nor a property export or
+    a defineProperty. When the name is there only in such a form, "not declared"
+    would be a false fact; the honest answer is that it cannot be told.
+    """
+    if not name or not files:
+        return None
+    if _declared(name, files):
+        return True
+    escaped = re.escape(name)
+    trace = re.compile(rf"""['"`]{escaped}['"`]|\.\s*{escaped}\s*=(?!=)|\[\s*['"`]{escaped}['"`]\s*\]""")
+    if any(trace.search(text) for text in files.values()):
+        return None
+    return False
+
+
 _MAX_LISTED = 40
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+# Words a model puts where a class name belongs. None of them is a class, and the
+# search would otherwise look for a call of `ServeResult` on a class called `type`.
+_KIND_WORDS = {"function", "method", "class", "unknown", "none", "type", "interface", "enum",
+               "constant", "const", "object", "variable", "var", "property", "field", "module",
+               "namespace", "keyword", "definition", "typedef", "struct", "export", "default"}
+# Kinds nothing can call: the flaw runs in whichever function uses them.
+_NOT_CALLABLE = {"type", "interface", "enum", "constant", "const", "object", "variable", "var",
+                 "property", "field", "keyword", "definition", "typedef", "struct"}
+
+
+def _split_kind(value: str) -> tuple[str, str]:
+    """(class, kind) from the model's class field: a kind word is not a class name."""
+    klass = (value or "").split("\\")[-1].strip()
+    lowered = klass.lower()
+    if " " in klass or lowered in _KIND_WORDS:
+        words = set(lowered.split())
+        kind = next((w for w in ("constant", "const", "type", "interface", "enum", "object",
+                                 "variable", "property", "field", "keyword", "definition",
+                                 "typedef", "struct") if w in words), lowered)
+        return "", kind
+    return klass, ""
+
+
+def _users_of(name: str, files: dict[str, str], limit: int = 6) -> list[str]:
+    """Functions of the installed package whose body mentions `name`.
+
+    A constant, a type or a keyword definition is never called; what an application
+    runs is the function that reads it. Those functions are what to search for.
+    """
+    from . import declarations as decl
+
+    if not name or not files:
+        return []
+    pattern = re.compile(rf"(?<![\w$]){re.escape(name)}(?![\w$])")
+    found: list[str] = []
+    for path, text in files.items():
+        if decl.language_of(path) is None or "test" in path.lower():
+            continue
+        parsed = None
+        for match in pattern.finditer(text):
+            if parsed is None:
+                parsed = decl.declarations(path, text)
+            enclosing = decl.enclosing_in(parsed, match.start())
+            if enclosing is None or enclosing.name == name or enclosing.name in found:
+                continue
+            found.append(enclosing.name)
+            if len(found) >= limit:
+                return found
+    return found
 _LOOKS_LIKE_A_FILE = re.compile(
     r"\.(?:js|mjs|cjs|ts|php|py|go|rb|java|json|min\.js)$", re.IGNORECASE)
 
@@ -308,7 +377,6 @@ def _candidate_symbol(advisory: Advisory, names: list[str]) -> VulnerableSymbol 
                    "наличие вызова в проекте проверяется отдельно")
     return symbol
 
-_LAST_RESORT = registry.step("symbol-last-resort")
 
 _LAST_RESORT_SCHEMA = {
     "type": "object",
@@ -335,6 +403,8 @@ def _carry_context(base: VulnerableSymbol, fallback: VulnerableSymbol) -> Vulner
     fallback.required_actions = base.required_actions or fallback.required_actions
     fallback.search_targets = base.search_targets or fallback.search_targets
     fallback.source_stage = base.source_stage or fallback.source_stage
+    if fallback.declared_in_installed is None:
+        fallback.declared_in_installed = base.declared_in_installed
     if base.note:
         fallback.note = f"{base.note}; {fallback.note}"
     return fallback
@@ -425,7 +495,7 @@ class SymbolResolver:
 
     def _ask(self, user: str) -> dict:
         try:
-            return json.loads(self._client.complete(SYSTEM, user, json_schema=SCHEMA).text)
+            return json.loads(self._client.complete(registry.step("symbol"), user, json_schema=SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - provider/schema failures are intentionally fail-soft
             log.warning("symbol extraction failed: %s", exc)
             return {"vulnerable_function": "", "vulnerable_class": "",
@@ -449,12 +519,12 @@ class SymbolResolver:
         ])
         try:
             answer = json.loads(self._client.complete(
-                _LAST_RESORT, prompt, json_schema=_LAST_RESORT_SCHEMA).text)
+                registry.step("symbol-last-resort"), prompt, json_schema=_LAST_RESORT_SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - one dead call, not the run
             log.warning("last-resort naming failed for %s: %s", advisory.advisory_id, exc)
             return None
 
-        klass = (answer.get("klass") or "").split("\\")[-1].strip()
+        klass, _ = _split_kind(answer.get("klass") or "")
         names: list[str] = []
         for value in answer.get("names") or []:
             name = str(value).split("::")[-1].split(".")[-1].strip().rstrip("()")
@@ -555,10 +625,7 @@ class SymbolResolver:
             scope = "unknown"
         if names and scope == "package":
             scope = "function"
-        klass = (str(symbols[0].get("class") or "").split("\\")[-1].strip()
-                 if symbols else "")
-        if klass.lower() in {"function", "method", "class", "unknown", "none"}:
-            klass = ""
+        klass, _ = _split_kind(str(symbols[0].get("class") or "") if symbols else "")
         symbol = VulnerableSymbol(
             advisory_id=advisory.advisory_id, package=advisory.package,
             aliases=tuple(advisory.aliases), function=names[0] if names else "",
@@ -645,7 +712,7 @@ class SymbolResolver:
             answer["vulnerable_file"] = answer.get("vulnerable_file") or name
             name = ""
 
-        klass = (answer.get("vulnerable_class") or "").split("\\")[-1].strip()
+        klass, kind = _split_kind(answer.get("vulnerable_class") or "")
         path = (answer.get("vulnerable_file") or "").strip()
 
         base.function = name
@@ -659,7 +726,7 @@ class SymbolResolver:
         installed: dict[str, str] = {}
         if name and registries.supported(advisory.ecosystem):
             installed = self._source_for(advisory.ecosystem, advisory.package, version)
-        declared = bool(_declared(name, installed)) if installed else None
+        declared = _declaration_state(name, installed) if installed else None
         existed = _existed_before_fix(name, diff)
 
         base.steps = steps
@@ -706,6 +773,17 @@ class SymbolResolver:
                          "похоже на обойдённый валидатор, а не на уязвимую функцию")
             base.function = ""
             base.klass = ""
+        elif name and kind in _NOT_CALLABLE:
+            users = _users_of(name, installed)
+            if users:
+                base.note = (f"{name} — {kind}, а не функция: вызвать его нельзя. Ищутся функции "
+                             f"{advisory.package}, которые его используют: {', '.join(users[:4])}")
+                base.function, base.klass = users[0], ""
+                base.candidates = tuple((user, "") for user in users)
+            else:
+                base.note = (f"{name} — {kind}, а не функция, и в установленном {advisory.package} "
+                             "не найдено функций, которые его используют — искать по нему нечего")
+                base.function, base.klass = "", ""
         elif name:
             base.note = base.strength
 

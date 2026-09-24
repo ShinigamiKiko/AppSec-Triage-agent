@@ -15,10 +15,17 @@ _REGISTRY = {
 
 
 def build_client(cfg: ProviderConfig) -> LLMClient:
+    if cfg.kind == "mailbox":
+        # A local testing provider (the evaluator answers as the model, through files).
+        # It is not part of the repository: imported only when asked for.
+        try:
+            from .mailbox import MailboxClient
+        except ImportError:
+            raise ConfigError(f"provider '{cfg.name}': the mailbox testing provider is not "
+                              "installed here") from None
+        return MailboxClient(cfg)  # type: ignore[return-value]
     try:
         klass = _REGISTRY[cfg.kind]
     except KeyError:
         raise ConfigError(f"provider '{cfg.name}': unsupported kind '{cfg.kind}'. Known: {sorted(_REGISTRY)}") from None
     return klass(cfg)  # type: ignore[return-value]
-
-

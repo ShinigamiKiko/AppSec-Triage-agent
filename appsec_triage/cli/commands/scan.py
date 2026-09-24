@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from ... import scanners
@@ -47,9 +49,78 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0 if any(r.ok for r in results) else 1
 
 
+def _prepare_sbom(target: Path, scan_dir: Path, given: str | None) -> Path | None:
+    """The run's SBOM, written where ingest will not read it as findings."""
+    from ...sca import sbom as sbom_mod
+
+    if given:
+        return Path(given)
+    if not sbom_mod.available():
+        print("  ! cdxgen не установлен — прямые и транзитивные пакеты не различить", file=sys.stderr)
+        return None
+    document, problem = sbom_mod.generate(target)
+    if document is None:
+        print(f"  ! SBOM не снят: {problem}", file=sys.stderr)
+        return None
+    # A dot-prefixed name keeps ingest from parsing the SBOM as a findings file.
+    path = scan_dir / ".sbom.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+    components = len(sbom_mod.components(document))
+    print(f"→ SBOM: {components} компонент(ов) -> {path}", file=sys.stderr)
+    return path
+
+
+def _install_dependencies(target: Path) -> Path:
+    """A copy of `target` with its dependencies installed, or `target` itself.
+
+    The bridge into a parent package reads the parent's installed source; without
+    it every transitive finding ends as "the path could not be checked".
+    """
+    from ...sca import install as install_mod
+
+    if not install_mod.needs_install(target):
+        return target
+    workspace = Path(os.environ.get("APPSEC_WORKSPACE")
+                     or Path(tempfile.gettempdir()) / "appsec-workspace")
+    print(f"→ зависимости: ставлю с {install_mod.PUBLIC_REGISTRY} в копию проекта {workspace}",
+          file=sys.stderr)
+    result = install_mod.install(target, workspace)
+    if result.rewritten:
+        print(f"  → {result.rewritten} адрес(ов) lock-файла переведены с приватного прокси на "
+              "публичный реестр — версии прежние", file=sys.stderr)
+    for item in result.dropped[:12]:
+        print(f"  ! не установлен: {item}", file=sys.stderr)
+    if not result.usable:
+        print(f"  ! зависимости не поставлены: {result.problem or 'дерево пустое'} — "
+              "скан пойдёт без node_modules", file=sys.stderr)
+        return target
+    versions = "из lock-файла" if result.faithful else "разрешены заново — lock-файла нет"
+    print(f"→ установлено пакетов: {result.installed} ({result.tool}, версии {versions})",
+          file=sys.stderr)
+    return result.workspace
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     target = Path(args.target).resolve()
     out = Path(args.out).resolve()
+    if not getattr(args, "no_preflight", False):
+        # Before the scanners: they take minutes, a rejected key takes one call.
+        from ...config import load_pipeline_config, load_provider_config
+        from ..common import node_modules_problem, preflight_provider
+        cfg = load_pipeline_config(getattr(args, "config", None))
+        provider_cfg = load_provider_config(getattr(args, "provider", None) or cfg.provider)
+        if problem := preflight_provider(provider_cfg):
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+        args._preflight_done = True
+        print(f"→ провайдер {provider_cfg.name} отвечает", file=sys.stderr)
+        if getattr(args, "install_deps", False):
+            target = _install_dependencies(target)
+        if problem := node_modules_problem([target]):
+            print(f"  ! {problem}", file=sys.stderr)
+    elif getattr(args, "install_deps", False):
+        target = _install_dependencies(target)
     scan_dir = out / "scans"
     if out.is_relative_to(target):
         relative = out.relative_to(target)
@@ -61,9 +132,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("error: scanners produced no readable report", file=sys.stderr)
         return 1
     wolfee_report = scan_dir / "wolfee.sarif.json"
-    if not getattr(args, "no_deps", False) and not wolfee_report.is_file():
-        deps_file = scan_dir / "dependencies.json"
-        if cmd_sbom(argparse.Namespace(target=target, out=deps_file, sbom=getattr(args, "sbom", None), limit=0)) != 0:
-            print("  ! зависимости не разобраны — триаж пойдёт только по находкам сканеров", file=sys.stderr)
+    if not getattr(args, "no_deps", False):
+        # One cdxgen pass per run, whoever found the vulnerabilities. wolfee reports
+        # npm names without their scope and without edges; the SBOM has both, so the
+        # same document repairs the names and builds the dependency graph.
+        sbom_file = _prepare_sbom(target, scan_dir, getattr(args, "sbom", None))
+        if sbom_file:
+            args.sbom = str(sbom_file)
+        if not wolfee_report.is_file():
+            deps_file = scan_dir / "dependencies.json"
+            if cmd_sbom(argparse.Namespace(target=target, out=deps_file,
+                                           sbom=str(sbom_file) if sbom_file else None,
+                                           limit=0)) != 0:
+                print("  ! зависимости не разобраны — триаж пойдёт только по находкам сканеров", file=sys.stderr)
     args.scan_dir = scan_dir
     return run_triage(args, scan_dir, out, [target])
