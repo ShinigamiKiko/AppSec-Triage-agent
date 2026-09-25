@@ -78,6 +78,9 @@ class Scanner(ABC):
 
     def __init__(self, cfg: ScannerConfig) -> None:
         self.cfg = cfg
+        # The candidate that answered the version probe: a broken binary of the same
+        # name earlier on PATH (a project's own Psalm) must not hide a working one.
+        self._binary: str | None = None
 
 
     def available(self) -> Availability:
@@ -92,7 +95,9 @@ class Scanner(ABC):
         return Availability(usable=False, detail="; ".join(problems))
 
     def resolve_binary(self, default: str) -> str:
-        """The first configured candidate that exists, else PATH."""
+        """The candidate the version probe accepted; before a probe, the first that exists."""
+        if self._binary:
+            return self._binary
         configured = self.cfg.binary
         if not configured:
             return default
@@ -104,22 +109,40 @@ class Scanner(ABC):
                 return str(path) if path.is_file() else str(candidate)
         return str(Path(str(candidates[0])).expanduser())
 
+    def _candidates(self, first: str) -> list[str]:
+        """Every configured binary in order; `first` alone when none is configured."""
+        configured = self.cfg.binary
+        if not configured:
+            return [first]
+        listed = [configured] if isinstance(configured, str) else list(configured)
+        return [str(Path(str(c)).expanduser()) if str(c).startswith("~") else str(c) for c in listed]
+
     def _probe_native(self) -> Availability:
         argv = self._native_version_argv()
         if not argv:
             return Availability(False, detail="no native invocation defined")
-        exe = argv[0]
-        on_disk = Path(exe).expanduser()
-        if exe != sys.executable and shutil.which(exe) is None and not on_disk.is_file():
-            hint = " (set `binary:` in the scanner profile)" if not self.cfg.binary else ""
-            return Availability(False, detail=f"{exe!r} not on PATH and not a file{hint}")
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=_native_scanner_env(), check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return Availability(False, detail=f"version probe failed: {exc}")
-        if proc.returncode != 0:
-            return Availability(False, detail=f"version probe exited {proc.returncode}")
-        return Availability(True, mode="native", version=_first_line(proc.stdout or proc.stderr))
+        problems: list[str] = []
+        self._binary = None
+        for exe in self._candidates(argv[0]):
+            on_disk = Path(exe).expanduser()
+            if exe != sys.executable and shutil.which(exe) is None and not on_disk.is_file():
+                problems.append(f"{exe!r} not found")
+                continue
+            try:
+                proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=60,
+                                      env=_native_scanner_env(), check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                problems.append(f"{exe!r}: version probe failed: {exc}")
+                continue
+            if proc.returncode != 0:
+                tail = _first_line(proc.stderr or proc.stdout)
+                problems.append(f"{exe!r}: version probe exited {proc.returncode}"
+                                + (f" ({tail[:120]})" if tail else ""))
+                continue
+            self._binary = str(on_disk) if on_disk.is_file() else exe
+            return Availability(True, mode="native", version=_first_line(proc.stdout or proc.stderr))
+        hint = " (set `binary:` in the scanner profile)" if not self.cfg.binary else ""
+        return Availability(False, detail="; ".join(problems) + hint)
 
     def _probe_docker(self) -> Availability:
         if not self.cfg.image:

@@ -18,10 +18,13 @@
 # путей нет, — их проверяет модель при обходе кода.
 
 mode: native                 # docker не предлагается: контейнер не видит vendor таргета
-# Psalm ставится через composer global и обычно не на PATH.
+# Первым — Psalm 6 из образа: заглушка Symfony и плагин поиска вызовов рассчитаны на
+# него. `psalm` из PATH — только запасной: на раннере или в vendor/bin проекта бывает
+# свой Psalm, старый или без dev-зависимостей. Берётся первый, кто ответил на --version.
 binary:
-  - psalm
   - /opt/composer/vendor/bin/psalm.phar
+  - /usr/local/bin/psalm
+  - psalm
   - /opt/composer/vendor/bin/psalm
   - ~/.config/composer/vendor/bin/psalm
 image: null

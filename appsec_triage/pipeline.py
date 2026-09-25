@@ -203,14 +203,14 @@ class TriagePipeline:
 
             psalm_binary = None
             try:
-                import shutil
-
                 from .config import ConfigError, load_scanner_config
                 from .scanners.tools import PsalmScanner
 
-                candidate = PsalmScanner(load_scanner_config("psalm")).resolve_binary("psalm")
-                if Path(candidate).is_file() or shutil.which(candidate):
-                    psalm_binary = candidate
+                # The binary that answers `--version`, not the first `psalm` on PATH: a
+                # project's own Psalm there can be broken, or too old for our stub.
+                psalm = PsalmScanner(load_scanner_config("psalm"))
+                if psalm.available().usable:
+                    psalm_binary = psalm.resolve_binary("psalm")
             except ConfigError as exc:
                 log.warning("psalm scanner profile unreadable, PHP dependency analysis without Psalm: %s", exc)
 
