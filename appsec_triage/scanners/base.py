@@ -265,14 +265,14 @@ class Scanner(ABC):
             return ScanResult(scanner=self.name, ok=False, command=argv, error=str(exc))
 
         duration = time.monotonic() - started
-        stderr_tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+        stderr_tail = _cause_and_tail(proc.stderr or "")
 
         if self.writes_stdout:
             if not (proc.stdout or "").strip():
                 return ScanResult(
                     scanner=self.name, ok=False, command=argv, mode=avail.mode, version=avail.version,
                     duration_s=duration, stderr_tail=stderr_tail,
-                    error=f"produced no report on stdout (exit {proc.returncode}): {stderr_tail[-600:]}",
+                    error=f"produced no report on stdout (exit {proc.returncode}): {stderr_tail[:1000]}",
                 )
             out_file.write_text(proc.stdout, encoding="utf-8")
 
@@ -280,7 +280,7 @@ class Scanner(ABC):
             return ScanResult(
                 scanner=self.name, ok=False, command=argv, mode=avail.mode, version=avail.version,
                 duration_s=duration, stderr_tail=stderr_tail,
-                error=f"no report written (exit {proc.returncode}): {stderr_tail[-600:]}",
+                error=f"no report written (exit {proc.returncode}): {stderr_tail[:1000]}",
             )
 
         if proc.returncode not in self.success_exit_codes:
@@ -289,7 +289,7 @@ class Scanner(ABC):
                 duration_s=duration, stderr_tail=stderr_tail, output_path=out_file,
                 findings=self.count_findings(out_file),
                 error=f"exited {proc.returncode}, not a success code for this scanner "
-                      f"(expected one of {sorted(self.success_exit_codes)}): {stderr_tail[-400:]}",
+                      f"(expected one of {sorted(self.success_exit_codes)}): {stderr_tail[:800]}",
             )
 
         if reason := self.report_health(out_file):
@@ -309,3 +309,18 @@ class Scanner(ABC):
 
 def _first_line(text: str) -> str:
     return (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+
+
+_CAUSE = ("Uncaught ", "Fatal error", "PHP Fatal", "Exception:", "Error:", "error:")
+
+
+def _cause_and_tail(stderr: str, tail: int = 6) -> str:
+    """The line that says what broke, then the last lines.
+
+    A crash prints its cause first and a stack trace after it: the tail alone is the
+    trace (`#16 phar://…ProjectAnalyzer->check()`), never the reason.
+    """
+    lines = stderr.strip().splitlines()
+    last = lines[-tail:]
+    cause = next((line.strip() for line in lines[:-tail] if any(mark in line for mark in _CAUSE)), "")
+    return "\n".join(([f"{cause[:400]} …"] if cause else []) + last)
