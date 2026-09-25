@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -129,8 +130,11 @@ class Scanner(ABC):
                 problems.append(f"{exe!r} not found")
                 continue
             try:
+                # From a neutral directory: the job starts in the project, and a tool that
+                # reads the working directory first (Psalm looks for vendor/autoload.php
+                # next to composer.json before it answers --version) fails there.
                 proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=60,
-                                      env=_native_scanner_env(), check=False)
+                                      env=_native_scanner_env(), check=False, cwd=tempfile.gettempdir())
             except (OSError, subprocess.TimeoutExpired) as exc:
                 problems.append(f"{exe!r}: version probe failed: {exc}")
                 continue
