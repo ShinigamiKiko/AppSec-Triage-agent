@@ -7,6 +7,11 @@ base_url: ${OLLAMA_BASE_URL:-http://localhost:11434}
 temperature: 0.0
 max_tokens: 2200          # вердикт с трассой и обоснованием; на 1400 бывали обрывы
 
+# Рассуждающие модели (qwen3.5, qwen3, deepseek-r1) сначала пишут блок «мыслей»:
+# он идёт в счёт max_tokens и генерируется целиком до ответа. OLLAMA_THINK=false
+# его выключает; пусто — как решит модель. Для моделей без рассуждений не задавать.
+think: ${OLLAMA_THINK:-}
+
 # Ollama умеет constrained decoding по полной JSON Schema — самый строгий режим
 # из трёх провайдеров. Именно поэтому здесь ollama_format, а не json_object.
 json_mode: ollama_format

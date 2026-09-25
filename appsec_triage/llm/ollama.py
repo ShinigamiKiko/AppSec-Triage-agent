@@ -44,7 +44,13 @@ class OllamaClient(BaseHTTPClient):
         elif self.cfg.json_mode != "none":
             payload["format"] = "json"
 
-        return "/api/chat", payload
+        return "/api/chat", self._with_think(payload)
+
+    def _with_think(self, payload: dict[str, Any]) -> dict[str, Any]:
+        think = (self.cfg.think or "").strip().lower()
+        if think in ("true", "false"):
+            payload["think"] = think == "true"
+        return payload
 
     def _parse(self, body: dict[str, Any]) -> tuple[str, int | None, int | None]:
         text = (body.get("message") or {}).get("content", "")
@@ -55,8 +61,8 @@ class OllamaClient(BaseHTTPClient):
         return text, body.get("prompt_eval_count"), body.get("eval_count")
 
     def _tool_payload(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
-        return "/api/chat", {"model": self.model, "messages": messages, "tools": tools,
-                             "stream": False, "options": self._options()}
+        return "/api/chat", self._with_think({"model": self.model, "messages": messages, "tools": tools,
+                                              "stream": False, "options": self._options()})
 
     def _tool_parse(self, body: dict[str, Any]) -> ToolTurn:
         if body.get("done_reason") == "length":

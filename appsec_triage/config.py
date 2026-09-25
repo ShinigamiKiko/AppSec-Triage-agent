@@ -74,6 +74,10 @@ class ProviderConfig:
     budget_usd: float = 5.0
     keep_raw_response: bool = False
     tool_calling: bool = True
+    # Ollama's top-level `think` for hybrid-reasoning models: "false" skips the thinking
+    # block, whose tokens count against max_tokens and every one of which the GPU
+    # generates before the answer; "" leaves the model's default.
+    think: str = ""
 
     options: dict[str, Any] = field(default_factory=dict)
 
