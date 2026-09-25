@@ -512,6 +512,11 @@ class DependencyGraph:
         node = self._nodes.get(package.lower())
         return node.version if node else ""
 
+    def dependents(self, package: str) -> list[str]:
+        """Installed packages that require `package` and do not run only in development."""
+        key = package.lower()
+        return sorted(parent for parent in self._parents.get(key, ()) if self.scope(parent) != "dev")
+
     def placement(self, package: str, max_paths: int = 4) -> Placement:
         """How `package` got here, from every direct requirement that leads to it."""
         key = package.lower()

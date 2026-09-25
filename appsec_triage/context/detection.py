@@ -22,7 +22,18 @@ ECOSYSTEM_SUFFIXES = {
 }
 
 CONFIG_SUFFIXES = {".yaml", ".yml", ".json", ".toml", ".ini", ".env", ".xml", ".neon"}
-DEFAULT_SOURCE_SUFFIXES = set().union(*ECOSYSTEM_SUFFIXES.values(), CONFIG_SUFFIXES)
+# Templates call a language's code by name (`|spaceless`, `{{ format_args(...) }}`), but
+# no parser here reads them: they join the text searches that also read configuration,
+# never the language rules that parse imports.
+TEMPLATE_SUFFIXES = {
+    "npm": {".hbs", ".handlebars", ".ejs", ".pug"},
+    "composer": {".twig"},
+    "packagist": {".twig"},
+    "pypi": {".jinja", ".jinja2", ".j2"},
+    "python": {".jinja", ".jinja2", ".j2"},
+}
+DEFAULT_SOURCE_SUFFIXES = set().union(*ECOSYSTEM_SUFFIXES.values(), CONFIG_SUFFIXES,
+                                      *TEMPLATE_SUFFIXES.values())
 
 
 class DetectionError(RuntimeError):
@@ -74,6 +85,8 @@ def get_source_suffixes(
     
     if include_configs:
         suffixes.update(CONFIG_SUFFIXES)
+        for eco in ecosystems:
+            suffixes.update(TEMPLATE_SUFFIXES.get(eco, ()))
     
     log.info("Using ecosystems from APPSEC_ECOSYSTEMS: %s → %d extensions", raw, len(suffixes))
     return suffixes

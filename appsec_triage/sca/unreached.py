@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +90,43 @@ _SCHEMA = {
         "why": {"type": "string"},
     },
 }
+
+
+def _callback_patterns(name: str) -> list[re.Pattern[str]]:
+    """Ways a package hands one of its own methods to the framework by name."""
+    quoted = rf"""['"]{re.escape(name)}['"]"""
+    return [
+        # [$this, 'formatArgs'], [self::class, 'handle'], [Foo::class, 'handle']
+        re.compile(rf"\[\s*(?:\$this|self::class|static::class|__CLASS__|[\w\\]+::class)\s*,\s*{quoted}\s*\]"),
+        # getSubscribedEvents(): 'event' => 'onLogin' or 'event' => ['onLogin', 10]
+        re.compile(rf"=>\s*\[?\s*{quoted}"),
+        # 'Some\\Class::onLogin' as a string callable
+        re.compile(rf"""['"][\w\\]+::{re.escape(name)}['"]"""),
+        # getattr(obj, 'handle') / setattr-style dispatch
+        re.compile(rf"getattr\([^)]*{quoted}"),
+    ]
+
+
+def callback_registration(name: str, source: dict[str, str]) -> str:
+    """`file:line: code` where the package registers `name` as a callback, or "".
+
+    A listener, a template filter, a message handler is called by the framework, never
+    by the application: "no call from the project" says nothing about it.
+    """
+    if not name or not source:
+        return ""
+    patterns = _callback_patterns(name)
+    for path, text in source.items():
+        if name not in text:
+            continue
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                start = text.rfind("\n", 0, match.start()) + 1
+                end = text.find("\n", match.end())
+                line = text[start:end if end >= 0 else len(text)].strip()
+                return f"{path}:{text.count(chr(10), 0, match.start()) + 1}: {line[:160]}"
+    return ""
 
 
 @dataclass(slots=True)

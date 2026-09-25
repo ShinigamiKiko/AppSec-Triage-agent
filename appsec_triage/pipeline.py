@@ -248,6 +248,8 @@ class TriagePipeline:
         return record
 
     def _triage_one(self, finding: Finding, timings: dict[str, float]) -> TriageRecord:
+        if records.is_license(finding):
+            return records.license_risk(finding, provider=self.provider_cfg.name)
         if finding.misconfiguration:
             if entry := self.deployment.handled_by_platform(finding.rule_id):
                 return records.platform_handled(finding, entry, provider=self.provider_cfg.name)
@@ -467,6 +469,7 @@ class TriagePipeline:
                 responses.append(resp)
                 raw_verdict = parse_verdict(resp.text)
                 repaired = True
+            raw_verdict = self._with_quotes(system, user, raw_verdict, responses)
         except (LLMError, SchemaError) as exc:
             log.warning("finding %s: %s", finding.finding_id, exc)
             if self.cfg.fail_fast:
@@ -522,7 +525,7 @@ class TriagePipeline:
                 user = builder.render_for_prompt(candidate_pkg)
                 resp = self.client.complete(system, user, json_schema=VERDICT_SCHEMA)
                 responses.append(resp)
-                raw_verdict = parse_verdict(resp.text)
+                raw_verdict = self._with_quotes(system, user, parse_verdict(resp.text), responses)
                 pkg.evidence_blocks = candidate_pkg.evidence_blocks
                 pkg.context_notes = candidate_pkg.context_notes
                 pkg.repository_code_collected = candidate_pkg.repository_code_collected
@@ -662,6 +665,31 @@ class TriagePipeline:
             needs_other_vuln=policy_mod.needs_other_vulnerability(
                 advisory, chain.condition.statement if chain.condition is not None else ""),
         )
+
+    def _with_quotes(self, system: str, user: str, verdict, responses: list):
+        """A decisive verdict that quotes nothing gets one chance to cite the material.
+
+        Post-validation turns such a verdict into `unknown` ("no_evidence"), which is
+        right for a guess and wasteful for an answer the model simply left bare — a
+        closure it argued in the previous run and returned empty in this one.
+        """
+        bare_reason = not (verdict.reason or "").strip()
+        if verdict.verdict is VerdictLabel.unknown or (verdict.evidence and not bare_reason):
+            return verdict
+        ask = (f"{user}\n\n## Correction required\n"
+               f"Your verdict `{verdict.verdict.value}` cites no evidence"
+               + (" and gives no reason" if bare_reason else "")
+               + ". A decisive verdict quotes, character for character, the lines of the material "
+                 "above that decide it, and says why. Return it again as one JSON object with "
+                 "`evidence` quotes and a `reason`. If no line of the material supports it, return "
+                 "`unknown` with the question that would settle it.")
+        try:
+            resp = self.client.complete(system, ask, json_schema=VERDICT_SCHEMA)
+            responses.append(resp)
+            return parse_verdict(resp.text)
+        except (LLMError, SchemaError) as exc:
+            log.info("quote repair round failed: %s", str(exc)[:120])
+            return verdict
 
     def _raise_if_fatal(self) -> None:
         if (fatal := _fatal_of(self.client)) is not None:

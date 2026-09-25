@@ -19,6 +19,12 @@ resolution installs newer code than the one that ships and answers for it.
 
 Everything happens in a copy: the source tree is mounted read-only, and the
 project's own `.npmrc`/`.yarnrc` would send the install back to the proxy.
+
+Composer works the same way. A private Satis or proxy mirrors public packages as
+zip files the scan host cannot fetch, but every locked package also names its
+source repository and the exact commit: a GitHub one is fetched from GitHub's own
+archive of that commit, a package whose source is on a private host is dropped
+and named, and the project's `repositories` stop pointing at the mirror.
 """
 
 from __future__ import annotations
@@ -42,7 +48,12 @@ _YARN = os.environ.get("APPSEC_YARN", "yarn@1.22.22")
 
 _COPY_SKIP = {".git", "node_modules", ".codeql", "coverage", ".nuxt", ".next"}
 # Registry configuration of the developer's machine points at the private proxy.
-_REGISTRY_CONFIG = (".npmrc", ".yarnrc", ".yarnrc.yml")
+_REGISTRY_CONFIG = (".npmrc", ".yarnrc", ".yarnrc.yml", "auth.json")
+# Hosts a locked Composer package may be fetched from without the company network.
+_PUBLIC_HOSTS = {"github.com", "api.github.com", "codeload.github.com", "gitlab.com",
+                 "bitbucket.org", "repo.packagist.org", "packagist.org"}
+_GITHUB_REPO = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+_COMPOSER_SECTIONS = ("require", "require-dev")
 _SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
 # A spec that is not a version range: git, a URL, a local path, a workspace link.
 _NOT_REGISTRY = re.compile(r"^(?:git\+|git:|https?:|file:|link:|workspace:|github:|[\w.-]+/[\w.-]+(?:#|$))")
@@ -75,7 +86,90 @@ class InstallResult:
 
 
 def needs_install(project: Path) -> bool:
+    return _needs_npm(project) or _needs_composer(project)
+
+
+def _needs_npm(project: Path) -> bool:
     return (project / "package.json").is_file() and not (project / "node_modules").is_dir()
+
+
+def composer_vendor(project: Path) -> bool:
+    """Whether `project/vendor` is an installed Composer tree (not Go's vendored modules).
+
+    Such a tree holds other projects' lock files and bundled assets — phpunit's jQuery,
+    a library's own package-lock.json. Scanned as the project, they become hundreds of
+    dependencies it does not have; composer.lock is the project's dependency list.
+    """
+    return (Path(project) / "vendor" / "composer").is_dir()
+
+
+def _needs_composer(project: Path) -> bool:
+    return (project / "composer.lock").is_file() and not (project / "vendor").is_dir()
+
+
+def _host(url: str) -> str:
+    """The host of an https URL or of an scp-style git address (`git@host:path`)."""
+    url = str(url or "")
+    if "://" in url:
+        return url.split("://", 1)[1].split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+    if "@" in url and ":" in url:
+        return url.split("@", 1)[1].split(":", 1)[0].lower()
+    return ""
+
+
+def rewrite_composer_lock(lock: Path) -> tuple[int, list[str]]:
+    """Point every locked package at a public source; drop those only a private host has.
+
+    Returns (entries rewritten, packages dropped). The locked commit stays: a GitHub
+    source is fetched as GitHub's zip of exactly that reference.
+    """
+    data = json.loads(lock.read_text(encoding="utf-8"))
+    rewritten, dropped = 0, []
+    for section in ("packages", "packages-dev"):
+        kept = []
+        for package in data.get(section) or []:
+            dist = package.get("dist") or {}
+            source = package.get("source") or {}
+            reference = source.get("reference") or dist.get("reference")
+            if dist.get("type") == "path" or (not dist and not source):
+                kept.append(package)           # a local path or a metapackage: nothing to fetch
+                continue
+            if _host(dist.get("url", "")) in _PUBLIC_HOSTS:
+                kept.append(package)
+                continue
+            github = _GITHUB_REPO.search(str(source.get("url") or ""))
+            if github and reference:
+                package["dist"] = {"type": "zip", "reference": reference, "shasum": "",
+                                   "url": f"https://codeload.github.com/{github[1]}/{github[2]}"
+                                          f"/legacy.zip/{reference}"}
+                rewritten += 1
+                kept.append(package)
+            elif _host(source.get("url", "")) in _PUBLIC_HOSTS and reference:
+                package.pop("dist", None)      # Composer clones the public source instead
+                rewritten += 1
+                kept.append(package)
+            else:
+                dropped.append(package.get("name", "?"))
+        data[section] = kept
+    lock.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+    return rewritten, dropped
+
+
+def public_composer_manifest(manifest: Path, dropped: list[str]) -> None:
+    """The project's composer.json without the private mirror and the dropped packages."""
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    for section in _COMPOSER_SECTIONS:
+        for name in dropped:
+            (data.get(section) or {}).pop(name, None)
+    data.pop("repositories", None)             # back to Packagist, the public default
+    manifest.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+
+
+def _installed_composer(vendor: Path) -> int:
+    if not vendor.is_dir():
+        return 0
+    return sum(1 for owner in vendor.iterdir() if owner.is_dir() and owner.name not in ("bin", "composer")
+               for package in owner.iterdir() if package.is_dir())
 
 
 def copy_project(source: Path, workspace: Path) -> None:
@@ -168,7 +262,59 @@ def install(source: Path, workspace: Path, *, registry: str = PUBLIC_REGISTRY,
     except OSError as exc:
         result.problem = f"копия проекта не создана: {exc}"
         return result
+    tools = []
+    if _needs_npm(workspace):
+        _install_npm(workspace, result, registry, attempts, timeout_s)
+        tools.append(result.tool)
+    if _needs_composer(workspace):
+        _install_composer(workspace, result, timeout_s)
+        tools.append("composer")
+    result.tool = "+".join(t for t in tools if t)
+    result.workspace = workspace if result.installed else None
+    return result
 
+
+def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) -> None:
+    rewritten, dropped = rewrite_composer_lock(workspace / "composer.lock")
+    result.rewritten += rewritten
+    result.dropped += [f"{name} (исходники только на приватном хосте)" for name in dropped]
+    if (workspace / "composer.json").is_file():
+        public_composer_manifest(workspace / "composer.json", dropped)
+    result.faithful = True
+    home = workspace.parent / f".{workspace.name}-composer-home"
+    shutil.rmtree(home, ignore_errors=True)
+    env = {**os.environ, "COMPOSER_HOME": str(home), "COMPOSER_NO_INTERACTION": "1",
+           "COMPOSER_ALLOW_SUPERUSER": "1", "COMPOSER_NO_AUDIT": "1"}
+    run = dict(cwd=workspace, capture_output=True, text=True, env=env, encoding="utf-8",
+               errors="replace", check=False)
+    try:
+        # Composer 2.9 refuses to install versions with known advisories — exactly the
+        # versions a scan exists to look at.
+        subprocess.run(["composer", "config", "--global", "audit.block-insecure", "false"],
+                       timeout=60, **run)
+        # --no-dev: what production code reaches is the question, and a project's own dev
+        # Psalm in vendor/ hijacks the scanner's Psalm (its Psalm\ classes load first).
+        proc = subprocess.run(["composer", "install", "--no-interaction", "--no-progress",
+                               "--prefer-dist", "--ignore-platform-reqs", "--no-scripts",
+                               "--no-plugins", "--no-dev"], timeout=timeout_s, **run)
+    except subprocess.TimeoutExpired:
+        result.problem = f"composer не уложился в {timeout_s}s"
+        return
+    except OSError as exc:
+        result.problem = f"composer не запустился: {exc}"
+        return
+    installed = _installed_composer(workspace / "vendor")
+    result.installed += installed
+    if proc.returncode != 0:
+        lines = f"{proc.stdout}\n{proc.stderr}".strip().splitlines()
+        said = [line.strip() for line in lines if re.search(r"\b(?:error|failed|could not)\b", line, re.I)]
+        result.problem = (f"composer завершился с кодом {proc.returncode}"
+                          f"{f' (поставлено пакетов: {installed})' if installed else ''}: "
+                          f"{chr(10).join(said[:3] or lines[-4:])[:400]}")
+
+
+def _install_npm(workspace: Path, result: InstallResult, registry: str, attempts: int,
+                 timeout_s: int) -> None:
     manifest = workspace / "package.json"
     result.dropped += drop_unregistered(manifest)
     result.rewritten = (rewrite_lock(workspace / "yarn.lock", registry)
@@ -207,6 +353,4 @@ def install(source: Path, workspace: Path, *, registry: str = PUBLIC_REGISTRY,
         log.info("attempt %d: dropped %s, retrying", attempt, ", ".join(sorted(removable)))
 
     installed = workspace / "node_modules"
-    result.installed = sum(1 for _ in installed.iterdir()) if installed.is_dir() else 0
-    result.workspace = workspace if result.installed else None
-    return result
+    result.installed += sum(1 for _ in installed.iterdir()) if installed.is_dir() else 0

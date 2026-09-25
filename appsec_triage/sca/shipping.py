@@ -82,7 +82,8 @@ class ShippingFacts:
             "unknown": "поставку определить не удалось",
         }
         where = {"browser": "в браузере (клиентская сборка)", "node": "в Node на сервере",
-                 "both": "и в браузере, и в Node (SSR)", "unknown": "среда не определена"}
+                 "both": "и в браузере, и в Node (SSR)", "server": "на сервере",
+                 "unknown": "среда не определена"}
         lines = [f"поставка: {self.shipped} — {words.get(self.shipped, self.shipped)}"]
         if self.shipped == "runtime":
             lines.append(f"где выполняется: {where.get(self.where, self.where)}")
@@ -374,7 +375,8 @@ class ProjectShipping:
 
     def _by_scope(self, facts: ShippingFacts) -> ShippingFacts:
         if facts.scope == "runtime" or facts.declared == "dependencies":
-            facts.shipped, facts.where = "runtime", "node"
+            # Outside JS there is no browser bundle: the code runs in the server process.
+            facts.shipped, facts.where = "runtime", "server"
         elif facts.scope == "dev" or facts.declared == "devDependencies":
             facts.shipped = "image_only" if self.image.tree == "full" else "build_only"
         return facts

@@ -10,7 +10,7 @@
 # рассуждения, — но на настройке промптов она стоит времени.
 provider: deepseek
 prompt_pack: default
-max_workers: 4            # ограничивается сверху provider.concurrency
+max_workers: 8            # ограничивается сверху provider.concurrency; Psalm и CodeQL и так идут по очереди
 fail_fast: false          # false: сбой одного finding не роняет прогон
 
 # Сколько кода уезжает в промпт. Больше контекста != лучше: шум роняет качество.

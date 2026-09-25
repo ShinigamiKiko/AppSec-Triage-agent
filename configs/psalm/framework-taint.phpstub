@@ -1,0 +1,244 @@
+<?php
+// Where user input enters a Symfony application and where it does harm, for
+// Psalm's taint analysis. Symfony only: it is the one PHP framework in use here, and
+// marking PSR-7 as input would also taint the responses of HTTP clients (Guzzle).
+//
+// Psalm knows the superglobals as sources and a few builtins as sinks (mysqli_query,
+// echo, shell_exec), but not what frameworks wrap them in: a Symfony controller
+// reading `$request->query->get('q')` looked clean to it, and so did PDO::query and
+// every Doctrine call. The framework plugins that teach it this need the full
+// vimeo/psalm package and a matching framework version; this stub needs neither and
+// works with the PHAR.
+//
+// Sources: only methods that hand back raw input. Filtered accessors (getInt,
+// getBoolean, getDigits, getAlpha, getAlnum) return values an injection cannot ride
+// on and are left out. Sinks: the argument that is executed as SQL, DQL, a shell
+// command or HTML. Signatures are loose on purpose: a stub replaces the real one for
+// type inference, and `mixed` is the honest answer here.
+
+namespace Symfony\Component\HttpFoundation {
+    class ParameterBag
+    {
+        /** @psalm-taint-source input */
+        public function get(string $key, $default = null) {}
+
+        /** @psalm-taint-source input */
+        public function all(?string $key = null) {}
+
+        /** @psalm-taint-source input */
+        public function getString(string $key, string $default = '') {}
+    }
+
+    class InputBag extends ParameterBag
+    {
+        /** @psalm-taint-source input */
+        public function get(string $key, $default = null) {}
+
+        /** @psalm-taint-source input */
+        public function all(?string $key = null) {}
+
+        /** @psalm-taint-source input */
+        public function getString(string $key, string $default = '') {}
+    }
+
+    class HeaderBag
+    {
+        /** @psalm-taint-source input */
+        public function get(string $key, ?string $default = null) {}
+
+        /** @psalm-taint-source input */
+        public function all(?string $key = null) {}
+    }
+
+    class Request
+    {
+        /** @var InputBag */
+        public $query;
+        /** @var InputBag */
+        public $request;
+        /** @var InputBag */
+        public $cookies;
+        /** @var HeaderBag */
+        public $headers;
+        /** @var ParameterBag */
+        public $attributes;
+        /** @var ParameterBag */
+        public $server;
+
+        /** @psalm-taint-source input */
+        public function get(string $key, $default = null) {}
+
+        /** @psalm-taint-source input */
+        public function getContent(bool $asResource = false) {}
+
+        /** @psalm-taint-source input */
+        public function toArray() {}
+
+        /** @psalm-taint-source input */
+        public function getPathInfo() {}
+
+        /** @psalm-taint-source input */
+        public function getRequestUri() {}
+
+        /** @psalm-taint-source input */
+        public function getUri() {}
+
+        /** @psalm-taint-source input */
+        public function getQueryString() {}
+
+        /** @psalm-taint-source input */
+        public function getHost() {}
+    }
+}
+
+// ---- sinks ------------------------------------------------------------------
+
+namespace {
+    class PDO
+    {
+        /** @psalm-taint-sink sql $query */
+        public function query(string $query, ?int $fetchMode = null, ...$fetchModeArgs) {}
+
+        /** @psalm-taint-sink sql $statement */
+        public function exec(string $statement) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function prepare(string $query, array $options = []) {}
+    }
+}
+
+namespace Doctrine\DBAL {
+    class Connection
+    {
+        /** @psalm-taint-sink sql $sql */
+        public function executeQuery(string $sql, array $params = [], $types = [], $qcp = null) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function executeStatement(string $sql, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function executeUpdate(string $sql, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function executeCacheQuery(string $sql, array $params, $types, $qcp) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function query(string $sql) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function exec(string $sql) {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function prepare(string $sql) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchAssociative(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchNumeric(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchOne(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchAllAssociative(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchAllNumeric(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchFirstColumn(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchAllKeyValue(string $query, array $params = [], array $types = []) {}
+
+        /** @psalm-taint-sink sql $query */
+        public function fetchAllAssociativeIndexed(string $query, array $params = [], array $types = []) {}
+    }
+}
+
+namespace Doctrine\DBAL\Query {
+    class QueryBuilder
+    {
+        /** @psalm-taint-sink sql $predicates */
+        public function where($predicates, ...$more) {}
+
+        /** @psalm-taint-sink sql $where */
+        public function andWhere($where, ...$more) {}
+
+        /** @psalm-taint-sink sql $where */
+        public function orWhere($where, ...$more) {}
+
+        /** @psalm-taint-sink sql $having */
+        public function having($having, ...$more) {}
+
+        /** @psalm-taint-sink sql $sort */
+        public function orderBy($sort, $order = null) {}
+
+        /** @psalm-taint-sink sql $sort */
+        public function addOrderBy($sort, $order = null) {}
+
+        /** @psalm-taint-sink sql $expressions */
+        public function select(...$expressions) {}
+    }
+}
+
+namespace Doctrine\ORM {
+    class QueryBuilder
+    {
+        /** @psalm-taint-sink sql $predicates */
+        public function where($predicates) {}
+
+        /** @psalm-taint-sink sql $where */
+        public function andWhere($where) {}
+
+        /** @psalm-taint-sink sql $where */
+        public function orWhere($where) {}
+
+        /** @psalm-taint-sink sql $having */
+        public function having($having) {}
+
+        /** @psalm-taint-sink sql $sort */
+        public function orderBy($sort, $order = null) {}
+
+        /** @psalm-taint-sink sql $sort */
+        public function addOrderBy($sort, $order = null) {}
+    }
+
+    interface EntityManagerInterface
+    {
+        /** @psalm-taint-sink sql $dql */
+        public function createQuery($dql = '');
+
+        /** @psalm-taint-sink sql $sql */
+        public function createNativeQuery($sql, $rsm);
+    }
+
+    class EntityManager implements EntityManagerInterface
+    {
+        /** @psalm-taint-sink sql $dql */
+        public function createQuery($dql = '') {}
+
+        /** @psalm-taint-sink sql $sql */
+        public function createNativeQuery($sql, $rsm) {}
+    }
+}
+
+namespace Symfony\Component\Process {
+    class Process
+    {
+        /** @psalm-taint-sink shell $command */
+        public static function fromShellCommandline(string $command, ?string $cwd = null, ?array $env = null, $input = null, ?float $timeout = 60) {}
+    }
+}
+
+namespace Symfony\Component\HttpFoundation {
+    class Response
+    {
+        /** @psalm-taint-sink html $content */
+        public function __construct(?string $content = '', int $status = 200, array $headers = []) {}
+
+        /** @psalm-taint-sink html $content */
+        public function setContent(?string $content) {}
+    }
+}

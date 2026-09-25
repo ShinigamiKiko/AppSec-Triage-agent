@@ -19,6 +19,17 @@ _SKIP_DIRS = {".git", "vendor", "node_modules", "venv", ".venv", "target",
               "build", "dist", "__pycache__"}
 _MAX_FILES = 8000
 _MAX_BYTES = 600_000
+# Inventories list every package and word a scanner met; they configure nothing, so a
+# condition "found" in one is found nowhere.
+_GENERATED_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+                    "composer.lock", "go.sum", "poetry.lock", "pipfile.lock", "cargo.lock",
+                    "packages.lock.json", "bom.json", "sbom.json"}
+_GENERATED_SUFFIXES = (".cdx.json", ".spdx.json", ".slices.json", ".sbom.json")
+# A line that only comments on the code does not switch anything on. Docblock lines are
+# not skipped — annotations there (`@Route(requirements=...)`) are configuration — and
+# neither are PHP attributes, `#[...]`.
+_COMMENT_LINE = re.compile(r"^\s*(?:#(?!\[)|;|//|<!--|\{#)")
+_HITS_PER_PART = 3
 
 
 class ConditionState(str, Enum):
@@ -135,8 +146,44 @@ def _files(root: Path, suffixes: set[str]):
         # production: `--host` in docker-compose is a developer's `yarn dev`.
         if is_test(path.relative_to(root).as_posix()):
             continue
+        name = path.name.lower()
+        if name in _GENERATED_NAMES or name.endswith(_GENERATED_SUFFIXES):
+            continue
         out.append(path)
     return out
+
+
+def _first_code_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """The first match on a line that is code or configuration, not a comment."""
+    for match in pattern.finditer(text):
+        start = text.rfind("\n", 0, match.start()) + 1
+        end = text.find("\n", match.end())
+        if not _COMMENT_LINE.match(text[start:end if end >= 0 else len(text)]):
+            return match
+    return None
+
+
+def _searchable(token: str) -> bool:
+    """A token a text search can tell apart: `.+` or `in` is in every file."""
+    return len(re.findall(r"\w", token)) >= 3
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][\w\\]*$")
+
+
+def _pattern(token: str) -> re.Pattern[str]:
+    """An identifier with a capital is a class or a constant: `Date` the constraint, not
+    `date.timezone` or `$date`. Anything else — a key, a word, a header such as
+    `X-Forwarded-For` that code writes in any case — is matched in any case."""
+    exact = bool(_IDENTIFIER.match(token)) and any(c.isupper() for c in token)
+    return re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", 0 if exact else re.IGNORECASE)
+
+
+def _parts(tokens: list[str], groups) -> list[list[str]]:
+    """The parts of a condition, each a list of alternatives; all parts must hold."""
+    parts = [[t.strip() for t in group if t and _searchable(t.strip())][:8] for group in (groups or ())]
+    parts = [part for part in parts if part]
+    return parts or ([tokens] if tokens else [])
 
 
 def check(
@@ -146,9 +193,19 @@ def check(
     where: str = "",
     *,
     decidable: bool = True,
+    groups=None,
 ) -> Condition:
-    """Look for `tokens` in the project, or say why the answer is not here."""
-    tokens = [t.strip() for t in tokens if t and t.strip()][:12]
+    """Look for `tokens` in the project, or say why the answer is not here.
+
+    `groups` splits the tokens by the parts of the condition that must hold at once
+    ("the sandbox is on" and "a template uses join"): the condition holds only where
+    every part is found, and a part found nowhere makes it absent. Without groups the
+    tokens are one part, any of them enough.
+    """
+    tokens = [t.strip() for t in tokens if t and _searchable(t.strip())][:12]
+    parts = _parts(tokens, groups)
+    if parts and not tokens:
+        tokens = [t for part in parts for t in part][:12]
     if not statement:
         return Condition(ConditionState.NONE)
     if not decidable or not tokens:
@@ -177,12 +234,13 @@ def check(
     except DetectionError:
         suffixes = DEFAULT_SOURCE_SUFFIXES
 
-    patterns = [(token, re.compile(rf"(?<![\w]){re.escape(token)}(?![\w])", re.IGNORECASE))
-                for token in tokens]
-    hits: list[str] = []
+    compiled = [[(token, _pattern(token)) for token in part] for part in parts]
+    found: list[list[str]] = [[] for _ in parts]
     scanned = 0
     for root in roots:
         for path in _files(Path(root), suffixes):
+            if all(len(hits) >= _HITS_PER_PART for hits in found):
+                break
             try:
                 if path.stat().st_size > _MAX_BYTES:
                     continue
@@ -190,18 +248,25 @@ def check(
             except OSError:
                 continue
             scanned += 1
-            for token, pattern in patterns:
-                match = pattern.search(text)
-                if match:
-                    line = text.count("\n", 0, match.start()) + 1
-                    hits.append(f"{path.relative_to(root)}:{line} ({token})")
-                    break
-            if len(hits) >= 5:
-                break
-    if hits:
-        return Condition(ConditionState.HOLDS, statement, tokens, where, hits, source="text")
+            for index, part in enumerate(compiled):
+                if len(found[index]) >= _HITS_PER_PART:
+                    continue
+                for token, pattern in part:
+                    match = _first_code_match(pattern, text)
+                    if match:
+                        line = text.count("\n", 0, match.start()) + 1
+                        found[index].append(f"{path.relative_to(root)}:{line} ({token})")
+                        break
     if not scanned:
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="в корнях исходников не оказалось файлов для поиска")
-    return Condition(ConditionState.ABSENT, statement, tokens, where,
-                     reason=f"просмотрено {scanned} файлов", source="text")
+    missing = [part for part, hits in zip(parts, found) if not hits]
+    if not missing:
+        return Condition(ConditionState.HOLDS, statement, tokens, where,
+                         [hit for hits in found for hit in hits][:6], source="text")
+    absent = [token for part in missing for token in part]
+    reason = f"просмотрено {scanned} файлов"
+    if len(parts) > 1:
+        reason += (f"; не найдена часть условия ({', '.join(absent[:5])}), "
+                   "а условие требует всех частей сразу")
+    return Condition(ConditionState.ABSENT, statement, absent, where, reason=reason, source="text")

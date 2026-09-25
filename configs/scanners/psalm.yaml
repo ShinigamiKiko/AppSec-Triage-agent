@@ -5,19 +5,23 @@
 # опасный паттерн». В SARIF Psalm кладёт codeFlows — ingest предпочтёт эту
 # запись любому менее информативному совпадению на том же месте (см. _richness).
 #
-# Если в целевом проекте нет psalm.xml или vendor/autoload.php, сканер создаёт
-# временный минимальный конфиг вне проекта. Прямые и межфайловые PHP-потоки
-# анализируются без скачивания проекта; framework-specific типы могут остаться
-# неразрешёнными и это отражается в покрытии.
+# Сканер всегда запускает Psalm со своим временным конфигом вне проекта, а
+# psalm.xml проекта не использует: тот написан под версию Psalm проекта, его
+# плагинам нужен vimeo/psalm, которого нет в PHAR, а baseline может заглушить
+# taint-находки. vendor/ читается только через автозагрузчик — ради типов.
 #
-# На Symfony-проектах распознавание $request->get() как источника и Doctrine
-# как стока зависит от моделей и плагинов проекта (например psalm/plugin-symfony).
-# Нулевой результат не доказывает, что все framework-specific пути проверены.
+# Источники ввода Symfony (Request и его ParameterBag) и стоки
+# (PDO, Doctrine DBAL/ORM, Symfony Process и Response) задаёт
+# configs/psalm/framework-taint.phpstub — плагины фреймворков не нужны.
+# Ввод, который проходит через рефлексию (Serializer/ParamConverter → DTO),
+# статический анализ не прослеживает: ноль находок не доказывает, что таких
+# путей нет, — их проверяет модель при обходе кода.
 
 mode: native                 # docker не предлагается: контейнер не видит vendor таргета
 # Psalm ставится через composer global и обычно не на PATH.
 binary:
   - psalm
+  - /opt/composer/vendor/bin/psalm.phar
   - /opt/composer/vendor/bin/psalm
   - ~/.config/composer/vendor/bin/psalm
 image: null

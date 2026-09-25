@@ -1,13 +1,16 @@
 """Records the pipeline can write without asking the model.
 
-Four cases end a finding before the verdict step: the dependency chain closed
+Five cases end a finding before the verdict step: the dependency chain closed
 it on a checked fact, the platform owns the misconfiguration, a
-misconfiguration has no code to reason about, and a secret is a fact rather
-than a judgement. Each builds the same TriageRecord the model path builds, so
-a report cannot tell where a decision came from except by `decided_by`.
+misconfiguration has no code to reason about, a secret is a fact rather
+than a judgement, and a dangerous license is a fact about a package. Each
+builds the same TriageRecord the model path builds, so a report cannot tell
+where a decision came from except by `decided_by`.
 """
 
 from __future__ import annotations
+
+import re
 
 from . import calibration as calibration_mod
 from . import reuse as reuse_mod
@@ -164,6 +167,66 @@ def misconfiguration(finding: Finding, *, provider: str) -> TriageRecord:
         provider=provider,
         model=None,
     )
+
+_LICENSE_RULE = re.compile(r"licen[cs]e", re.IGNORECASE)
+
+
+def is_license(finding: Finding) -> bool:
+    """A license finding: the package's license, not a flaw in its code.
+
+    Decided by the scanner's rule alone. Wolfee writes `license` and `licenseRisk`
+    into every result, advisories included ("MIT", "low"), so those properties say
+    what the package is licensed under, not that the finding is about it.
+    """
+    return bool(_LICENSE_RULE.search(finding.rule_id or ""))
+
+
+def license_risk(finding: Finding, *, provider: str) -> TriageRecord:
+    """Always confirmed: the license is what it is, whatever the code does.
+
+    It is not a vulnerability, so no model is asked and nothing about reachability
+    applies; the finding is marked as a dangerous license for whoever owns
+    compliance, and the decision — replace the package or approve the license —
+    is theirs, not a triage question.
+    """
+    props = (finding.raw or {}).get("properties") or {}
+    name = (finding.raw or {}).get("locations") or [{}]
+    logical = ((name[0].get("logicalLocations") or [{}])[0].get("name") or "") if name else ""
+    license_id = str(props.get("license") or "").strip()
+    risk = str(props.get("licenseRisk") or "").strip()
+    subject = logical or finding.code_context.file_path or "пакет"
+    said = (finding.description or finding.title or "").strip()
+    verdict = Verdict(
+        verdict=VerdictLabel.confirmed,
+        evidence_class=EvidenceClass.identifier_only,
+        confidence=0.95,
+        confidence_band="high",
+        confidence_rationale="Лицензию пакета сканер прочитал из его метаданных — это факт, а не вывод.",
+        cwe=finding.cwe,
+        evidence=[EvidenceQuote(quote=said[:200], why="лицензия из метаданных пакета")] if said else [],
+        reason=(f"Опасная лицензия: {subject}"
+                + (f" распространяется под {license_id}" if license_id else "")
+                + (f" (риск: {risk})" if risk else "")
+                + ". Это не уязвимость, а юридический риск: копилефт или ограничительная лицензия "
+                  "может обязать раскрыть исходники или запретить коммерческое использование. "
+                  "Решение — заменить пакет или согласовать лицензию."),
+        requires_human_review=False,
+    )
+    return TriageRecord(
+        finding_id=finding.finding_id,
+        cwe=finding.cwe,
+        file_path=finding.code_context.file_path,
+        severity=finding.severity,
+        rule_id=finding.rule_id,
+        start_line=finding.code_context.start_line,
+        fingerprint=reuse_mod.fingerprint(finding),
+        verdict=verdict,
+        kind="license",
+        decided_by="heuristics",
+        provider=provider,
+        model=None,
+    )
+
 
 def secret(finding: Finding, *, provider: str) -> TriageRecord | None:
     """Decide a credential finding from its value, or hand it over unjudged."""

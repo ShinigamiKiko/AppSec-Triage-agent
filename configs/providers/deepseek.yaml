@@ -19,7 +19,7 @@ max_retries: 3
 backoff_base_s: 1.5
 backoff_max_s: 30.0
 
-concurrency: 4
+concurrency: 8            # запросы ждут сеть, а не GPU; Psalm и CodeQL стоят в своей очереди
 
 pricing:
   input_usd_per_mtok: 0.28

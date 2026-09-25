@@ -369,6 +369,33 @@ class DependencyChain(ChainSupport):
             elif entry_audit is not None and lsp_audit is None:
                 lsp_audit = entry_audit
 
+        if lsp_audit is not None and symbol.function and not lsp_audit.reopens:
+            # "No call from the project" closes nothing for a method the package hands to
+            # the framework: an event listener, a template filter, a handler.
+            registered = unreached_mod.callback_registration(
+                symbol.function, self._resolver._source_for(
+                    dependency.ecosystem or "", dependency.package or "",
+                    dependency.installed_version or ""))
+            if registered:
+                lsp_audit.invisible_path = True
+                lsp_audit.quote = registered
+                lsp_audit.why = (f"{dependency.package} сам регистрирует {symbol.function} как колбэк "
+                                 "(слушатель события, фильтр шаблона, обработчик) — его вызывает "
+                                 "фреймворк, а не код проекта, поэтому отсутствие вызова в проекте "
+                                 "ничего не доказывает")
+
+        if (lsp_audit is not None and not lsp_audit.reopens
+                and not (bridge is not None and bridge.closes)):
+            # A direct dependency can be a framework's too: Twig is rendered by twig-bundle,
+            # symfony/yaml parsed by swagger-php. The project's own calls are not all calls.
+            users = self._dependents(dependency.package or "")
+            if users:
+                lsp_audit.invisible_path = True
+                lsp_audit.quote = f"{dependency.package} требуют: {', '.join(users[:8])}"
+                lsp_audit.why = (f"{dependency.package} вызывает не только код проекта — от него зависят "
+                                 f"{', '.join(users[:4])}{' и другие' if len(users) > 4 else ''}; "
+                                 "отсутствие вызовов из проекта не доказывает, что уязвимый код не вызывается")
+
         if not self._roots:
             problems.append("не задан ни один корень исходников — поиск не выполнялся")
 
@@ -412,7 +439,8 @@ class DependencyChain(ChainSupport):
 
         condition = conditions_mod.check(
             self._roots, symbol.precondition, list(symbol.precondition_tokens),
-            symbol.precondition_where, decidable=symbol.precondition_decidable)
+            symbol.precondition_where, decidable=symbol.precondition_decidable,
+            groups=getattr(symbol, "precondition_groups", ()))
         if condition.needs_a_person and self._deployment is not None and getattr(self._deployment, "usable", False):
             condition = conditions_mod.check_against_deployment(condition, self._deployment, self._client)
         exploit = self._exploit.assess(

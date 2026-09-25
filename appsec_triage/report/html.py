@@ -53,6 +53,7 @@ _COV_CSS = """
 .cov.ok{background:#0f2b18;border:1px solid #1f6b3a}
 .cov.bad{background:#3a1414;border:1px solid #8b2c2c}
 .cov.unknown{background:#2b2411;border:1px solid #7a6320}
+.cov.warn{background:#2b2411;border:1px solid #7a6320}
 .cov ul{margin:8px 0 8px 20px}
 """
 
@@ -61,10 +62,10 @@ _ORDER = {VerdictLabel.confirmed: 0, VerdictLabel.unknown: 1, VerdictLabel.false
 _CSS = """
 :root{--bg:#fff;--fg:#16181d;--muted:#666e7a;--line:#e3e6ea;--card:#fff;
 --confirmed:#c0392b;--unknown:#b7791f;--fp:#2f855a;--accent:#2b6cb0;
---k-sca:#0f766e;--k-sast:#7c3aed;--k-config:#64748b}
+--k-sca:#0f766e;--k-sast:#7c3aed;--k-config:#64748b;--k-license:#b45309}
 @media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--muted:#98a1ae;
 --line:#2a2f37;--card:#1b1e24;--confirmed:#ff6b5e;--unknown:#e2b33c;--fp:#5fcf8e;--accent:#6aa9f0;
---k-sca:#2dd4bf;--k-sast:#a78bfa;--k-config:#94a3b8}}
+--k-sca:#2dd4bf;--k-sast:#a78bfa;--k-config:#94a3b8;--k-license:#fbbf24}}
 *{box-sizing:border-box}
 body{margin:0;padding:2rem 1.25rem;background:var(--bg);color:var(--fg);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -88,11 +89,13 @@ overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 details.k-dependency{border-bottom:4px solid var(--k-sca)}
 details.k-weakness{border-bottom:4px solid var(--k-sast)}
 details.k-misconfiguration{border-bottom:4px solid var(--k-config)}
+details.k-license{border-bottom:4px solid var(--k-license)}
 .ktag{font-size:.68rem;font-weight:800;letter-spacing:.08em;padding:.12rem .5rem;border-radius:4px;
 color:#fff;white-space:nowrap;margin-left:auto}
 .ktag.k-dependency,.kfoot.k-dependency{background:var(--k-sca)}
 .ktag.k-weakness,.kfoot.k-weakness{background:var(--k-sast)}
 .ktag.k-misconfiguration,.kfoot.k-misconfiguration{background:var(--k-config)}
+.ktag.k-license,.kfoot.k-license{background:var(--k-license)}
 .kfoot{margin:.9rem -.9rem -.9rem;padding:.35rem .9rem;color:#fff;font-size:.75rem;font-weight:700;
 letter-spacing:.04em}
 .kfoot span{font-weight:400;opacity:.9;margin-left:.4rem}
@@ -350,6 +353,7 @@ _KINDS = (
     ("dependency", "Зависимости (SCA)", "чужой код: уязвимость в пакете, вопрос — доходит ли до неё этот проект"),
     ("weakness", "Свой код (SAST)", "код проекта: вопрос — является ли отмеченное место дефектом"),
     ("misconfiguration", "Конфигурация", "образ и окружение: настройка, прочитанная сканером буквально"),
+    ("license", "Лицензии", "опасная лицензия пакета: не уязвимость, а юридический риск"),
 )
 
 
@@ -359,6 +363,7 @@ _KIND_TAG = {
     "dependency": ("SCA", "уязвимость в зависимости: доходит ли до неё этот проект"),
     "weakness": ("SAST", "код проекта: является ли отмеченное место дефектом"),
     "misconfiguration": ("CONFIG", "конфигурация образа или окружения"),
+    "license": ("ЛИЦЕНЗИЯ", "опасная лицензия: не уязвимость, а юридический риск"),
 }
 
 
@@ -383,7 +388,7 @@ def _kind_of(r: TriageRecord) -> str:
     means re-deciding which question you are looking at on every row.
     """
     kind = (getattr(r, "kind", "") or "").strip()
-    if kind in ("dependency", "weakness", "misconfiguration"):
+    if kind in ("dependency", "weakness", "misconfiguration", "license"):
         return kind
     return "dependency" if (r.sca and r.sca.package) else "weakness"
 
@@ -462,7 +467,8 @@ def _finding_row(r: TriageRecord, *, russian: bool = False) -> str:
         kind = _e(r.sca.placement or "зависимость")
         shipped = {"runtime": "загружается приложением", "image_only": "в образе, не загружается",
                    "build_only": "только сборка/тесты"}.get(r.sca.shipped, "")
-        where = {"browser": "браузер", "node": "Node", "both": "браузер и Node (SSR)"}.get(r.sca.runtime, "")
+        where = {"browser": "браузер", "node": "Node", "both": "браузер и Node (SSR)",
+                 "server": "сервер"}.get(r.sca.runtime, "")
         if shipped:
             kind += f"<br>{_e(shipped)}" + (f" · {_e(where)}" if where and r.sca.shipped == "runtime" else "")
     else:
@@ -771,6 +777,30 @@ def _coverage_html(run: TriageRun) -> str:
     )
 
 
+def _image_hygiene_html(run: TriageRun) -> str:
+    """Packages the running code never loads but the production image still carries.
+
+    Their advisories close as unreachable, which hides the fix that removes them all:
+    installing production dependencies only.
+    """
+    packages = sorted({
+        f"{r.sca.package} {r.sca.installed_version or ''}".strip()
+        for r in run.records
+        if r.sca and r.sca.package and r.sca.shipped == "image_only"})
+    if not packages:
+        return ""
+    items = "".join(f"<li>{_e(p)}</li>" for p in packages[:20])
+    if len(packages) > 20:
+        items += f"<li>… и ещё {len(packages) - 20}</li>"
+    return (
+        '<div class="cov warn"><strong>В рабочем образе лежат пакеты, которые приложение не '
+        f"загружает ({len(packages)}).</strong><ul>{items}</ul>"
+        "Их уязвимости закрыты как недостижимые, но код остаётся в образе и достаётся любому, "
+        "кто в него попадёт. Ставьте в образ только production-зависимости: "
+        "<code>composer install --no-dev</code>, <code>npm ci --omit=dev</code>.</div>"
+    )
+
+
 def render(run: TriageRun, *, title: str = "SAST LLM Triage", russian: bool = False) -> str:
     counts = run.counts()
     total = len(run.records) or 1
@@ -827,6 +857,7 @@ model <strong>{_e(run.model)}</strong> · prompts <strong>{_e(run.prompt_pack)}<
 {overridden} verdict(s) corrected by post-validation ·
 cost ${run.total_cost_usd:.4f}</p>
 {coverage_html}
+{_image_hygiene_html(run)}
 <div class="cards">{cards_html}</div>
 <h2>By CWE</h2>
 <table><thead><tr><th>CWE</th><th>Confirmed</th><th>Unknown</th><th>Closed</th><th>Total</th></tr></thead>

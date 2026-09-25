@@ -83,8 +83,10 @@ def _install_dependencies(target: Path) -> Path:
         return target
     workspace = Path(os.environ.get("APPSEC_WORKSPACE")
                      or Path(tempfile.gettempdir()) / "appsec-workspace")
-    print(f"→ зависимости: ставлю с {install_mod.PUBLIC_REGISTRY} в копию проекта {workspace}",
-          file=sys.stderr)
+    # Only what this project has: the installer skips an ecosystem without a manifest.
+    sources = ([f"npm с {install_mod.PUBLIC_REGISTRY}"] if install_mod._needs_npm(target) else []) \
+        + (["composer с GitHub по коммитам из composer.lock"] if install_mod._needs_composer(target) else [])
+    print(f"→ зависимости: ставлю {', '.join(sources)} в копию проекта {workspace}", file=sys.stderr)
     result = install_mod.install(target, workspace)
     if result.rewritten:
         print(f"  → {result.rewritten} адрес(ов) lock-файла переведены с приватного прокси на "
@@ -93,8 +95,10 @@ def _install_dependencies(target: Path) -> Path:
         print(f"  ! не установлен: {item}", file=sys.stderr)
     if not result.usable:
         print(f"  ! зависимости не поставлены: {result.problem or 'дерево пустое'} — "
-              "скан пойдёт без node_modules", file=sys.stderr)
+              "скан пойдёт без установленных зависимостей", file=sys.stderr)
         return target
+    if result.problem:
+        print(f"  ! установлено не всё: {result.problem}", file=sys.stderr)
     versions = "из lock-файла" if result.faithful else "разрешены заново — lock-файла нет"
     print(f"→ установлено пакетов: {result.installed} ({result.tool}, версии {versions})",
           file=sys.stderr)

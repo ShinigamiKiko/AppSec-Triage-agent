@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -40,6 +41,8 @@ SCHEMA = {
         "precondition": {"type": "string"},
         "precondition_quote": {"type": "string"},
         "precondition_tokens": {"type": "array", "items": {"type": "string"}},
+        "precondition_groups": {"type": "array",
+                                "items": {"type": "array", "items": {"type": "string"}}},
         "precondition_where": {"type": "string"},
         "precondition_decidable": {"type": "boolean"},
     },
@@ -98,6 +101,7 @@ class VulnerableSymbol:
     precondition_quote: str = ""
     precondition_problem: str = ""
     precondition_tokens: tuple[str, ...] = field(default_factory=tuple)
+    precondition_groups: tuple[tuple[str, ...], ...] = field(default_factory=tuple)
     precondition_where: str = ""
     precondition_decidable: bool = True
     scope: str = ""
@@ -116,6 +120,15 @@ class VulnerableSymbol:
         return self.file or "(нет символа)"
 
 
+# Failures met while resolving on this thread: a model or network error degrades the
+# answer, and a degraded answer must not be kept for the next run.
+_TROUBLE = threading.local()
+
+
+def _trouble() -> None:
+    _TROUBLE.count = getattr(_TROUBLE, "count", 0) + 1
+
+
 def _fetch(url: str) -> str | None:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "appsec-triage"})
@@ -123,6 +136,8 @@ def _fetch(url: str) -> str | None:
             return response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.debug("could not fetch %s: %s", url, exc)
+        if not (isinstance(exc, urllib.error.HTTPError) and exc.code in (404, 410, 451)):
+            _trouble()      # a missing page is an answer; a dropped connection is not
         return None
 
 
@@ -395,6 +410,7 @@ def _carry_context(base: VulnerableSymbol, fallback: VulnerableSymbol) -> Vulner
     fallback.precondition_quote = base.precondition_quote
     fallback.precondition_problem = base.precondition_problem
     fallback.precondition_tokens = base.precondition_tokens
+    fallback.precondition_groups = base.precondition_groups
     fallback.precondition_where = base.precondition_where
     fallback.precondition_decidable = base.precondition_decidable
     fallback.what_changed = base.what_changed or fallback.what_changed
@@ -498,6 +514,7 @@ class SymbolResolver:
             return json.loads(self._client.complete(registry.step("symbol"), user, json_schema=SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - provider/schema failures are intentionally fail-soft
             log.warning("symbol extraction failed: %s", exc)
+            _trouble()
             return {"vulnerable_function": "", "vulnerable_class": "",
                     "vulnerable_file": "", "evidence": "", "why": f"ошибка модели: {exc}"}
 
@@ -522,6 +539,7 @@ class SymbolResolver:
                 registry.step("symbol-last-resort"), prompt, json_schema=_LAST_RESORT_SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - one dead call, not the run
             log.warning("last-resort naming failed for %s: %s", advisory.advisory_id, exc)
+            _trouble()
             return None
 
         klass, _ = _split_kind(answer.get("klass") or "")
@@ -593,6 +611,7 @@ class SymbolResolver:
                 "You extract dependency advisory context only.", prompt, json_schema=schema).text)
         except Exception as exc:  # noqa: BLE001 - fallback must not break triage
             log.warning("advisory context extraction failed for %s: %s", advisory.advisory_id, exc)
+            _trouble()
             return None
 
         symbols = [item for item in answer.get("symbols") or [] if isinstance(item, dict)]
@@ -646,6 +665,12 @@ class SymbolResolver:
         symbol.note = (f"контекст advisory извлечён агентом: scope={scope}; "
                        f"искать: {', '.join(targets[:12]) or 'не определено'}")
         return symbol
+
+    def resolve_clean(self, advisory: Advisory, version: str = "") -> tuple[VulnerableSymbol, bool]:
+        """(symbol, clean): clean when no model or network call failed on the way."""
+        _TROUBLE.count = 0
+        symbol = self.resolve(advisory, version)
+        return symbol, getattr(_TROUBLE, "count", 0) == 0
 
     def resolve(self, advisory: Advisory, version: str = "") -> VulnerableSymbol:
         base = VulnerableSymbol(
@@ -749,6 +774,11 @@ class SymbolResolver:
         base.precondition_tokens = tuple(
             str(t).strip() for t in (answer.get("precondition_tokens") or []) if str(t).strip()
         ) if condition else ()
+        groups = answer.get("precondition_groups") or []
+        base.precondition_groups = tuple(
+            tuple(str(t).strip() for t in group if str(t).strip())
+            for group in groups if isinstance(group, list)
+        ) if condition and isinstance(groups, list) else ()
         base.precondition_where = (
             (answer.get("precondition_where") or "").strip()[:200] if condition else "")
         base.precondition_decidable = bool(answer.get("precondition_decidable", True))

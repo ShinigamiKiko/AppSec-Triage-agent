@@ -114,6 +114,11 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
             print(f"error: invalid APPSEC_ECOSYSTEMS: {exc}", file=sys.stderr)
             return 2
 
+    # The advisory's resolved symbol is kept between runs (sca/resolve_cache.py). By default
+    # next to the report: a mounted output directory survives the container, and CI can
+    # cache it. APPSEC_CACHE_DIR points it elsewhere; set it empty to turn the cache off.
+    os.environ.setdefault("APPSEC_CACHE_DIR", str(Path(out) / ".appsec-cache"))
+
     cfg = load_pipeline_config(args.config)
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack

@@ -12,6 +12,7 @@ from collections import Counter
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
+from ..config import CONFIG_DIR
 from .base import Availability, Scanner, ScannerError, ScanResult
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,23 @@ class WolfeeScanner(Scanner):
     def _native_version_argv(self) -> list[str] | None:
         return [self.resolve_binary("wolfee"), "version"]
 
+    def scan(self, target: Path, out_dir: Path) -> ScanResult:
+        from ..sca.install import composer_vendor
+
+        target = Path(target).resolve()
+        if not composer_vendor(target):
+            return super().scan(target, out_dir)
+        # wolfee has no exclude option: it scans a copy without the Composer tree.
+        with tempfile.TemporaryDirectory(prefix="wolfee-") as work:
+            view = Path(work) / target.name
+
+            def ignore(directory: str, names: list[str]) -> set[str]:
+                return {"vendor", ".git"} & set(names) if Path(directory) == target else set()
+
+            shutil.copytree(target, view, ignore=ignore, symlinks=True)
+            log.info("wolfee: scanning a copy without vendor/ (installed Composer tree)")
+            return super().scan(view, out_dir)
+
     def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
         return [
             self.resolve_binary("wolfee"), "scan", "--reachable", str(target),
@@ -72,42 +90,49 @@ class PsalmScanner(Scanner):
             (Path(out_dir) / f"{self.name}{self.output_suffix}").unlink(missing_ok=True)
         except OSError as exc:
             return ScanResult(scanner=self.name, ok=False, error=f"cannot clear previous Psalm report: {exc}")
-        configured = next((target / name for name in ("psalm.xml", "psalm.xml.dist")
-                            if (target / name).is_file()), None)
-        self._runtime_config = configured
+        # Always the scanner's own config, never the project's psalm.xml. That file is
+        # written for the project's Psalm version (an issue type the PHAR no longer
+        # knows is enough to reject it), its plugins need a vimeo/psalm the PHAR does
+        # not load, and its baseline can silence the very taint issues wanted here.
+        # What the taint scan needs is the project's code and where input enters it.
+        return self._scan_autonomous(target, out_dir)
+
+    def _scan_autonomous(self, target: Path, out_dir: Path) -> ScanResult:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".xml", prefix="psalm-autonomous-", dir=out_dir,
+            encoding="utf-8", delete=False,
+        ) as handle:
+            # vendor/ is read for types through the autoloader, never
+            # analysed: the taint paths wanted are the project's own, and
+            # analysing an old dependency tree is what makes Psalm crash.
+            autoload = target / "vendor" / "autoload.php"
+            # Psalm refuses a config naming a directory that is not there,
+            # so only the ones this project actually has are listed.
+            # var/cache is Symfony's generated container, not the project's code.
+            skip = [target / name for name in ("vendor", "node_modules", "var/cache")
+                    if (target / name).is_dir()]
+            ignored = "".join(
+                f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
+            # Framework input as taint sources and database, shell and response calls as sinks.
+            stubs = CONFIG_DIR / "psalm" / "framework-taint.phpstub"
+            handle.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8"'
+                + (f' autoloader={quoteattr(str(autoload))}' if autoload.is_file() else "")
+                + '>\n'
+                '  <projectFiles>\n'
+                f'    <directory name={quoteattr(str(target))} />\n'
+                + (f'    <ignoreFiles>\n{ignored}    </ignoreFiles>\n' if ignored else "")
+                + '  </projectFiles>\n'
+                + (f'  <stubs>\n    <file name={quoteattr(str(stubs))} />\n  </stubs>\n'
+                   if stubs.is_file() else "")
+                + '</psalm>\n'
+            )
+            temporary = Path(handle.name)
+        self._runtime_config = temporary
+        # The project, not the directory the report is written to: --root is
+        # what Psalm resolves the analysed tree against.
         self._runtime_root = target
-        temporary = None
-        if configured is None or not (target / "vendor" / "autoload.php").is_file():
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".xml", prefix="psalm-autonomous-", dir=out_dir,
-                encoding="utf-8", delete=False,
-            ) as handle:
-                # vendor/ is read for types through the autoloader, never
-                # analysed: the taint paths wanted are the project's own, and
-                # analysing an old dependency tree is what makes Psalm crash.
-                autoload = target / "vendor" / "autoload.php"
-                # Psalm refuses a config naming a directory that is not there,
-                # so only the ones this project actually has are listed.
-                skip = [target / name for name in ("vendor", "node_modules")
-                        if (target / name).is_dir()]
-                ignored = "".join(
-                    f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
-                handle.write(
-                    '<?xml version="1.0" encoding="UTF-8"?>\n'
-                    '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8"'
-                    + (f' autoloader={quoteattr(str(autoload))}' if autoload.is_file() else "")
-                    + '>\n'
-                    '  <projectFiles>\n'
-                    f'    <directory name={quoteattr(str(target))} />\n'
-                    + (f'    <ignoreFiles>\n{ignored}    </ignoreFiles>\n' if ignored else "")
-                    + '  </projectFiles>\n'
-                    '</psalm>\n'
-                )
-                temporary = Path(handle.name)
-            self._runtime_config = temporary
-            # The project, not the directory the report is written to: --root is
-            # what Psalm resolves the analysed tree against.
-            self._runtime_root = target
         try:
             return super().scan(target, out_dir)
         finally:

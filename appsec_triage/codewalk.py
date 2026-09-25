@@ -30,7 +30,12 @@ declares, lsp_read_symbol to read a function or class, lsp_definition / lsp_refe
 lsp_callers to follow a name.
 read_file reads a known path and 1-based line; search_code is a literal search across
 the project's own code and configuration (tests, docker-compose and installed packages
-left out).
+left out). search_code with `package` searches one installed dependency instead: use it
+when the question is whether a library the project loads calls a function (does the
+parent package call the vulnerable one?). When the question is what the installed version
+of a package contains — the advisory's function "absent from the installed version" —
+read that package's file under vendor/ or node_modules/ with read_file and answer it
+yourself; do not leave it for a person.
 Each answer says whose code it is: [код проекта], [тестовый код — не продакшен], or
 [код зависимости — пакет X] for a path under node_modules/ or vendor/. A dependency's own
 source shows what that library does, never what this project does — every vulnerable
@@ -221,8 +226,13 @@ class CodeWalk:
             # Code is text-searched too: a setting written as a string (`'query parser'`) or a
             # call the server cannot name is found only this way.
             pattern = str(arguments.get("pattern") or "")
+            package = str(arguments.get("package") or "").strip()
             before = len(getattr(pkg, "code_facts", []) or [])
-            text = run({"action": "search", "pattern": pattern})
+            text = run({"action": "search", "pattern": pattern, **({"package": package} if package else {})})
+            if package:
+                # A dependency's own code: no language-server lookup of the project follows.
+                fact = "\n".join((getattr(pkg, "code_facts", []) or [])[before:])
+                return f"{text}\n{fact}" if fact and text != "Nothing found." else (fact or text)
             fact = "\n".join((getattr(pkg, "code_facts", []) or [])[before:])
             if text == "Nothing found.":
                 text = fact or "Code and configuration of the project: no match."
@@ -271,9 +281,14 @@ class CodeWalk:
                            "line": {"type": "integer", "description": "1-based start line."}},
                           ["path", "line"]),
             function_tool("search_code", "Literal substring search across repository files; "
-                                         "returns the lines around each match.",
+                                         "returns the lines around each match. With `package`, "
+                                         "searches that installed dependency instead — to see "
+                                         "whether a library the project loads calls a function.",
                           {"pattern": {"type": "string",
-                                       "description": "Short literal: a symbol or a configuration key."}},
+                                       "description": "Short literal: a symbol or a configuration key."},
+                           "package": {"type": "string",
+                                       "description": "Optional installed package name, e.g. "
+                                                      "sentry/sentry or axios; omit to search the project."}},
                           ["pattern"]),
         ]
         handlers = {"read_file": read, "search_code": search}

@@ -13,6 +13,17 @@ log = logging.getLogger(__name__)
 
 _JS_NAME = r"[A-Za-z_$][\w$]*"
 
+# Called by the language, never by name: an object used as a function (a middleware, a
+# runtime), `new`, a property read, a cast, array access, iteration. No search finds a
+# call of them, so their absence from a parent's code says nothing about a path.
+_IMPLICIT = frozenset({
+    "__invoke", "__call", "__callStatic", "__get", "__set", "__isset", "__unset", "__toString",
+    "__construct", "__destruct", "__clone", "__serialize", "__unserialize", "__sleep", "__wakeup",
+    "offsetGet", "offsetSet", "offsetExists", "offsetUnset", "getIterator", "jsonSerialize",
+    "__call__", "__init__", "__new__", "__getattr__", "__getattribute__", "__getitem__",
+    "__setitem__", "__iter__", "__next__", "__enter__", "__exit__", "__str__", "__repr__", "__del__",
+})
+
 
 def _default_imports(text: str, package: str) -> dict[str, list[tuple[int, int]]]:
     """Local names bound to a package's CommonJS/default export."""
@@ -71,8 +82,14 @@ def _callers(
     parent_package: str = "",
     default_export_from: str = "",
     max_symbols: int = 12,
+    owners: set[str] | frozenset[str] = frozenset(),
 ) -> BridgeResult:
-    """Which functions call or export any name in `targets`."""
+    """Which functions call or export any name in `targets`.
+
+    `owners` are the classes the targets are methods of. A parent that names such a
+    class without calling the method has registered it — as a service, an event
+    listener, a handler — and the framework calls the method itself.
+    """
     label = ", ".join(sorted(targets)[:3]) or "искомую функцию"
     if not parent_source:
         return BridgeResult(
@@ -179,6 +196,23 @@ def _callers(
             return BridgeResult(
                 detail=f"{parent_package or 'посредник'} упоминает {label}, "
                        "но статический вызов или реэкспорт не удалось разрешить")
+        implicit = sorted(targets & _IMPLICIT)
+        if implicit:
+            return BridgeResult(
+                detail=(f"путь к уязвимой функции идёт через {', '.join(implicit[:3])} — такой метод "
+                        "вызывает сам язык (объект как функция, `new`, приведение, доступ по ключу), "
+                        f"а не код по имени; отсутствие вызова в {parent_package or 'посреднике'} "
+                        "ничего не доказывает"))
+        registered = sorted(
+            short for short in {_short_class(o) for o in owners} if short
+            and any(re.search(rf"(?<![\w$]){re.escape(short)}(?![\w$])", text)
+                    for text in parent_source.values()))
+        if registered:
+            return BridgeResult(
+                detail=(f"{parent_package or 'посредник'} не вызывает {label} по имени, но ссылается "
+                        f"на класс {', '.join(registered[:3])} — так фреймворк подключает сервисы, "
+                        "слушатели событий и обработчики и вызывает их методы сам; "
+                        "по именам путь не проследить"))
         return BridgeResult(
             calls_it=False, call_sites=0,
             detail=(f"{parent_package or 'пакет-посредник'} нигде не вызывает "
@@ -191,6 +225,11 @@ def _callers(
         calls_it=True, symbols=found, call_sites=sites,
         detail=(f"{parent_package or 'посредник'} {action}; наружу открыто: "
                 f"{', '.join(str(s) for s in public[:4]) or 'ничего публичного'}"))
+
+
+def _short_class(name: str) -> str:
+    r"""`Symfony\Component\X\Listener` or `pkg.Listener` → `Listener`."""
+    return re.split(r"[\\.]", (name or "").strip())[-1]
 
 
 def entry_points(function: str, source: dict[str, str], *, package: str = "",
@@ -250,13 +289,14 @@ def walk_bridge(
     max_symbols: int = 12,
     max_internal_steps: int = 4,
     origin_package: str = "",
+    vulnerable_class: str = "",
 ) -> BridgeWalk:
     """Follow the flaw outward along `chain`, package by package, toward the app."""
     if not vulnerable_function:
         return BridgeWalk(unknown=True, detail="уязвимая функция не определена")
 
     targets = {vulnerable_function}
-    carried = [BridgeSymbol(vulnerable_function)]
+    carried = [BridgeSymbol(vulnerable_function, vulnerable_class)]
     if not chain:
         return BridgeWalk(targets=carried, unknown=True,
                           detail="цепочка посредников пуста")
@@ -286,10 +326,14 @@ def walk_bridge(
         imported_default = (packages[depth - 2] if depth > 1
                             and any(s.default_export and s.function in targets for s in carried)
                             else "")
+        # The package that declares the classes names them too: only a parent's
+        # reference to them is a registration.
+        owners = ({s.klass for s in carried if s.klass}
+                  if not (origin_package and depth == 1) else set())
         while frontier and steps < max_internal_steps:
             result = _callers(frontier, source, parent_package=package,
                               default_export_from=imported_default if frontier & targets else "",
-                              max_symbols=max_symbols)
+                              max_symbols=max_symbols, owners=owners if frontier == targets else set())
             if result.calls_it is None:
                 return stopped(result.detail, max(parent_depth, 0))
             if result.calls_it is False:

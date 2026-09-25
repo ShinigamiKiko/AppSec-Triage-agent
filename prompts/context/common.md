@@ -74,3 +74,28 @@ File names, any ecosystem:
   conditions required by the advisory are present.
 - OSV, EPSS, and CISA KEV data are supporting evidence. A network timeout is
   missing evidence, not evidence that the vulnerability is absent.
+- An opt-in feature — a sandbox, a security policy, an adapter, an
+  authenticator, a decorator, a client wrapper, a route option — is on only when
+  the project's own code or configuration turns it on. Installed packages do not
+  switch on another package's features behind the project's back. When a search
+  of the project's code and configuration finds no name that would turn the
+  feature on, the feature is off: that is a checked absence and a valid reason to
+  close, not missing context. Never keep a finding open, or list as missing
+  information, that the feature "might be enabled somewhere the search did not
+  cover".
+- Values the deployment sets — environment variables, `.env` files, service
+  configuration, secrets, endpoints of the organisation's own services — belong to
+  the operator, not to an attacker. A flaw that needs attacker control of such a
+  value is not exploitable through it, unless repository evidence shows the value
+  is built from request data.
+- A condition with several parts ("a route declares an alternation requirement
+  and an untrusted value reaches the URL generator") fails as soon as one
+  required part is checked absent. Do not keep a finding open to establish the
+  other parts: with no such route, what reaches the URL generator no longer
+  matters.
+- A framework calls the code it registers: an event listener or subscriber, a
+  handler or service named in configuration, a console command, a template
+  filter or function. A package that only names such a class, and never calls
+  the method, still reaches it — "the parent never calls it" is not "not
+  called". Decide by whether the registration is active in production, not by
+  whether a call site exists.

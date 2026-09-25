@@ -110,8 +110,13 @@ RUN curl -fsSL https://github.com/phpactor/phpactor/releases/latest/download/php
     && chmod +x /opt/phpactor.phar \
     && php /opt/phpactor.phar --version
 
-# Psalm (PHP taint) — global Composer install; binary lands on PATH via COMPOSER_HOME.
-RUN composer global require "vimeo/psalm:^6" --no-interaction --no-progress \
+# Psalm (PHP taint) as the official PHAR. Its own dependencies (amphp, Symfony
+# Console, …) are prefixed inside the PHAR, so they never collide with the same
+# libraries in the scanned project's vendor/ — Psalm loads that autoloader. The plain
+# `vimeo/psalm` install died with "Cannot redeclare Amp\delay()" on a project that
+# ships an older Psalm and amphp/amp of its own.
+RUN composer global require "psalm/phar:^6" --no-interaction --no-progress \
+    && ln -sf /opt/composer/vendor/bin/psalm.phar /usr/local/bin/psalm \
     && psalm --version
 
 # --- language-server support ---------------------------------------------------

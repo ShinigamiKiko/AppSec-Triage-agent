@@ -67,10 +67,14 @@ def _installed_package(path) -> str | None:
     return None
 
 
+_PACKAGE_NAME = re.compile(r"^@?[\w.-]+(?:/[\w.-]+)?$")
+
+
 def _search_fact(pattern: str, matches: int, files_hit: int, scanned: int, in_tests: int,
-                 *, truncated: bool) -> str:
+                 *, truncated: bool, samples: list[str] | None = None, package: str = "") -> str:
     """One quotable line: what a search read and what it found — an absence included."""
-    scope = ("the project's own code and configuration (tests, docker-compose and installed "
+    scope = (f"the installed package {package} (its tests excluded)" if package else
+             "the project's own code and configuration (tests, docker-compose and installed "
              "packages excluded)")
     if matches:
         found = f"{matches} match(es) in {files_hit} of {scanned} files of {scope}; the lines are under REPOSITORY EVIDENCE"
@@ -81,6 +85,10 @@ def _search_fact(pattern: str, matches: int, files_hit: int, scanned: int, in_te
         tail += f"; {in_tests} more in test and docker-compose files, not production"
     if truncated:
         tail += "; the search stopped at its file limit, so an absence is not established"
+    if samples:
+        # The windows may not survive the evidence budget; the lines themselves always do,
+        # so a count never stands alone ("3 matches" that are `ForRequest::createFrom...`).
+        tail += "; matched lines: " + " | ".join(samples)
     return f"search_code «{pattern}» → {found}{tail}"
 
 
@@ -281,6 +289,26 @@ class RepositoryEvidence:
                             self._note(pkg, "Repository traversal truncated at file limit.")
                             return sorted(paths, key=self._priority)
         return sorted(paths, key=self._priority)
+
+    def _package_paths(self, pkg, package: str, files_limit: int = SEARCH_FILES) -> list[Path]:
+        """Files of one installed package: `vendor/<name>` or `node_modules/<name>`."""
+        paths: list[Path] = []
+        for root in self.source.roots:
+            for tree in _INSTALLED:
+                base = root / tree / package
+                if not base.is_dir() or base.is_symlink():
+                    continue
+                for directory, dirs, files in os.walk(base, followlinks=False):
+                    dirs[:] = sorted(d for d in dirs if not (Path(directory) / d).is_symlink()
+                                     and d.lower() not in {"node_modules", ".git"})
+                    for name in sorted(files):
+                        path = Path(directory) / name
+                        if self._safe(path, root, installed=True):
+                            paths.append(path)
+                            if len(paths) >= files_limit:
+                                self._note(pkg, "Package search truncated at file limit.")
+                                return paths
+        return paths
 
     @staticmethod
     def _priority(path):
@@ -500,12 +528,22 @@ class RepositoryEvidence:
                     self._note(pkg, "Search rejected: expected a nonempty literal of at most 512 characters.")
                     continue
                 matches = 0
+                samples: list[str] = []
                 skip = tuple(s.lower() for s in (request.get("skip_suffixes") or []))
                 skipped = 0
                 in_tests = 0
                 scanned = 0
                 files_hit = 0
-                candidates = self._paths(pkg, SEARCH_FILES, SEARCH_ENTRIES)
+                package = str(request.get("package") or "").strip().strip("/")
+                if package and (not _PACKAGE_NAME.match(package) or ".." in package):
+                    self._note(pkg, f"Search rejected: {package!r} is not an installed package name.")
+                    continue
+                candidates = (self._package_paths(pkg, package) if package
+                              else self._paths(pkg, SEARCH_FILES, SEARCH_ENTRIES))
+                if package and not candidates:
+                    self._fact(pkg, f"search_code «{pattern}» in {package} → the package is not installed "
+                                    "here; nothing was searched, so an absence is not established")
+                    continue
                 for path in candidates:
                     if skip and path.name.lower().endswith(skip):
                         skipped += 1
@@ -526,6 +564,8 @@ class RepositoryEvidence:
                         if pattern in text:
                             added = self._add(pkg, path, lines, n - 10, n + 10) or added
                             matches += 1
+                            if len(samples) < 5:
+                                samples.append(f"{self._relative(path)}:{n}: {text.strip()[:160]}")
                             if matches >= MAX_LOCATIONS:
                                 break
                     if matches >= MAX_LOCATIONS:
@@ -535,7 +575,8 @@ class RepositoryEvidence:
                     self._note(pkg, f"search_code skipped {in_tests} match(es) of {pattern!r} in test and "
                                     "docker-compose files: not production code.")
                 self._fact(pkg, _search_fact(pattern, matches, files_hit, scanned, in_tests,
-                                             truncated=len(candidates) >= SEARCH_FILES))
+                                             truncated=len(candidates) >= SEARCH_FILES, samples=samples,
+                                             package=package))
                 if skipped:
                     # Never a silent "nothing found" over code the search did not read.
                     self._note(pkg, f"search_code did not read {skipped} source file(s) a language server "

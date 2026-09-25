@@ -366,7 +366,8 @@ def render_for_prompt(pkg: EvidencePackage) -> str:
             f"named in our source: {'yes' if dep.imported else ('not found — see the note in the prompt' if dep.imported is False else 'unknown')}",
         ]
         if getattr(dep, "runtime", None) and dep.shipped == "runtime":
-            lines.append(f"runs in: {dep.runtime} (browser = client bundle, node = server, both = SSR)")
+            lines.append(f"runs in: {dep.runtime} (browser = client bundle, node = Node server, "
+                         "both = SSR, server = the application's server process)")
         if dep.advisory_url:
             lines.append(f"advisory: {dep.advisory_url}")
 

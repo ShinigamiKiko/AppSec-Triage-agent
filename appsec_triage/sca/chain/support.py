@@ -12,6 +12,7 @@ from .. import presence as presence_mod, registries
 from ..bridge import BridgeWalk, entry_points, walk_bridge
 from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
+from .. import resolve_cache
 from ..resolve import SymbolResolver, VulnerableSymbol
 
 log = logging.getLogger(__name__)
@@ -135,7 +136,8 @@ class ChainSupport:
             if not chain_pkgs:
                 continue
             walk = walk_bridge(symbol.function, chain_pkgs, source_of,
-                               origin_package=dependency.package or "")
+                               origin_package=dependency.package or "",
+                               vulnerable_class=symbol.klass)
             through = intro.root_requirement
             if walk.closed:
                 closed = closed or (walk, through)
@@ -334,9 +336,27 @@ class ChainSupport:
         return advisory
 
     def _resolve_symbol(self, advisory, version: str):
-        """The vulnerable symbol for this advisory, resolved once per run."""
+        """The vulnerable symbol for this advisory, resolved once per run — and, with
+        APPSEC_CACHE_DIR set, once per advisory, version, model and prompts across runs."""
         key = (str(getattr(advisory, "advisory_id", "") or ""), version or "")
-        symbol, _ = self._once(self._symbols, key, lambda: self._resolver.resolve(advisory, version))
+
+        def compute():
+            stored_key = None
+            if resolve_cache.directory() is not None:
+                installed = bool(self._resolver._source_for(
+                    getattr(advisory, "ecosystem", "") or "", getattr(advisory, "package", "") or "", version))
+                stored_key = resolve_cache.key(advisory, version, getattr(self._client, "model", "") or "",
+                                               installed)
+                stored = resolve_cache.load(stored_key)
+                if stored is not None:
+                    log.info("resolve cache: %s %s taken from a previous run", key[0], version)
+                    return stored
+            symbol, clean = self._resolver.resolve_clean(advisory, version)
+            if stored_key is not None and clean:
+                resolve_cache.store(stored_key, symbol)
+            return symbol
+
+        symbol, _ = self._once(self._symbols, key, compute)
         return symbol
 
     def prefill_imports(self, wanted: dict[str, set[str]]) -> None:
@@ -444,6 +464,15 @@ class ChainSupport:
         if answer.problem:
             return f"поток данных не проверен: {answer.problem}"
         return verdict
+
+    def _dependents(self, package: str) -> list[str]:
+        """Other installed runtime packages that require this one."""
+        found: list[str] = []
+        for graph in self._graphs.values():
+            for name in graph.dependents(package):
+                if name not in found:
+                    found.append(name)
+        return found
 
     def _graph_version(self, package: str) -> str:
         for graph in self._graphs.values():

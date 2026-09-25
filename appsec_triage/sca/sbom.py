@@ -62,7 +62,12 @@ def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None
 
     with tempfile.TemporaryDirectory() as work:
         out = Path(work) / "sbom.json"
-        argv = [exe, "-r", "-o", str(out), "--no-install-deps", str(project)]
+        argv = [exe, "-r", "-o", str(out), "--no-install-deps"]
+        from .install import composer_vendor
+
+        if composer_vendor(project):
+            argv += ["--exclude", "**/vendor/**"]
+        argv.append(str(project))
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=timeout_s, encoding="utf-8", errors="replace", check=False)

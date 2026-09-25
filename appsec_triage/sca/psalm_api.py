@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
@@ -20,6 +23,51 @@ SUPPORTED_ECOSYSTEMS = frozenset({"composer", "packagist", "php"})
 ENGINE = "Psalm"
 _TIMEOUT_S = 1800
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# `--find-references-to` analyses the whole project for one method, and the entry lists
+# of one package's advisories overlap almost entirely (73-85 methods each for Twig).
+# The project does not change during a scan, so one answer per method holds for the run.
+_REFERENCES: dict[tuple[str, str], list[tuple[str, int]]] = {}
+_REFERENCES_PENDING: dict[tuple[str, str], threading.Event] = {}
+_REFERENCES_LOCK = threading.Lock()
+# One batch at a time: a second batch waits and then finds most of its methods cached.
+_BATCH_LOCK = threading.Lock()
+# The first path from input to each method, or None: a path into one method does not
+# depend on which other methods the stub marks as sinks, so it too holds for the run.
+_TAINT: dict[tuple[str, str], Reached | None] = {}
+_TAINT_LOCK = threading.Lock()
+# Batches run one at a time, so they can share Psalm's own cache: the vendor tree is
+# parsed once per run instead of once per batch. Its config, plugin and files keep one
+# path for the whole run, so Psalm never sees a "new" config and drops the cache.
+_BATCH_HOME: Path | None = None
+
+# `--find-references-to` takes one method, but the codebase it analyses answers any
+# number: this plugin asks it for all of them once the analysis is done. The CLI option
+# still names one method — that is what switches on the collection of call locations.
+_REFERENCES_PLUGIN = r"""<?php
+use Psalm\Plugin\EventHandler\AfterAnalysisInterface;
+use Psalm\Plugin\EventHandler\Event\AfterAnalysisEvent;
+
+final class ScaReferences implements AfterAnalysisInterface
+{
+    public static function afterAnalysis(AfterAnalysisEvent $event): void
+    {
+        $codebase = $event->getCodebase();
+        $methods = json_decode((string) file_get_contents(%(input)s), true);
+        $out = [];
+        foreach (is_array($methods) ? $methods : [] as $method) {
+            try {
+                $out[$method] = array_map(
+                    static fn($location) => [$location->file_path, $location->getLineNumber()],
+                    $codebase->findReferencesToSymbol($method)
+                );
+            } catch (\Throwable $e) {
+                $out[$method] = ['error' => $e->getMessage()];
+            }
+        }
+        file_put_contents(%(output)s, json_encode($out));
+    }
+}
+"""
 _REFERENCE = re.compile(r"^(?P<file>\S+\.php):(?P<line>\d+)$")
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\\[A-Za-z_][A-Za-z0-9_]*)*$")
@@ -320,13 +368,14 @@ def _enclosing_call(project: Path, sink_file: str, sink_line: int, signatures: l
     return None
 
 
-def _config(path: Path, project: Path, stub_path: Path | None = None) -> Path:
+def _config(path: Path, project: Path, stub_path: Path | None = None, cache: Path | None = None) -> Path:
     autoload = project / "vendor" / "autoload.php"
     vendor = project / "vendor"
     parts = [
         '<?xml version="1.0"?>',
         '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8" findUnusedCode="false"'
-        + (f" autoloader={quoteattr(str(autoload))}" if autoload.is_file() else "") + ">",
+        + (f" autoloader={quoteattr(str(autoload))}" if autoload.is_file() else "")
+        + (f" cacheDirectory={quoteattr(str(cache))}" if cache is not None else "") + ">",
         f"  <projectFiles><directory name={quoteattr(str(project))} />"
         + (f"<ignoreFiles><directory name={quoteattr(str(vendor))} /></ignoreFiles>" if vendor.is_dir() else "")
         + "</projectFiles>",
@@ -336,6 +385,84 @@ def _config(path: Path, project: Path, stub_path: Path | None = None) -> Path:
     parts.append("</psalm>")
     path.write_text("\n".join(parts) + "\n", encoding="utf-8")
     return path
+
+
+def _php_string(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _batch_home(project: Path) -> Path:
+    """The run's directory for batches: config, plugin, their files and Psalm's cache."""
+    global _BATCH_HOME
+    if _BATCH_HOME is None:
+        _BATCH_HOME = Path(tempfile.mkdtemp(prefix="sca-psalm-batch-"))
+        atexit.register(shutil.rmtree, _BATCH_HOME, True)
+    home = _BATCH_HOME / re.sub(r"[^\w.-]+", "_", str(project)).strip("_")[-80:]
+    (home / "cache").mkdir(parents=True, exist_ok=True)
+    return home
+
+
+def _batch_references(methods: list[str], *, binary: str, project: Path,
+                      timeout_s: float) -> dict[str, list[tuple[str, int]]]:
+    """References to every method from one analysis of the project; {} when the batch fails.
+
+    Call it under `_BATCH_LOCK`: batches share one Psalm cache and one set of files.
+    """
+    if not methods:
+        return {}
+    home = _batch_home(project)
+    config = _config(home / "psalm.xml", project, cache=home / "cache")
+    source, result = home / "references-in.json", home / "references-out.json"
+    plugin = home / "ScaReferences.php"
+    result.unlink(missing_ok=True)
+    source.write_text(json.dumps(methods), encoding="utf-8")
+    plugin.write_text(_REFERENCES_PLUGIN % {"input": _php_string(str(source)),
+                                            "output": _php_string(str(result))}, encoding="utf-8")
+    _, problem = _run([binary, f"--config={config}", f"--root={project}", "--no-progress",
+                       "--threads=1", f"--find-references-to={methods[0]}", f"--plugin={plugin}"],
+                      home, timeout_s, f"поиск вызовов пачкой ({len(methods)} методов)")
+    try:
+        payload = json.loads(result.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        log.info("psalm api: batch of %d methods gave no answer (%s); asking one by one",
+                 len(methods), problem or "no output")
+        return {}
+    found: dict[str, list[tuple[str, int]]] = {}
+    for method, rows in (payload.items() if isinstance(payload, dict) else ()):
+        if not isinstance(rows, list):
+            continue          # {"error": ...}: this method is asked on its own
+        sites: list[tuple[str, int]] = []
+        for row in rows:
+            if isinstance(row, list) and len(row) == 2:
+                file = _relative(str(row[0]), home, project)
+                site = (file, int(row[1])) if file else None
+                if site and site not in sites:
+                    sites.append(site)
+        found[method] = sites
+    return found
+
+
+def _references(key: tuple[str, str], compute) -> tuple[list[tuple[str, int]], str]:
+    """(references, problem) for one method, computed once per run; a failure is not kept."""
+    while True:
+        with _REFERENCES_LOCK:
+            if key in _REFERENCES:
+                return _REFERENCES[key], ""
+            pending = _REFERENCES_PENDING.get(key)
+            if pending is None:
+                pending = _REFERENCES_PENDING[key] = threading.Event()
+                break
+        pending.wait()
+    try:
+        found, problem = compute()
+        if not problem:
+            with _REFERENCES_LOCK:
+                _REFERENCES[key] = found
+        return found, problem
+    finally:
+        with _REFERENCES_LOCK:
+            _REFERENCES_PENDING.pop(key, None)
+        pending.set()
 
 
 def _run(argv: list[str], cwd: Path, timeout_s: float, what: str) -> tuple[str, str]:
@@ -395,33 +522,60 @@ def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm
         answer = ApiAnswer(engine="psalm")
         references: dict[str, list[tuple[str, int]]] = {}
         base_config = _config(work / "psalm.xml", project)
+        wanted = list(dict.fromkeys(f"{_clean_class(sig.declaring)}::{sig.function}"
+                                    for sig in signatures if sig.kind != "function"))
+        if len(wanted) > 1:
+            with _BATCH_LOCK:
+                with _REFERENCES_LOCK:
+                    missing = [m for m in wanted if (str(project), m) not in _REFERENCES]
+                if len(missing) > 1:
+                    batch = _batch_references(missing, binary=binary, project=project, timeout_s=timeout_s)
+                    with _REFERENCES_LOCK:
+                        for method, sites in batch.items():
+                            _REFERENCES[(str(project), method)] = sites
         for sig in signatures:
             if sig.kind == "function":
                 continue
-            output, problem = _run([binary, f"--config={base_config}", f"--root={project}", "--no-cache",
-                                    "--no-progress", "--threads=1",
-                                    f"--find-references-to={_clean_class(sig.declaring)}::{sig.function}"],
-                                   work, timeout_s, f"поиск вызовов {sig.label}")
+            method = f"{_clean_class(sig.declaring)}::{sig.function}"
+
+            def find(method=method, sig=sig):
+                output, problem = _run([binary, f"--config={base_config}", f"--root={project}", "--no-cache",
+                                        "--no-progress", "--threads=1", f"--find-references-to={method}"],
+                                       work, timeout_s, f"поиск вызовов {sig.label}")
+                return ([], problem) if problem else (parse_references(output, work, project), "")
+
+            found, problem = _references((str(project), method), find)
             if problem:
                 return ApiAnswer(problem=problem, engine="psalm")
-            references[sig.label] = parse_references(output, work, project)
+            references[sig.label] = found
             if references[sig.label]:
                 answer.calls[sig.label] = [_hit(project, file, line) for file, line in references[sig.label]]
 
-        stub_path = work / "sca-sinks.php"
-        stub_path.write_text(stub(signatures), encoding="utf-8")
-        taint_config = _config(work / "psalm-taint.xml", project, stub_path)
-        report = work / "taint.sarif"
-        _, problem = _run([binary, f"--config={taint_config}", f"--root={project}", "--taint-analysis",
-                           "--no-cache", "--no-progress", "--threads=1", f"--report={report}"],
-                          work, timeout_s, "taint-анализ")
-        if problem:
-            return ApiAnswer(calls=answer.calls, problem=problem, engine="psalm")
-        try:
-            document = json.loads(report.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            return ApiAnswer(calls=answer.calls, problem=f"отчёт taint-анализа не прочитан: {exc}", engine="psalm")
-        answer.reached = parse_taint(document, work, project, signatures, references)
+        methods = {sig.label: f"{_clean_class(sig.declaring)}::{sig.function}" for sig in signatures}
+        with _TAINT_LOCK:
+            todo = [sig for sig in signatures if (str(project), methods[sig.label]) not in _TAINT]
+            if todo:
+                # Without Psalm's cache: the stub marks different methods as sinks on
+                # every run, and a cached storage could carry the previous run's sinks.
+                stub_path = work / "sca-sinks.php"
+                stub_path.write_text(stub(todo), encoding="utf-8")
+                taint_config = _config(work / "psalm-taint.xml", project, stub_path)
+                report = work / "taint.sarif"
+                _, problem = _run([binary, f"--config={taint_config}", f"--root={project}", "--taint-analysis",
+                                   "--no-cache", "--no-progress", "--threads=1", f"--report={report}"],
+                                  work, timeout_s, "taint-анализ")
+                if problem:
+                    return ApiAnswer(calls=answer.calls, problem=problem, engine="psalm")
+                try:
+                    document = json.loads(report.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    return ApiAnswer(calls=answer.calls, problem=f"отчёт taint-анализа не прочитан: {exc}",
+                                     engine="psalm")
+                fresh = parse_taint(document, work, project, todo, references)
+                for sig in todo:
+                    _TAINT[(str(project), methods[sig.label])] = fresh.get(sig.label)
+            answer.reached = {label: reached for label, method in methods.items()
+                              if (reached := _TAINT.get((str(project), method))) is not None}
         for label, reached in answer.reached.items():
             site = _hit(project, reached.file, reached.line)
             if all((hit.file, hit.line) != (site.file, site.line) for hit in answer.calls.get(label, [])):

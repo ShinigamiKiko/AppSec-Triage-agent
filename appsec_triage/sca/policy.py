@@ -50,21 +50,34 @@ _NEEDS_MODEL = {CVEVerdict.PRESENT_UNPROVEN, CVEVerdict.CALL_UNCONFIRMED, CVEVer
 # "malicious" alone is not enough — advisories say "a malicious user could…" about ReDoS.
 # Phrased the way such advisories are: "Malicious code in X", "contains malicious code",
 # "the maintainer account was compromised". "Crafted malicious code" is input, not this.
+# Nor is "a supply chain attack": advisories list it as one way to plant the input of an
+# ordinary flaw (PHPUnit: "a supply chain attack inserting malicious files").
 _SUPPLY_CHAIN = re.compile(
     r"\bmalicious (?:code|package|version|release|payload) in\b|"
     r"\b(?:contains?|contained|embedded|ships?|shipped|injected)\s+(?:\w+\s+)?malicious (?:code|payload)|"
     r"\bbackdoor(?:ed)?\b|"
     r"compromised (?:package|account|maintainer|version|release|publish)|"
-    r"(?:package|account|maintainer|version|release|token)s? (?:was|were|has been|had been) compromised|"
-    r"supply[- ]chain (?:attack|compromise)", re.IGNORECASE)
+    r"(?:package|account|maintainer|version|release|token)s? (?:was|were|has been|had been) compromised",
+    re.IGNORECASE)
 _SUPPLY_CHAIN_CWES = {"CWE-506", "CWE-912"}
 # A flaw that runs code, but only on input crafted for it: a build is exposed only if
 # it processes input it did not write (pull requests from forks, uploaded sources).
 _CODE_EXECUTION = re.compile(
     r"arbitrary code execution|remote code execution|code injection|command injection", re.IGNORECASE)
 _CODE_EXECUTION_CWES = {"CWE-94", "CWE-78", "CWE-77", "CWE-829"}
-# An exploit that needs Object.prototype polluted by some other flaw first.
-_GADGET = re.compile(r"pollution gadget|prototype pollution gadget|\bgadget\b", re.IGNORECASE)
+# An exploit that needs another flaw first: a prototype-pollution gadget reads a polluted
+# Object.prototype, a DOM-clobbering gadget reads injected markup. A deserialization
+# "gadget chain" is the opposite — the flaw itself, not a precondition — so a bare
+# "gadget" counts only next to prototype pollution or DOM clobbering.
+_GADGET = re.compile(r"(?:pollution|dom[- ]clobbering|script)\s+gadgets?\b", re.IGNORECASE)
+_GADGET_WORD = re.compile(r"\bgadgets?\b", re.IGNORECASE)
+_OTHER_FLAW = re.compile(
+    r"prototype[- ]pollution|object\.prototype|__proto__|dom[- ]clobbering|загрязнени\w* прототипа",
+    re.IGNORECASE)
+_DESERIALIZATION = re.compile(
+    r"unseriali[sz]|deseriali[sz]|gadget chain|pop chain|object injection|\breadObject\b",
+    re.IGNORECASE)
+_DESERIALIZATION_CWES = {"CWE-502"}
 _NEEDS_POLLUTION = re.compile(
     r"(?:object\.prototype|прототип\w*)[^.]{0,80}(?:уже|already|предварительно|first)[^.]{0,60}"
     r"(?:загрязн|pollut)|(?:примитив|primitive)[^.]{0,30}(?:загрязнени\w* прототипа|prototype pollution)|"
@@ -126,7 +139,11 @@ def needs_other_vulnerability(advisory, condition_text: str = "") -> bool:
     """A gadget: exploitable only after some other flaw has done its part — polluted
     Object.prototype, or injected the markup a DOM-clobbering gadget reads."""
     text = (getattr(advisory, "text", "") or "") if advisory is not None else ""
-    return bool(_GADGET.search(text) or _NEEDS_POLLUTION.search(condition_text or ""))
+    if advisory is not None and (_cwes(advisory) & _DESERIALIZATION_CWES or _DESERIALIZATION.search(text)):
+        return False
+    return bool(_GADGET.search(text)
+                or (_GADGET_WORD.search(text) and _OTHER_FLAW.search(text))
+                or _NEEDS_POLLUTION.search(condition_text or ""))
 
 
 def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: str = "",
@@ -197,6 +214,17 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
             "false_positive", "low", False,
             f"только сборка и тесты — в рабочий образ не попадает; {fix}",
             "build_only")
+
+    if parent_calls is False and severity in ("critical", "high"):
+        # A name search over the parent misses what a framework wires by itself (a
+        # middleware Guzzle adds, a runtime jmespath picks): for a severe advisory it is a
+        # lead for the model, not a closure.
+        return DependencyPolicy(
+            "unknown", _lift("medium", severity), True,
+            f"проверенный родитель{via_text} не вызывает уязвимую функцию по имени, но для "
+            f"{severity}-advisory это не доказательство: проверь, как родитель использует пакет "
+            "(поиск внутри пакета-родителя), прежде чем закрывать",
+            "bridge_no_path_severe")
 
     if parent_calls is False:
         return DependencyPolicy(

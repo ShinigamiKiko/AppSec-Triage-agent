@@ -307,7 +307,7 @@ class TriageRecord(BaseModel):
     finding_id: str
     cwe: str | None
     file_path: str
-    kind: Literal["weakness", "dependency", "misconfiguration"] = "weakness"
+    kind: Literal["weakness", "dependency", "misconfiguration", "license"] = "weakness"
     severity: Severity = Severity.unknown
     rule_id: str | None = None
     start_line: int | None = None
