@@ -104,6 +104,11 @@ RUN npm install -g typescript@5.9.3 typescript-language-server@5.3.0 \
 RUN npm install -g @cyclonedx/cdxgen \
     && cdxgen --version
 
+# yarn (classic) — the job installs a project's dependencies itself, through the
+# registry in the project's .yarnrc/.npmrc, and a yarn.lock needs yarn to install.
+RUN npm install -g yarn@1.22.22 \
+    && yarn --version
+
 # phpactor (PHP) — a single phar at the default fallback path.
 RUN curl -fsSL https://github.com/phpactor/phpactor/releases/latest/download/phpactor.phar \
         -o /opt/phpactor.phar \

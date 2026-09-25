@@ -77,6 +77,36 @@ class WolfeeScanner(Scanner):
         raise ScannerError("wolfee must run natively; configure binary: with the wolfee executable path")
 
 
+def _map_overlay_paths(report: Path | None) -> None:
+    """Findings Psalm made in an overlay copy belong to the original file."""
+    from ..sca.psalm_api import original_path
+
+    if report is None or not Path(report).is_file():
+        return
+    try:
+        document = json.loads(Path(report).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    changed = False
+
+    def walk(node) -> None:
+        nonlocal changed
+        if isinstance(node, dict):
+            location = node.get("artifactLocation")
+            if isinstance(location, dict) and (original := original_path(str(location.get("uri") or ""))):
+                location["uri"] = original
+                changed = True
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(document)
+    if changed:
+        Path(report).write_text(json.dumps(document), encoding="utf-8")
+
+
 class PsalmScanner(Scanner):
     """Psalm interprocedural taint analysis for PHP."""
 
@@ -105,8 +135,9 @@ class PsalmScanner(Scanner):
             log.warning("psalm: %s left out — Psalm cannot read it; scanning again", skipped)
             result = self._scan_autonomous(target, out_dir)
         if result.ok and (skipped_files := psalm_api.unreadable_files(target)):
-            result.note = ("пропущены файлы, на которых Psalm падает (исправьте в них докблоки): "
-                           + ", ".join(skipped_files))
+            _map_overlay_paths(result.output_path)
+            result.note = ("Psalm падает на докблоках этих файлов — их код проверен без докблоков, "
+                           "исправьте в них аннотации: " + ", ".join(skipped_files))
         return result
 
     def _scan_autonomous(self, target: Path, out_dir: Path) -> ScanResult:
@@ -125,11 +156,13 @@ class PsalmScanner(Scanner):
                     if (target / name).is_dir()]
             ignored = "".join(
                 f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
-            # Files an earlier attempt crashed on (psalm_api.exclude_crashed_file).
-            from ..sca.psalm_api import unreadable_files
+            # Files an earlier attempt crashed on (psalm_api.exclude_crashed_file); their
+            # code without docblocks is read from the overlay instead.
+            from ..sca.psalm_api import overlay_dir, unreadable_files
             ignored += "".join(
                 f'      <file name={quoteattr(str(target / name))} />\n'
                 for name in unreadable_files(target) if (target / name).is_file())
+            overlay = overlay_dir(target)
             # Framework input as taint sources and database, shell and response calls as sinks.
             stubs = CONFIG_DIR / "psalm" / "framework-taint.phpstub"
             handle.write(
@@ -139,6 +172,7 @@ class PsalmScanner(Scanner):
                 + '>\n'
                 '  <projectFiles>\n'
                 f'    <directory name={quoteattr(str(target))} />\n'
+                + (f'    <directory name={quoteattr(str(overlay))} />\n' if overlay is not None else "")
                 + (f'    <ignoreFiles>\n{ignored}    </ignoreFiles>\n' if ignored else "")
                 + '  </projectFiles>\n'
                 + (f'  <stubs>\n    <file name={quoteattr(str(stubs))} />\n  </stubs>\n'

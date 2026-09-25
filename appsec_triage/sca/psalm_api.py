@@ -38,6 +38,12 @@ _CRASH_FILE = re.compile(r"in (/[^\s:()]+\.php):\d+")
 _UNREADABLE: dict[str, set[str]] = {}
 _UNREADABLE_LOCK = threading.Lock()
 MAX_UNREADABLE = 5
+# Leaving such a file out is not enough: a class another file uses is read through the
+# autoloader all the same. Its code, without the docblocks, goes into an overlay the
+# analysis takes as a project file, so the class is known and the original never opened.
+_OVERLAY: dict[str, Path] = {}
+_OVERLAY_PREFIX = "sca-psalm-overlay-"
+_DOCBLOCK = re.compile(r"/\*\*.*?\*/", re.S)
 
 # One batch at a time: a second batch waits and then finds most of its methods cached.
 _BATCH_LOCK = threading.Lock()
@@ -160,8 +166,43 @@ def exclude_crashed_file(project: Path | str, text: str) -> str:
             if relative.as_posix() in known or len(known) >= MAX_UNREADABLE:
                 return ""
             known.add(relative.as_posix())
+        _overlay_copy(project, relative.as_posix())
         return relative.as_posix()
     return ""
+
+
+def _overlay_copy(project: Path, relative: str) -> None:
+    """The file's code without its docblocks, at the same relative path in the overlay."""
+    try:
+        text = (project / relative).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with _UNREADABLE_LOCK:
+        base = _OVERLAY.get(str(project))
+        if base is None:
+            base = Path(tempfile.mkdtemp(prefix=_OVERLAY_PREFIX))
+            atexit.register(shutil.rmtree, base, True)
+            _OVERLAY[str(project)] = base
+    copy = base / relative
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    # Each docblock becomes as many empty lines as it had: a finding in the copy keeps
+    # the line number it has in the original.
+    copy.write_text(_DOCBLOCK.sub(lambda m: "\n" * m.group(0).count("\n"), text), encoding="utf-8")
+
+
+def overlay_dir(project: Path | str) -> Path | None:
+    with _UNREADABLE_LOCK:
+        return _OVERLAY.get(str(Path(project).resolve()))
+
+
+def original_path(path: str) -> str | None:
+    """A path inside an overlay → the project-relative path of the file it stands for."""
+    normal = (path or "").replace("\\", "/")
+    at = normal.find("/" + _OVERLAY_PREFIX)
+    if at < 0:
+        return None
+    rest = normal[at + 1:].split("/", 1)
+    return rest[1] if len(rest) == 2 and rest[1] else None
 
 
 def unreadable_files(project: Path | str) -> list[str]:
@@ -298,6 +339,8 @@ def public_api(project_root: Path | str, package: str, limit: int = 40) -> str:
 
 def _relative(path: str, base: Path, project: Path) -> str | None:
     """A Psalm path — relative to its working directory — as a path inside the project."""
+    if (original := original_path(path)) is not None:
+        return original
     candidate = Path(path)
     resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
     try:
@@ -419,12 +462,15 @@ def _config(path: Path, project: Path, stub_path: Path | None = None, cache: Pat
     vendor = project / "vendor"
     ignored = "".join(f"<file name={quoteattr(str(project / name))} />"
                       for name in unreadable_files(project) if (project / name).is_file())
+    overlay = overlay_dir(project)
     parts = [
         '<?xml version="1.0"?>',
         '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8" findUnusedCode="false"'
         + (f" autoloader={quoteattr(str(autoload))}" if autoload.is_file() else "")
         + (f" cacheDirectory={quoteattr(str(cache))}" if cache is not None else "") + ">",
         f"  <projectFiles><directory name={quoteattr(str(project))} />"
+        + (f"<directory name={quoteattr(str(overlay))} />" if overlay is not None else "")
+        + ""
         + (f"<ignoreFiles>{f'<directory name={quoteattr(str(vendor))} />' if vendor.is_dir() else ''}"
            f"{ignored}</ignoreFiles>" if vendor.is_dir() or ignored else "")
         + "</projectFiles>",
