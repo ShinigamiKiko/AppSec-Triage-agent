@@ -11,6 +11,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..llm.base import output_budget
 from ..prompts import registry
 from . import cassette, registries
 from .advisories import Advisory
@@ -22,6 +23,9 @@ _MAX_DIFF = 60_000
 _SKIP_IN_DIFF = re.compile(
     r"(^|/)(tests?|spec|fixtures?|samples?|docs?)/|CHANGELOG|\.md$", re.IGNORECASE)
 _NOT_SHIPPED = re.compile(r"(^|/)(samples?|tests?|docs?|examples?)/", re.IGNORECASE)
+# The advisory steps answer with lists of quoted symbols, conditions and search terms, and
+# a Russian retelling: more than a verdict, whose size the profile's max_tokens is set for.
+_ADVISORY_BUDGET = 4096
 
 
 SCHEMA = {
@@ -40,9 +44,9 @@ SCHEMA = {
         "flaw_ru": {"type": "string"},
         "precondition": {"type": "string"},
         "precondition_quote": {"type": "string"},
-        "precondition_tokens": {"type": "array", "items": {"type": "string"}},
-        "precondition_groups": {"type": "array",
-                                "items": {"type": "array", "items": {"type": "string"}}},
+        "precondition_tokens": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+        "precondition_groups": {"type": "array", "maxItems": 4,
+                                "items": {"type": "array", "items": {"type": "string"}, "maxItems": 8}},
         "precondition_where": {"type": "string"},
         "precondition_decidable": {"type": "boolean"},
     },
@@ -511,7 +515,8 @@ class SymbolResolver:
 
     def _ask(self, user: str) -> dict:
         try:
-            return json.loads(self._client.complete(registry.step("symbol"), user, json_schema=SCHEMA).text)
+            with output_budget(_ADVISORY_BUDGET):
+                return json.loads(self._client.complete(registry.step("symbol"), user, json_schema=SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - provider/schema failures are intentionally fail-soft
             log.warning("symbol extraction failed: %s", exc)
             _trouble()
@@ -535,8 +540,9 @@ class SymbolResolver:
             advisory.details or "(нет текста)",
         ])
         try:
-            answer = json.loads(self._client.complete(
-                registry.step("symbol-last-resort"), prompt, json_schema=_LAST_RESORT_SCHEMA).text)
+            with output_budget(_ADVISORY_BUDGET):
+                answer = json.loads(self._client.complete(
+                    registry.step("symbol-last-resort"), prompt, json_schema=_LAST_RESORT_SCHEMA).text)
         except Exception as exc:  # noqa: BLE001 - one dead call, not the run
             log.warning("last-resort naming failed for %s: %s", advisory.advisory_id, exc)
             _trouble()
@@ -575,17 +581,17 @@ class SymbolResolver:
             "properties": {
                 "scope": {"type": "string", "enum": [
                     "function", "file", "package", "configuration", "action", "unknown"]},
-                "symbols": {"type": "array", "items": {"type": "object",
+                "symbols": {"type": "array", "maxItems": 8, "items": {"type": "object",
                     "additionalProperties": False, "required": ["name", "class", "file", "evidence"],
                     "properties": {"name": {"type": "string"}, "class": {"type": "string"},
                                    "file": {"type": "string"}, "evidence": {"type": "string"}}}},
                 "file": {"type": "string"},
                 "what_changed": {"type": "string"},
-                "preconditions": {"type": "array", "items": {"type": "string"}},
-                "required_actions": {"type": "array", "items": {"type": "string"}},
-                "search_targets": {"type": "array", "items": {"type": "string"}},
-                "evidence": {"type": "array", "items": {"type": "string"}},
-                "unresolved": {"type": "array", "items": {"type": "string"}},
+                "preconditions": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+                "required_actions": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+                "search_targets": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+                "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "unresolved": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
             },
         }
         prompt = "\n".join([
@@ -607,8 +613,9 @@ class SymbolResolver:
             "=== FIX DIFF ===", diff or "(not available)",
         ])
         try:
-            answer = json.loads(self._client.complete(
-                "You extract dependency advisory context only.", prompt, json_schema=schema).text)
+            with output_budget(_ADVISORY_BUDGET):
+                answer = json.loads(self._client.complete(
+                    "You extract dependency advisory context only.", prompt, json_schema=schema).text)
         except Exception as exc:  # noqa: BLE001 - fallback must not break triage
             log.warning("advisory context extraction failed for %s: %s", advisory.advisory_id, exc)
             _trouble()

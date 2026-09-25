@@ -12,7 +12,7 @@ max_tokens: 2200          # вердикт с трассой и обоснова
 json_mode: ollama_format
 
 # Локальная модель на 4080 отвечает ~3 c/finding, но первый вызов грузит веса.
-timeout_s: 180
+timeout_s: 500             # повтор с удвоенным лимитом (обрыв по max_tokens) и шаги advisory на 4096 токенов
 connect_timeout_s: 5
 max_retries: 2
 backoff_base_s: 2.0

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .base import BaseHTTPClient, LLMError, ToolCall, ToolTurn, tool_arguments
+from .base import BaseHTTPClient, LLMError, LLMTruncated, ToolCall, ToolTurn, tool_arguments
 
 
 class _ChatCompletionsClient(BaseHTTPClient):
@@ -25,7 +25,7 @@ class _ChatCompletionsClient(BaseHTTPClient):
                 {"role": "user", "content": user},
             ],
             "temperature": self.cfg.temperature,
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": self._max_tokens(),
             **self.cfg.options,
         }
         if self.cfg.top_p is not None:
@@ -40,8 +40,10 @@ class _ChatCompletionsClient(BaseHTTPClient):
             raise LLMError(f"{self.cfg.name}: response had no choices: {str(body)[:300]}")
         message = choices[0].get("message") or {}
         text = message.get("content") or ""
-        if not text and choices[0].get("finish_reason") == "length":
-            raise LLMError(f"{self.cfg.name}: hit max_tokens before emitting any content")
+        if choices[0].get("finish_reason") == "length":
+            # A cut-off reply is not an answer: half a JSON object only buys three
+            # "not valid JSON" retries at the same limit.
+            raise LLMTruncated(f"{self.cfg.name}: response truncated at max_tokens={self._max_tokens()}")
         usage = body.get("usage") or {}
         return text, usage.get("prompt_tokens"), usage.get("completion_tokens")
 
@@ -55,7 +57,7 @@ class _ChatCompletionsClient(BaseHTTPClient):
             "messages": messages,
             "tools": tools,
             "temperature": self.cfg.temperature,
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": self._max_tokens(),
             **self.cfg.options,
         }
         if self.cfg.top_p is not None:

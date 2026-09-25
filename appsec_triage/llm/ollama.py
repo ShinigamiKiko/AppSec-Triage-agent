@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BaseHTTPClient, LLMError, ToolCall, ToolTurn, tool_arguments
+from .base import BaseHTTPClient, LLMError, LLMTruncated, ToolCall, ToolTurn, tool_arguments
 
 
 class OllamaClient(BaseHTTPClient):
@@ -19,7 +19,7 @@ class OllamaClient(BaseHTTPClient):
     def _options(self) -> dict[str, Any]:
         options: dict[str, Any] = {
             "temperature": self.cfg.temperature,
-            "num_predict": self.cfg.max_tokens,
+            "num_predict": self._max_tokens(),
             **self.cfg.options,
         }
         if self.cfg.top_p is not None:
@@ -49,9 +49,8 @@ class OllamaClient(BaseHTTPClient):
     def _parse(self, body: dict[str, Any]) -> tuple[str, int | None, int | None]:
         text = (body.get("message") or {}).get("content", "")
         if body.get("done_reason") == "length":
-            raise LLMError(
-                f"{self.cfg.name}: response truncated at max_tokens={self.cfg.max_tokens}; "
-                "raise max_tokens in the provider profile"
+            raise LLMTruncated(
+                f"{self.cfg.name}: response truncated at max_tokens={self._max_tokens()}"
             )
         return text, body.get("prompt_eval_count"), body.get("eval_count")
 
@@ -61,9 +60,8 @@ class OllamaClient(BaseHTTPClient):
 
     def _tool_parse(self, body: dict[str, Any]) -> ToolTurn:
         if body.get("done_reason") == "length":
-            raise LLMError(
-                f"{self.cfg.name}: response truncated at max_tokens={self.cfg.max_tokens}; "
-                "raise max_tokens in the provider profile"
+            raise LLMTruncated(
+                f"{self.cfg.name}: response truncated at max_tokens={self._max_tokens()}"
             )
         message = body.get("message") or {}
         raw_calls = [item for item in (message.get("tool_calls") or []) if isinstance(item, dict)]

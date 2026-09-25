@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -26,6 +28,28 @@ class LLMAuthError(LLMError):
     Fatal for the whole run: every later call would fail the same way, so the
     client remembers it and refuses further calls without touching the network.
     """
+
+
+class LLMTruncated(LLMError):
+    """The reply hit the output limit: a longer limit helps, the same request again does not."""
+
+
+log = logging.getLogger(__name__)
+
+# The output limit a step asks for, on this thread: the profile's `max_tokens` is sized
+# for a verdict, and a step that returns lists of quoted symbols needs more.
+_BUDGET = threading.local()
+
+
+@contextmanager
+def output_budget(tokens: int):
+    """Allow replies of up to `tokens` for the calls made inside, on this thread."""
+    previous = getattr(_BUDGET, "tokens", None)
+    _BUDGET.tokens = max(tokens, previous or 0)
+    try:
+        yield
+    finally:
+        _BUDGET.tokens = previous
 
 
 class _UnparsableReply(LLMRetryableError):
@@ -161,7 +185,21 @@ class BaseHTTPClient(ABC):
         seconds instead of after the scanners and the SCA preparation."""
         self.complete('Reply with the json object {"ok": true} and nothing else.', "ping — answer in json")
 
+    def _max_tokens(self) -> int:
+        """The profile's limit, or more when the step asked for more (`output_budget`)."""
+        return max(self.cfg.max_tokens, getattr(_BUDGET, "tokens", None) or 0)
+
     def complete(self, system: str, user: str, *, json_schema: dict[str, Any] | None = None) -> LLMResponse:
+        try:
+            return self._complete(system, user, json_schema)
+        except LLMTruncated as exc:
+            # Once, with twice the room: a long answer fits, a runaway one fails again.
+            limit = self._max_tokens() * 2
+            log.info("%s; asking once more with max_tokens=%d", exc, limit)
+            with output_budget(limit):
+                return self._complete(system, user, json_schema)
+
+    def _complete(self, system: str, user: str, json_schema: dict[str, Any] | None) -> LLMResponse:
         self._refuse_if_fatal()
         path, payload = self._build_payload(system, user, json_schema)
         started = time.monotonic()
@@ -235,6 +273,15 @@ class BaseHTTPClient(ABC):
 
     def chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ToolTurn:
         """One turn of a native tool-calling conversation, with the usual retries."""
+        try:
+            return self._chat_tools(messages, tools)
+        except LLMTruncated as exc:
+            limit = self._max_tokens() * 2
+            log.info("%s; asking once more with max_tokens=%d", exc, limit)
+            with output_budget(limit):
+                return self._chat_tools(messages, tools)
+
+    def _chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ToolTurn:
         if not self.supports_tools:
             raise LLMError(f"{self.name}: tool calling is not enabled for this provider")
         self._refuse_if_fatal()
