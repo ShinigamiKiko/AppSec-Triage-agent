@@ -30,16 +30,28 @@ appsec-triage:
     APPSEC_ECOSYSTEMS: "composer"
     # GitLab caches only paths under the project directory.
     GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+    # Composer's audit refuses advisories on purpose-installed vulnerable versions.
+    COMPOSER_NO_AUDIT: "1"
+    # Go modules through the internal proxy; govulncheck, CodeQL and gopls inherit
+    # these from the job. Private modules also need a netrc for git.rabota.space.
+    # GOPROXY: "https://nexus.example/repository/go-proxy/"
+    # GOPRIVATE: "git.example"
+    # npm/yarn read the registry from the project's .npmrc/.yarnrc; a token for it
+    # goes into a masked variable the .npmrc references (e.g. NPM_TOKEN).
   before_script:
     # The project's own build, whatever it needs before composer can resolve.
     - ./build.sh
     # Vulnerable versions must install: they are what is being analysed.
+    # The job installs, through the registries it has access to (satis, Nexus, the
+    # project's own .npmrc/.yarnrc, GOPROXY): the agent installs nothing itself.
     # Install only what the cache did not bring; the key is the lock files, so a
     # restored tree always matches them. No `|| true` here on purpose: a failed
     # install must stop the job, not leave the agent reading a half-built tree.
-    # Dev dependencies stay — a package pruned from the tree cannot be read, and
-    # the chain stops at it.
-    - if [ -f composer.lock ] && [ ! -d vendor ]; then composer config --no-interaction audit.block-insecure false; composer install --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist; fi
+    # Composer without dev: a project's own Psalm or phpstan in vendor/ replaces
+    # the agent's Psalm classes through the autoloader, and dev tools never ship.
+    # npm and Go keep dev dependencies — a package pruned from the tree cannot be
+    # read, and the chain stops at it.
+    - if [ -f composer.lock ] && [ ! -d vendor ]; then composer install --no-dev --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist; fi
     - if [ -f package-lock.json ] && [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
     - if [ -f yarn.lock ] && [ ! -d node_modules ]; then yarn install --frozen-lockfile; fi
     - if [ -f go.sum ] && [ ! -d "$GOMODCACHE/cache/download" ]; then go mod download; fi

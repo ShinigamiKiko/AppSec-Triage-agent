@@ -55,12 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="scan a source tree and triage the findings in one pass")
     r.add_argument("target"); r.add_argument("-s", "--scanner", action="append"); _triage_options(r)
     r.add_argument("--lsp-config", type=Path); r.add_argument("--sbom", type=Path); r.add_argument("--no-deps", action="store_true")
-    # On by default; the flag stays so older commands and CI files keep working.
-    r.add_argument("--install-deps", dest="install_deps", action="store_true")
+    # Off by default: the job installs dependencies itself, through the registries it has
+    # access to. The flag is for runs outside that network (local tests): it installs
+    # into a copy from public sources, rewriting a private proxy's URLs in the lock file.
+    r.add_argument("--install-deps", dest="install_deps", action="store_true",
+                   help="outside the CI network only: install npm/composer dependencies from public "
+                        "sources, at the lock file's versions, into a copy of the project")
     r.add_argument("--no-install-deps", dest="install_deps", action="store_false",
-                   help="scan the tree as it is instead of installing npm/composer dependencies from "
-                        "public sources, at the lock file's versions, into a copy of the project")
-    r.set_defaults(func=scan.cmd_run, install_deps=True)
+                   help="scan the tree as it is (the default)")
+    r.set_defaults(func=scan.cmd_run, install_deps=False)
     v = sub.add_parser("variants"); v.add_argument("verdicts"); v.add_argument("-f", "--findings"); v.add_argument("--source-root", action="append"); v.add_argument("-o", "--out"); v.set_defaults(func=reports.cmd_variants)
     q = sub.add_parser("queue"); q.add_argument("verdicts"); q.add_argument("-f", "--findings"); q.add_argument("-b", "--budget", type=float); q.add_argument("--no-cluster", action="store_true"); q.add_argument("--config", type=Path); q.add_argument("-o", "--out"); q.set_defaults(func=reports.cmd_queue)
     s = sub.add_parser("sbom"); s.add_argument("target"); s.add_argument("-o", "--out", required=True); s.add_argument("--sbom"); s.add_argument("--limit", type=int); s.set_defaults(func=scan.cmd_sbom)
