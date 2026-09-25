@@ -29,6 +29,16 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _REFERENCES: dict[tuple[str, str], list[tuple[str, int]]] = {}
 _REFERENCES_PENDING: dict[tuple[str, str], threading.Event] = {}
 _REFERENCES_LOCK = threading.Lock()
+# A crash exits 1, the code Psalm also uses for "issues found": told apart by its text,
+# or an analysis that died reads as "no calls, no path" — a closure nobody checked.
+_CRASHED = "crashed due to an uncaught Throwable"
+_CRASH_FILE = re.compile(r"in (/[^\s:()]+\.php):\d+")
+# Project files Psalm cannot read (a docblock it cannot parse kills the whole run): left
+# out of every later run over that project, by the scan and the dependency chain alike.
+_UNREADABLE: dict[str, set[str]] = {}
+_UNREADABLE_LOCK = threading.Lock()
+MAX_UNREADABLE = 5
+
 # One batch at a time: a second batch waits and then finds most of its methods cached.
 _BATCH_LOCK = threading.Lock()
 # The first path from input to each method, or None: a path into one method does not
@@ -121,6 +131,42 @@ class Signature:
     kind: str = "class"
     static: bool = False
     params: list[dict] = field(default_factory=list)
+
+
+def crash_cause(text: str) -> str:
+    """The line of a Psalm crash that says what broke; "" when Psalm did not crash."""
+    if _CRASHED not in (text or ""):
+        return ""
+    return next((line.strip() for line in text.splitlines() if "Uncaught" in line), "Psalm crashed")
+
+
+def exclude_crashed_file(project: Path | str, text: str) -> str:
+    """Leave out the project file a crash names; its project-relative path, or "".
+
+    "" also when the file is already left out or too many are: then the crash is not
+    one file's fault, and the run reports it instead of shrinking the project further.
+    """
+    project = Path(project).resolve()
+    cause = crash_cause(text) or ("Uncaught" in (text or "") and text) or ""
+    for match in _CRASH_FILE.finditer(cause):
+        try:
+            relative = Path(match.group(1)).resolve().relative_to(project)
+        except (ValueError, OSError):
+            continue
+        if not relative.parts or relative.parts[0] in ("vendor", "node_modules"):
+            continue
+        with _UNREADABLE_LOCK:
+            known = _UNREADABLE.setdefault(str(project), set())
+            if relative.as_posix() in known or len(known) >= MAX_UNREADABLE:
+                return ""
+            known.add(relative.as_posix())
+        return relative.as_posix()
+    return ""
+
+
+def unreadable_files(project: Path | str) -> list[str]:
+    with _UNREADABLE_LOCK:
+        return sorted(_UNREADABLE.get(str(Path(project).resolve()), ()))
 
 
 def _clean_class(klass: str) -> str:
@@ -371,13 +417,16 @@ def _enclosing_call(project: Path, sink_file: str, sink_line: int, signatures: l
 def _config(path: Path, project: Path, stub_path: Path | None = None, cache: Path | None = None) -> Path:
     autoload = project / "vendor" / "autoload.php"
     vendor = project / "vendor"
+    ignored = "".join(f"<file name={quoteattr(str(project / name))} />"
+                      for name in unreadable_files(project) if (project / name).is_file())
     parts = [
         '<?xml version="1.0"?>',
         '<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="8" findUnusedCode="false"'
         + (f" autoloader={quoteattr(str(autoload))}" if autoload.is_file() else "")
         + (f" cacheDirectory={quoteattr(str(cache))}" if cache is not None else "") + ">",
         f"  <projectFiles><directory name={quoteattr(str(project))} />"
-        + (f"<ignoreFiles><directory name={quoteattr(str(vendor))} /></ignoreFiles>" if vendor.is_dir() else "")
+        + (f"<ignoreFiles>{f'<directory name={quoteattr(str(vendor))} />' if vendor.is_dir() else ''}"
+           f"{ignored}</ignoreFiles>" if vendor.is_dir() or ignored else "")
         + "</projectFiles>",
     ]
     if stub_path is not None:
@@ -476,13 +525,31 @@ def _run(argv: list[str], cwd: Path, timeout_s: float, what: str) -> tuple[str, 
     if proc.returncode not in (0, 1, 2):
         tail = "\n".join((proc.stderr or proc.stdout or "").strip().splitlines()[-4:])
         return "", f"{what}: код {proc.returncode}: {tail[:300]}"
-    return proc.stdout + "\n" + proc.stderr, ""
+    output = proc.stdout + "\n" + proc.stderr
+    if cause := crash_cause(output):
+        return "", f"{what}: Psalm упал — {cause[:500]}"
+    return output, ""
 
 
 def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm", php: str = "php",
         timeout_s: float = _TIMEOUT_S) -> ApiAnswer:
-    """Find the calls of these PHP methods and the paths from user input into them."""
+    """Find the calls of these PHP methods and the paths from user input into them.
+
+    A file Psalm crashes on is left out and the question asked again: one unreadable
+    docblock must not cost every PHP dependency its call search.
+    """
     project = Path(project_root).resolve()
+    answer = _run_once(project, targets, binary=binary, php=php, timeout_s=timeout_s)
+    for _ in range(MAX_UNREADABLE):
+        if not answer.problem or not (skipped := exclude_crashed_file(project, answer.problem)):
+            break
+        log.warning("psalm api: %s left out — Psalm cannot read it; asking again", skipped)
+        answer = _run_once(project, targets, binary=binary, php=php, timeout_s=timeout_s)
+    return answer
+
+
+def _run_once(project: Path, targets: list[Target], *, binary: str, php: str,
+              timeout_s: float) -> ApiAnswer:
     targets = targets_valid(targets)
     if not targets:
         return ApiAnswer(problem="нет корректных имён PHP-методов для поиска", engine="psalm")

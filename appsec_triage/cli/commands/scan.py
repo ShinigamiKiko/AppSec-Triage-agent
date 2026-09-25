@@ -42,6 +42,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     for r in results:
         status = f"{r.findings} finding(s) in {r.duration_s:.0f}s" if r.ok else f"FAILED: {r.error}"
         print(f"\r  {'✓' if r.ok else '✗'} {r.scanner:<10} {status}", file=sys.stderr)
+        if r.note:
+            print(f"    ! {r.note}", file=sys.stderr)
     manifest = scanners.write_manifest(target, results, out_dir)
     print(f"→ manifest: {manifest}", file=sys.stderr)
     for r in results:

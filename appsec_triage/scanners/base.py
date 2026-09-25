@@ -56,6 +56,8 @@ class ScanResult:
     mode: str | None = None
     error: str | None = None
     stderr_tail: str = ""
+    # Something a successful scan left out, worth a line next to its result.
+    note: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -69,6 +71,7 @@ class ScanResult:
             "mode": self.mode,
             "error": self.error,
             "stderr_tail": self.stderr_tail or None,
+            "note": self.note or None,
         }
 
 

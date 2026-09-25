@@ -95,7 +95,19 @@ class PsalmScanner(Scanner):
         # knows is enough to reject it), its plugins need a vimeo/psalm the PHAR does
         # not load, and its baseline can silence the very taint issues wanted here.
         # What the taint scan needs is the project's code and where input enters it.
-        return self._scan_autonomous(target, out_dir)
+        from ..sca import psalm_api
+
+        result = self._scan_autonomous(target, out_dir)
+        for _ in range(psalm_api.MAX_UNREADABLE):
+            if result.ok or not (skipped := psalm_api.exclude_crashed_file(
+                    target, f"{result.error or ''}\n{result.stderr_tail}")):
+                break
+            log.warning("psalm: %s left out — Psalm cannot read it; scanning again", skipped)
+            result = self._scan_autonomous(target, out_dir)
+        if result.ok and (skipped_files := psalm_api.unreadable_files(target)):
+            result.note = ("пропущены файлы, на которых Psalm падает (исправьте в них докблоки): "
+                           + ", ".join(skipped_files))
+        return result
 
     def _scan_autonomous(self, target: Path, out_dir: Path) -> ScanResult:
         with tempfile.NamedTemporaryFile(
@@ -113,6 +125,11 @@ class PsalmScanner(Scanner):
                     if (target / name).is_dir()]
             ignored = "".join(
                 f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
+            # Files an earlier attempt crashed on (psalm_api.exclude_crashed_file).
+            from ..sca.psalm_api import unreadable_files
+            ignored += "".join(
+                f'      <file name={quoteattr(str(target / name))} />\n'
+                for name in unreadable_files(target) if (target / name).is_file())
             # Framework input as taint sources and database, shell and response calls as sinks.
             stubs = CONFIG_DIR / "psalm" / "framework-taint.phpstub"
             handle.write(
