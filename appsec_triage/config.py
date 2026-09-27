@@ -162,6 +162,7 @@ class LSPConfig:
     startup_timeout_s: float = 120.0
     index_timeout_s: float = 90.0
     request_timeout_s: float = 20.0
+    search_timeout_s: float = 60.0
     servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     required_languages: list[str] = field(default_factory=list)
 

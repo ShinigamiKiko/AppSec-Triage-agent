@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 PUBLIC_REGISTRY = os.environ.get("APPSEC_NPM_REGISTRY", "https://registry.npmjs.org")
 _TIMEOUT_S = int(os.environ.get("APPSEC_INSTALL_TIMEOUT_S", "900"))
 _ATTEMPTS = int(os.environ.get("APPSEC_INSTALL_ATTEMPTS", "4"))
+_COMPOSER_ATTEMPTS = max(1, min(_ATTEMPTS, 3))
 _YARN = os.environ.get("APPSEC_YARN", "yarn@1.22.22")
 
 _COPY_SKIP = {".git", "node_modules", ".codeql", "coverage", ".nuxt", ".next"}
@@ -173,9 +174,17 @@ def _installed_composer(vendor: Path) -> int:
 
 
 def copy_project(source: Path, workspace: Path) -> None:
-    """The source tree minus installed trees, VCS data and registry configuration."""
+    """The source tree minus VCS data and registry configuration.
+
+    An installed node_modules the project brought — restored from a cache or a build —
+    is copied too, like vendor/: left out, it was downloaded again in full whenever only
+    the Composer tree was missing. Without one at the root, node_modules directories
+    elsewhere are leftovers and stay out.
+    """
+    skip = _COPY_SKIP - {"node_modules"} if (source / "node_modules").is_dir() else _COPY_SKIP
+
     def ignore(directory: str, names: list[str]) -> set[str]:
-        skipped = {n for n in names if n in _COPY_SKIP or n.startswith("appsec-out")}
+        skipped = {n for n in names if n in skip or n.startswith("appsec-out")}
         if Path(directory) == source:
             skipped |= {n for n in names if n in _REGISTRY_CONFIG}
         return skipped
@@ -285,8 +294,15 @@ def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) ->
     shutil.rmtree(home, ignore_errors=True)
     env = {**os.environ, "COMPOSER_HOME": str(home), "COMPOSER_NO_INTERACTION": "1",
            "COMPOSER_ALLOW_SUPERUSER": "1", "COMPOSER_NO_AUDIT": "1"}
+    # The downloaded archives outlive the run where the run keeps its cache: a scan in a
+    # fresh container fetched 160+ archives from GitHub again, and a slow day ran out
+    # of time a third of the way through.
+    if cache := os.environ.get("APPSEC_CACHE_DIR", "").strip():
+        env["COMPOSER_CACHE_DIR"] = str(Path(cache) / "composer")
     run = dict(cwd=workspace, capture_output=True, text=True, env=env, encoding="utf-8",
                errors="replace", check=False)
+    autoload = workspace / "vendor" / "autoload.php"
+    proc = None
     try:
         # Composer 2.9 refuses to install versions with known advisories — exactly the
         # versions a scan exists to look at.
@@ -294,14 +310,33 @@ def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) ->
                        timeout=60, **run)
         # --no-dev: what production code reaches is the question, and a project's own dev
         # Psalm in vendor/ hijacks the scanner's Psalm (its Psalm\ classes load first).
-        proc = subprocess.run(["composer", "install", "--no-interaction", "--no-progress",
-                               "--prefer-dist", "--ignore-platform-reqs", "--no-scripts",
-                               "--no-plugins", "--no-dev"], timeout=timeout_s, **run)
+        # Again when it fails or runs out of time: one archive lost on the way, or a slow
+        # GitHub, stops composer before it writes the autoloader, and without one neither
+        # Psalm nor the dependency chain reads a line of PHP. The archives already
+        # fetched stay in the cache, so the next attempt only fetches what is missing.
+        for attempt in range(1, _COMPOSER_ATTEMPTS + 1):
+            try:
+                proc = subprocess.run(["composer", "install", "--no-interaction", "--no-progress",
+                                       "--prefer-dist", "--ignore-platform-reqs", "--no-scripts",
+                                       "--no-plugins", "--no-dev"], timeout=timeout_s, **run)
+            except subprocess.TimeoutExpired:
+                proc = None
+                log.warning("composer install did not finish in %ds (attempt %d of %d)",
+                            timeout_s, attempt, _COMPOSER_ATTEMPTS)
+                continue
+            if proc.returncode == 0 or autoload.is_file():
+                break
+            log.warning("composer install failed (attempt %d of %d), trying again: %s", attempt,
+                        _COMPOSER_ATTEMPTS, f"{proc.stdout}\n{proc.stderr}".strip().splitlines()[-1:])
     except subprocess.TimeoutExpired:
-        result.problem = f"composer не уложился в {timeout_s}s"
+        result.problem = "composer config не уложился в 60s"
         return
     except OSError as exc:
         result.problem = f"composer не запустился: {exc}"
+        return
+    if proc is None:
+        result.installed += _installed_composer(workspace / "vendor")
+        result.problem = f"composer не уложился в {timeout_s}s ни в одной из {_COMPOSER_ATTEMPTS} попыток"
         return
     installed = _installed_composer(workspace / "vendor")
     result.installed += installed

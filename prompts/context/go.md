@@ -28,6 +28,14 @@ File names, Go:
 - Settings worth searching when a reached call is judged: `ForceAttemptHTTP2`,
   `TLSClientConfig`, `InsecureSkipVerify`, `http.Transport{` — the transport is
   often built in another file than the call.
+- A generic body binder picks its decoder from the request's `Content-Type`, and
+  the client sets that header: Fiber `Bind().Body` / `BodyParser`, Gin
+  `ShouldBind` / `Bind`, Echo `Bind`. A handler that binds the body this way
+  reaches the XML, form and multipart decoders as well as JSON, so an
+  `encoding/xml` flaw is reachable through it even when the project never names
+  XML. It is not reachable when the handler binds with a JSON-only call
+  (`Bind().JSON`, `ShouldBindJSON`) or the application rejects other content
+  types before binding.
 - Modules are in the module cache or `vendor/`.
 
 ## Calls a Call Graph Misses

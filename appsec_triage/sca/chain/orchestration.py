@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from .. import advisories as adv
 from .. import codeql_agent, codeql_api, codeql_reach, components as components_mod
 from .. import conditions as conditions_mod, llm_advisory
-from .. import exploitable as exploitable_mod, govulncheck as govulncheck_mod
+from .. import exploitable as exploitable_mod, govulncheck as govulncheck_mod, psalm_api
 from .. import presence as presence_mod, reach as reach_mod, receiver as receiver_mod
 from .. import lsp_tools as lsp_tools_mod, registries, unreached as unreached_mod
 from .. import verdict as verdict_mod, versions as versions_mod
@@ -49,6 +49,11 @@ class DependencyChain(ChainSupport):
     def prepare(self, findings: Iterable[Finding], *, workers: int = 1,
                 progress: Callable[[int, int], None] | None = None) -> None:
         """Ask the database once per package, before any finding is triaged."""
+        findings = list(findings)
+        # The PHP call index is one Psalm analysis: started now, it is built while the
+        # findings' advisories are read, not after the first finding asks for it.
+        if any(self._uses_psalm(f.dependency) for f in findings if getattr(f, "dependency", None)):
+            psalm_api.prefetch(self._roots[0], self._psalm_binary)
         if not self._roots or not self._databases:
             return
         candidates: list[tuple[Finding, object, str, str]] = []

@@ -88,6 +88,32 @@ File names, any ecosystem:
   the operator, not to an attacker. A flaw that needs attacker control of such a
   value is not exploitable through it, unless repository evidence shows the value
   is built from request data.
+- A flaw that fires only when a third-party infrastructure component misbehaves —
+  a malicious or compromised message broker, database server, cache, object store,
+  mail server, registry or other service the application connects to — is a false
+  positive: those components belong to the operator, like the values the
+  deployment sets. The exception is a component whose address comes from request
+  data, where the application connects wherever the user says: then the attacker
+  is the server.
+- Before you confirm a flaw that fires in a client — an HTTP, HTTP/2 or TLS
+  client, a certificate check, a parser of responses — name who sends the bytes
+  it fires on. When that is a service the application calls at an address from
+  its own configuration — another company's API, the organisation's own service,
+  a broker, a database, an object store — the answer is `false_positive`: the
+  service belongs to the operator, and so does everything it sends back —
+  response bodies, headers, redirects, TLS certificates. A call path from the
+  application's code to that client proves the client runs, not that an
+  attacker feeds it. The exception is again an address taken from request data.
+- `unknown` is not an answer when what is left is decided by the rules above. If
+  the facts you have gathered show that the remaining condition needs an attacker
+  to control a value the operator sets (configuration, environment), needs a
+  third-party infrastructure component or external service to misbehave, or is
+  checked absent in the code, answer `false_positive` and name that fact. A value
+  the operator sets closes nothing when the flaw needs only that the value be on:
+  an operator who switched the vulnerable mode on made that part of the condition
+  hold, and the rest of the condition still has to be checked. Writing
+  "exploitation cannot be confirmed" while stating the very fact that closes it
+  leaves a person to repeat your work.
 - A condition with several parts ("a route declares an alternation requirement
   and an untrusted value reaches the URL generator") fails as soon as one
   required part is checked absent. Do not keep a finding open to establish the

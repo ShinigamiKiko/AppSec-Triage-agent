@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import select
 import statistics
 import subprocess
 import threading
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any, Self
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
+
+from .. import timing
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +62,21 @@ class Location:
         return f"{self.file_path}:{self.line}  |  {self.text}".rstrip()
 
 
+# Searches over the whole workspace are slow by nature on a large project — phpactor
+# looks for references file by file — so they get a longer wait, and running out of it
+# says nothing about the server being gone.
+_SEARCHES = frozenset({"textDocument/references", "textDocument/implementation", "workspace/symbol",
+                       "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"})
+_MAX_OVERDUE = 64
+# Stopping the server: its `shutdown`, `exit` and the wait for the process, each bounded,
+# so the end of a run never hangs on a server that stopped listening.
+_STOP_S = 5.0
+# A generated or vendored giant (a 1.5 MB PHP file on api-develop) keeps a PHP server
+# parsing for minutes, silent to every other request. Such a file is not sent; text
+# search still reads it.
+MAX_OPEN_BYTES = 256 * 1024
+
+
 @dataclass(slots=True)
 class LSPClient:
     """One language server process, driven synchronously."""
@@ -68,6 +86,7 @@ class LSPClient:
     timeout_s: float = 30.0
     init_timeout_s: float = 120.0
     index_timeout_s: float = 90.0
+    search_timeout_s: float = 60.0
     path_map: dict[str, str] = field(default_factory=dict)
     warmup: tuple[Path, str] | None = None
     index_ready: bool = field(default=False, init=False)
@@ -79,26 +98,143 @@ class LSPClient:
     started: bool = field(default=False, init=False)
     error: str | None = field(default=None, init=False)
     capabilities: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    # Health guard: a server that times out again and again, or answers slowly,
-    # is switched off for the run with one ERROR line instead of costing every
-    # finding its full timeout on every question.
+    # Health guard: a server that times out again and again, or answers slowly, is
+    # paused and then switched off for the run instead of costing every finding its full
+    # timeout on every question.
     max_consecutive_timeouts: int = 3
     slow_median_s: float = 5.0
     disabled: str | None = field(default=None, init=False)
     _timeouts_in_row: int = field(default=0, init=False, repr=False)
+    # Requests given up on: an answer to one of them arriving later shows the server was
+    # busy, not gone. One slow search used to time out the requests queued behind it,
+    # and three of those in a row switched a working server off for the whole run.
+    _overdue: set[int] = field(default_factory=set, init=False, repr=False)
+    # When the server last said anything — an answer, a late answer, a progress note. A
+    # busy server keeps talking or answers late; a hung one goes quiet.
+    _last_heard: float = field(default_factory=time.monotonic, init=False, repr=False)
+    # A silent server is paused, then asked again: phpactor searching references for a
+    # name like `parse` over thousands of files says nothing for minutes, and comes back.
+    # Off for the rest of the run only after the pauses ran out.
+    cooldown_s: float = 120.0
+    max_pauses: int = 2
+    _paused_until: float = field(default=0.0, init=False, repr=False)
+    _pauses: int = field(default=0, init=False, repr=False)
     _latencies: list[float] = field(default_factory=list, init=False, repr=False)
     _slow_reported: bool = field(default=False, init=False, repr=False)
     _inbox: Any = field(default=None, init=False, repr=False)
+    # The server's input, non-blocking. A busy server stops reading it; a blocking write
+    # into the full pipe held the client's lock — and every finding's request behind it —
+    # with no timeout to end it. Now a write has a deadline like everything else.
+    write_timeout_s: float = 10.0
+    _fd: int | None = field(default=None, init=False, repr=False)
+    # A connection given up on: part of a message went out, so the stream is corrupt. The
+    # server is killed and started again by the next request, a few times per run.
+    max_restarts: int = 2
+    _broken: str | None = field(default=None, init=False, repr=False)
+    _restarts: int = field(default=0, init=False, repr=False)
+    _restart_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _reader: threading.Thread | None = field(default=None, init=False, repr=False)
 
 
-    def _write(self, payload: dict[str, Any]) -> None:
-        if not self._proc or not self._proc.stdin:
-            raise LSPError("server is not running")
+    def _write(self, payload: dict[str, Any], deadline: float) -> None:
+        """One whole message into the server's input by the deadline; the caller holds the lock.
+
+        Nothing written by then: the server is not reading, and is paused. Part of it
+        written: the stream is corrupt, and the connection is dropped.
+        """
+        proc = self._proc
+        if proc is None or proc.stdin is None or self._broken:
+            raise LSPError(self._broken or "server is not running")
         body = json.dumps(payload).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        self._proc.stdin.write(header + body)
-        self._proc.stdin.flush()
+        frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        if self._fd is None:              # no non-blocking pipe here: a test double, or not POSIX
+            proc.stdin.write(frame)
+            proc.stdin.flush()
+            return
+        view, sent = memoryview(frame), 0
+        while sent < len(frame):
+            try:
+                sent += os.write(self._fd, view[sent:])
+                continue
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                self._drop(f"запись в сервер не удалась: {exc}")
+                raise LSPError(str(exc)) from None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            select.select([], [self._fd], [], min(remaining, 1.0))
+        if sent < len(frame):
+            what = payload.get("method") or "ответ"
+            if sent:
+                self._drop(f"{what} отправлен не целиком ({sent} из {len(frame)} байт) — поток испорчен")
+            else:
+                self._pause(f"сервер не читает ввод: {what} не ушёл за {self.write_timeout_s:.0f} с")
+            raise LSPError("write timed out")
+
+    def _pause(self, reason: str) -> None:
+        """Stop asking this server for a while; off for the run once the pauses ran out."""
+        if self.disabled:
+            return
+        self.disabled = reason
+        self._timeouts_in_row = 0
+        if self._pauses < self.max_pauses:
+            self._pauses += 1
+            pause = self.cooldown_s * self._pauses
+            self._paused_until = time.monotonic() + pause
+            log.warning("LSP %s на паузе %.0f с: %s — пока ответы по коду идут без него",
+                        self.command[0], pause, reason)
+        else:
+            self._paused_until = 0.0
+            log.error("LSP %s отключён до конца прогона: %s — ответы по коду пойдут без него",
+                      self.command[0], reason)
+
+    def _drop(self, reason: str) -> None:
+        """This connection is done: the server is killed, whoever waits on it hears so at once."""
+        self._broken = reason
+        self.started = False
+        proc, self._proc, self._fd = self._proc, None, None
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        if self._inbox is not None:
+            self._inbox.put(None)
+        log.warning("LSP %s: соединение разорвано (%s) — сервер будет запущен заново",
+                    self.command[0], reason)
+
+    def _reconnect(self) -> bool:
+        """Start a new server in place of a dropped one, in the background: no finding waits
+        for `initialize` and the index. False until it is up, or when no restart is left."""
+        if not self._broken:
+            return True
+        if not self._restart_lock.acquire(blocking=False):
+            return False                          # being started already
+        if self._restarts >= self.max_restarts:
+            if not self.disabled:
+                self.disabled, self._paused_until = self._broken, 0.0
+                log.error("LSP %s отключён до конца прогона: %s (перезапусков: %d)",
+                          self.command[0], self._broken, self._restarts)
+            self._restart_lock.release()
+            return False
+        self._restarts += 1
+        threading.Thread(target=self._restart, name=f"lsp-{self.command[0]}-restart", daemon=True).start()
+        return False
+
+    def _restart(self) -> None:
+        try:
+            reason = self._broken
+            self._opened.clear()
+            self._overdue.clear()
+            self._broken, self.disabled, self._paused_until, self._timeouts_in_row = None, None, 0.0, 0
+            if self.start():
+                log.info("LSP %s запущен заново (%d-й раз) после: %s", self.command[0], self._restarts, reason)
+            else:
+                self._broken = reason
+        finally:
+            self._restart_lock.release()
 
     def _pump(self) -> None:
         """Reader thread: frames from the server's stdout into the inbox.
@@ -130,6 +266,7 @@ class LSPClient:
                     return
                 try:
                     inbox.put(json.loads(raw.decode("utf-8")))
+                    self._last_heard = time.monotonic()
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     log.debug("undecodable LSP message: %s", exc)
             except (OSError, ValueError):
@@ -154,11 +291,13 @@ class LSPClient:
             return
         if not answered:
             self._timeouts_in_row += 1
-            if self._timeouts_in_row >= self.max_consecutive_timeouts and not self.disabled:
-                self.disabled = (f"{self._timeouts_in_row} запроса подряд без ответа "
-                                 f"(последний {method}, {elapsed:.0f} с)")
-                log.error("LSP %s отключён до конца прогона: %s — ответы по коду пойдут без него",
-                          self.command[0], self.disabled)
+            # Timeouts alone do not mean a dead server: behind one long search, every
+            # request queued there times out too. Off only when it has also gone quiet.
+            silent = time.monotonic() - self._last_heard
+            if (self._timeouts_in_row >= self.max_consecutive_timeouts and silent >= self.search_timeout_s
+                    and not self.disabled):
+                self._pause(f"{self._timeouts_in_row} запроса подряд без ответа, сервер молчит "
+                            f"{silent:.0f} с (последний {method}, {elapsed:.0f} с)")
             return
         self._timeouts_in_row = 0
         self._latencies.append(elapsed)
@@ -171,42 +310,105 @@ class LSPClient:
                           "(проект на /mnt/c, нет node_modules/vendor или сервер без индекса)",
                           self.command[0], median, len(recent))
 
+    def _usable(self) -> bool:
+        """Not paused or off; a pause that is over ends here."""
+        if not self.disabled:
+            return True
+        if not (self._paused_until and time.monotonic() >= self._paused_until):
+            return False
+        log.info("LSP %s: пауза кончилась, спрашиваю снова", self.command[0])
+        self.disabled, self._paused_until = None, 0.0
+        self._last_heard = time.monotonic()
+        return True
+
     def _request(self, method: str, params: dict[str, Any], timeout: float | None = None,
                  *, track: bool = True) -> Any:
-        """Send a request and wait for its reply, skipping unrelated traffic."""
-        if self.disabled and method != "shutdown":
+        """Send a request and wait for its reply, all of it within one deadline.
+
+        The deadline covers the wait for the client's lock (one request at a time per
+        server), sending, and the answer: a queue of findings behind one slow answer ends
+        in timeouts, not in a run that stands still.
+        """
+        if method not in ("initialize", "shutdown"):
+            if self._broken and not self._reconnect():
+                return None
+            if not self.started or not self._usable():
+                return None
+        search = method in _SEARCHES
+        queued = time.monotonic()
+        deadline = queued + (timeout or (self.search_timeout_s if search else self.timeout_s))
+        if not self._lock.acquire(timeout=max(0.0, deadline - queued)):
+            timing.add("lsp-wait", time.monotonic() - queued)
             return None
-        with self._lock:
+        try:
+            timing.add("lsp-wait", time.monotonic() - queued)
+            if method not in ("initialize", "shutdown") and (self._broken or self.disabled):
+                return None                       # paused or dropped while this one waited
             self._next_id += 1
             request_id = self._next_id
             started = time.monotonic()
-            deadline = started + (timeout or self.timeout_s)
             try:
-                self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}, deadline)
                 while True:
                     message = self._read(deadline)
                     if message is None:
+                        timing.add("lsp", time.monotonic() - started)
+                        if self._broken:
+                            return None
                         log.debug("%s timed out or the server closed the stream", method)
-                        if track:
+                        self._give_up(request_id)
+                        if track and not search:
                             self._note_latency(method, time.monotonic() - started, answered=False)
                         return None
+                    if "method" not in message and message.get("id") in self._overdue:
+                        self._overdue.discard(message.get("id"))
+                        self._timeouts_in_row = 0          # late, but alive
+                        continue
                     if message.get("id") == request_id and "method" not in message:
                         if track:
                             self._note_latency(method, time.monotonic() - started, answered=True)
+                        timing.add("lsp", time.monotonic() - started)
                         if "error" in message:
                             log.debug("%s returned an error: %s", method, message["error"])
                             return None
                         return message.get("result")
             except (OSError, LSPError) as exc:
+                timing.add("lsp", time.monotonic() - started)
                 log.debug("%s failed: %s", method, exc)
                 return None
+        finally:
+            self._lock.release()
 
-    def _notify(self, method: str, params: dict[str, Any]) -> None:
-        with self._lock:
-            try:
-                self._write({"jsonrpc": "2.0", "method": method, "params": params})
-            except (OSError, LSPError) as exc:
-                log.debug("notification %s failed: %s", method, exc)
+    def _give_up(self, request_id: int) -> None:
+        """Stop waiting for a request: ask the server to drop it, and remember it in case it answers.
+
+        The caller holds the lock; the cancel gets a second of its own to go out.
+        """
+        if len(self._overdue) >= _MAX_OVERDUE:
+            self._overdue.clear()
+        self._overdue.add(request_id)
+        try:
+            self._write({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": request_id}},
+                        time.monotonic() + 1.0)
+        except (OSError, LSPError) as exc:
+            log.debug("cancelling request %s failed: %s", request_id, exc)
+
+    def _notify(self, method: str, params: dict[str, Any], timeout: float | None = None) -> bool:
+        """A notification, within its own deadline; not sent while the server is paused or restarting."""
+        if method not in ("initialized", "exit") and (self._broken or not self.started or self.disabled):
+            return False
+        queued = time.monotonic()
+        deadline = queued + (timeout or self.write_timeout_s)
+        if not self._lock.acquire(timeout=max(0.0, deadline - queued)):
+            return False
+        try:
+            self._write({"jsonrpc": "2.0", "method": method, "params": params}, deadline)
+            return True
+        except (OSError, LSPError) as exc:
+            log.debug("notification %s failed: %s", method, exc)
+            return False
+        finally:
+            self._lock.release()
 
 
     def start(self) -> bool:
@@ -222,6 +424,14 @@ class LSPClient:
         except OSError as exc:
             self.error = f"cannot start {self.command[0]!r}: {exc}"
             return False
+        self._fd = None
+        if os.name == "posix" and self._proc.stdin is not None:
+            try:
+                self._fd = self._proc.stdin.fileno()
+                os.set_blocking(self._fd, False)
+            except (OSError, ValueError):
+                self._fd = None
+        self._last_heard = time.monotonic()
         self._inbox = queue.Queue()
         self._reader = threading.Thread(target=self._pump, name=f"lsp-{self.command[0]}", daemon=True)
         self._reader.start()
@@ -282,16 +492,25 @@ class LSPClient:
         )
 
     def stop(self) -> None:
-        if not self._proc:
+        """Shut the server down, every step bounded; killed if it does not go."""
+        proc = self._proc
+        if not proc:
             return
         try:
-            self._request("shutdown", {}, timeout=5)
-            self._notify("exit", {})
-            self._proc.wait(timeout=5)
+            if not self._broken:
+                self._request("shutdown", {}, timeout=_STOP_S)
+                self._notify("exit", {}, timeout=1.0)
+            proc.wait(timeout=_STOP_S)
         except (OSError, subprocess.TimeoutExpired):
-            self._proc.kill()
+            pass
         finally:
-            self._proc = None
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            self._proc, self._fd = None, None
             self.started = False
 
     def __enter__(self) -> Self:
@@ -308,13 +527,18 @@ class LSPClient:
         if uri in self._opened:
             return True
         try:
+            if Path(path).stat().st_size > MAX_OPEN_BYTES:
+                return False
             text = Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return False
-        self._notify(
+        # Not sent while paused or restarting: then it is not marked open, and goes out
+        # the next time the file is asked about.
+        if not self._notify(
             "textDocument/didOpen",
             {"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}},
-        )
+        ):
+            return False
         self._opened.add(uri)
         return True
 

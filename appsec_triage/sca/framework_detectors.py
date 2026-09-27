@@ -9,6 +9,8 @@ from pathlib import Path
 
 import yaml
 
+from .container import parse_yaml
+
 log = logging.getLogger(__name__)
 
 
@@ -220,7 +222,7 @@ class SymfonyDetector(FrameworkDetector):
                 except OSError:
                     continue
                 try:
-                    yaml.safe_load(text)
+                    parse_yaml(text)
                 except yaml.YAMLError:
                     continue
                 

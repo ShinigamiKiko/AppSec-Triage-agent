@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from . import codewalk
 from . import records
 from . import reuse as reuse_mod
 from . import scope as scope_filter
+from . import timing
 from . import verify as verify_pass
 from .config import PipelineConfig, ProviderConfig
 from .context import builder, deps, heuristics
@@ -240,7 +242,10 @@ class TriagePipeline:
         """One finding, with the seconds each stage took written into the record."""
         timings: dict[str, float] = {}
         started = time.monotonic()
-        record = self._triage_one(finding, timings)
+        # Model, language server, Psalm and the wait for Psalm are added up from wherever
+        # they run: "chain 900s" alone does not say which of them held a finding up.
+        with timing.collecting(timings):
+            record = self._triage_one(finding, timings)
         timings["total"] = round(time.monotonic() - started, 1)
         record.timings = {k: round(v, 1) for k, v in timings.items()}
         log.info("finding %s stages: %s", finding.finding_id,
@@ -261,18 +266,19 @@ class TriagePipeline:
                 return record
 
         heur = heuristics.evaluate(finding, self.cfg.heuristics) if self.cfg.heuristics.enabled else _no_heuristics()
-        symbols = self.symbols.enrich(finding) if self.symbols else None
-        pkg = builder.build(
-            finding,
-            heur,
-            self.cfg,
-            self.history,
-            self.source,
-            symbols,
-            deps_index=self.deps_index,
-            deps_roots=self.deps_roots,
-            routes=self.routes,
-        )
+        with timing.measure("context"):
+            symbols = self.symbols.enrich(finding) if self.symbols else None
+            pkg = builder.build(
+                finding,
+                heur,
+                self.cfg,
+                self.history,
+                self.source,
+                symbols,
+                deps_index=self.deps_index,
+                deps_roots=self.deps_roots,
+                routes=self.routes,
+            )
 
         authoritative_gov = postvalidation.is_authoritative_govulncheck(finding)
 
@@ -339,8 +345,11 @@ class TriagePipeline:
             except Exception:  # noqa: BLE001 - a lookup failure only skips this check
                 advisory = None
             advisory_text = getattr(advisory, "text", "") or ""
+            advisory_subject = "\n".join([getattr(advisory, "summary", "") or "",
+                                          *(getattr(advisory, "import_paths", None) or []),
+                                          *(getattr(advisory, "symbols", None) or [])])
             if advisory_text and (reason := postvalidation.check_deployment_mismatch(
-                    finding, pkg, advisory_text=advisory_text)):
+                    finding, pkg, advisory_text=advisory_text, advisory_subject=advisory_subject)):
                 return _deployment_closed(base, finding, reason)
             stage = time.monotonic()
             try:
@@ -719,6 +728,7 @@ class TriagePipeline:
         in_flight: dict[str, float] = {}
         guard = threading.Lock()
         finished = threading.Event()
+        last_done = [time.monotonic()]
 
         def timed(finding: Finding) -> TriageRecord:
             """One finding, with the two lines that say which one is running and for how long."""
@@ -732,27 +742,37 @@ class TriagePipeline:
             finally:
                 with guard:
                     in_flight.pop(finding.finding_id, None)
+                    last_done[0] = time.monotonic()
             log.info("finding %s decided %s in %.1fs", finding.finding_id,
                      record.verdict.verdict.value, time.monotonic() - started)
             return record
 
         def watch() -> None:
-            """Name the findings that are taking too long, while they still are."""
+            """Name the findings that are taking too long, and show where a stalled run stands."""
             warned: set[str] = set()
             limit = max(30, self.cfg.slow_finding_seconds)
+            dumped = 0.0
             while not finished.wait(30):
                 now = time.monotonic()
                 with guard:
                     slow = [(fid, now - t) for fid, t in in_flight.items() if now - t > limit]
+                    idle = now - last_done[0] if in_flight else 0.0
+                    since = last_done[0]
                 for fid, elapsed in slow:
                     if fid not in warned:
                         warned.add(fid)
                         log.warning("finding %s still running after %.0f s", fid, elapsed)
+                # Nothing finished for that long: once per stall, what every thread is
+                # doing — a run that sat silent for an hour left nothing to go on.
+                if idle > limit and dumped != since:
+                    dumped = since
+                    log.warning("no finding finished for %.0f s; the threads now:\n%s", idle, _thread_stacks())
 
         watcher = threading.Thread(target=watch, name="slow-finding-watch", daemon=True)
         watcher.start()
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {pool.submit(timed, f): i for i, f in enumerate(items)}
             for done, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
@@ -775,6 +795,15 @@ class TriagePipeline:
                         log.exception("could not journal %s", items[index].finding_id)
                 if progress:
                     progress(done, len(items))
+        except KeyboardInterrupt:
+            # Ctrl+C: the findings not started are dropped and the ones under way are not
+            # waited for. Waiting meant minutes of Psalm and of model calls on a client
+            # already closed, in a container that outlived the Ctrl+C and competed with
+            # the next run for memory. What was decided is in the journal already.
+            finished.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown()
 
         finished.set()
 
@@ -787,6 +816,16 @@ class TriagePipeline:
             spend_usd=float(getattr(self.client, "spend_usd", 0.0) or 0.0),
             model_calls=int(getattr(self.client, "calls", 0) or 0),
         )
+
+
+def _thread_stacks(depth: int = 14) -> str:
+    """The innermost frames of every thread, named."""
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    parts = []
+    for ident, frame in sys._current_frames().items():
+        stack = "".join(traceback.format_stack(frame)[-depth:])
+        parts.append(f"--- {names.get(ident, ident)}\n{stack}")
+    return "\n".join(parts)
 
 
 def _walk_key(finding: Finding) -> tuple[str, str, str] | None:

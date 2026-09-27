@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import timing
+
 log = logging.getLogger(__name__)
 
 TOOL_MODE_NOTE = (
@@ -73,7 +75,7 @@ def run_calls(calls, offered, handlers, loop, *, max_calls: int, parallel: int) 
 
     if len(run_me) > 1 and parallel > 1:
         with ThreadPoolExecutor(max_workers=min(parallel, len(run_me))) as pool:
-            for index, answer in zip(run_me, pool.map(invoke, run_me)):
+            for index, answer in zip(run_me, pool.map(timing.carry(invoke), run_me)):
                 answers[index] = answer
     else:
         for index in run_me:

@@ -9,6 +9,7 @@ from pathlib import Path
 from .. import advisories as adv
 from .. import codeql_api, codeql_reach, container as container_mod, exploitability as exploit_mod, psalm_api
 from .. import presence as presence_mod, registries
+from ... import timing
 from ..bridge import BridgeWalk, entry_points, walk_bridge
 from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
@@ -170,7 +171,9 @@ class ChainSupport:
                 if pending is None:
                     pending = self._pending[token] = threading.Event()
                     break
-            pending.wait()
+            # Another finding is computing the same answer: its time is counted there.
+            with timing.measure("shared-wait"):
+                pending.wait()
         try:
             value = compute()
             with self._dataflow_lock:
@@ -331,8 +334,9 @@ class ChainSupport:
         identifiers = self._identifiers(finding)
         key = (identifiers[0] if identifiers else "", dependency.package or "",
                dependency.ecosystem or "", dependency.installed_version or "")
-        advisory, _ = self._once(self._advisories, key,
-                                 lambda: adv.collect(*key, nvd_api_key=self._nvd_api_key))
+        with timing.measure("advisory"):
+            advisory, _ = self._once(self._advisories, key,
+                                     lambda: adv.collect(*key, nvd_api_key=self._nvd_api_key))
         return advisory
 
     def _resolve_symbol(self, advisory, version: str):

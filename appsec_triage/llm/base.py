@@ -13,6 +13,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from .. import timing
+
 
 class LLMError(RuntimeError):
     """Non-retryable provider failure."""
@@ -190,14 +192,15 @@ class BaseHTTPClient(ABC):
         return max(self.cfg.max_tokens, getattr(_BUDGET, "tokens", None) or 0)
 
     def complete(self, system: str, user: str, *, json_schema: dict[str, Any] | None = None) -> LLMResponse:
-        try:
-            return self._complete(system, user, json_schema)
-        except LLMTruncated as exc:
-            # Once, with twice the room: a long answer fits, a runaway one fails again.
-            limit = self._max_tokens() * 2
-            log.info("%s; asking once more with max_tokens=%d", exc, limit)
-            with output_budget(limit):
+        with timing.measure("model"):
+            try:
                 return self._complete(system, user, json_schema)
+            except LLMTruncated as exc:
+                # Once, with twice the room: a long answer fits, a runaway one fails again.
+                limit = self._max_tokens() * 2
+                log.info("%s; asking once more with max_tokens=%d", exc, limit)
+                with output_budget(limit):
+                    return self._complete(system, user, json_schema)
 
     def _complete(self, system: str, user: str, json_schema: dict[str, Any] | None) -> LLMResponse:
         self._refuse_if_fatal()
@@ -273,13 +276,14 @@ class BaseHTTPClient(ABC):
 
     def chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ToolTurn:
         """One turn of a native tool-calling conversation, with the usual retries."""
-        try:
-            return self._chat_tools(messages, tools)
-        except LLMTruncated as exc:
-            limit = self._max_tokens() * 2
-            log.info("%s; asking once more with max_tokens=%d", exc, limit)
-            with output_budget(limit):
+        with timing.measure("model"):
+            try:
                 return self._chat_tools(messages, tools)
+            except LLMTruncated as exc:
+                limit = self._max_tokens() * 2
+                log.info("%s; asking once more with max_tokens=%d", exc, limit)
+                with output_budget(limit):
+                    return self._chat_tools(messages, tools)
 
     def _chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ToolTurn:
         if not self.supports_tools:

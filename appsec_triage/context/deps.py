@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import sourcetext
 from .detection import get_source_suffixes
 
 log = logging.getLogger(__name__)
@@ -132,8 +135,44 @@ def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str
     return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
+# Asked for every dependency finding, and the answer depends only on the package and
+# the tree: each ask walked the whole tree — vendor/ with it — and read the project again.
+_IMPORTED: dict[tuple, bool | None] = {}
+_SOURCE_LISTS: dict[tuple[str, frozenset], list[Path]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _source_paths(root: Path, suffixes: set[str]) -> list[Path]:
+    """Files of these types under the root, in walk order, listed once per run."""
+    key = (str(root), frozenset(suffixes))
+    with _CACHE_LOCK:
+        cached = _SOURCE_LISTS.get(key)
+    if cached is None:
+        cached = []
+        for directory, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if not _skip_path(Path(directory) / d))
+            for name in sorted(names):
+                path = Path(directory) / name
+                if path.suffix.lower() in suffixes and not _skip_path(path) and path.is_file():
+                    cached.append(path)
+        with _CACHE_LOCK:
+            cached = _SOURCE_LISTS.setdefault(key, cached)
+    return cached
+
+
 def is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool | None:
     """Does any source file here reference the package?"""
+    key = (package, ecosystem, tuple(str(r) for r in roots))
+    with _CACHE_LOCK:
+        if key in _IMPORTED:
+            return _IMPORTED[key]
+    answer = _is_imported(package, ecosystem, roots)
+    with _CACHE_LOCK:
+        _IMPORTED[key] = answer
+    return answer
+
+
+def _is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool | None:
     patterns = _import_patterns(package, ecosystem)
     if not patterns:
         return None
@@ -149,19 +188,12 @@ def is_imported(package: str, ecosystem: str | None, roots: list[Path]) -> bool 
         root = Path(root)
         if not root.is_dir():
             continue
-        for path in root.rglob("*"):
+        for path in _source_paths(root, suffixes):
             if scanned >= _MAX_FILES:
                 log.debug("import search for %s hit the file budget", package)
                 return None
-            if path.suffix.lower() not in suffixes:
-                continue
-            if _skip_path(path):
-                continue
-            try:
-                if path.stat().st_size > _MAX_BYTES:
-                    continue
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            text = sourcetext.read(path, _MAX_BYTES)
+            if text is None:
                 continue
             scanned += 1
             if any(p.search(text) for p in patterns):

@@ -131,6 +131,7 @@ class LSPService:
             timeout_s=self.cfg.request_timeout_s,
             init_timeout_s=self.cfg.startup_timeout_s,
             index_timeout_s=self.cfg.index_timeout_s,
+            search_timeout_s=self.cfg.search_timeout_s,
             path_map=dict(spec.get("path_map") or {}),
             warmup=self._warmup_file(language, spec),
         )

@@ -82,12 +82,19 @@ def govulncheck_baseline(finding: Finding) -> Verdict:
 
 
 def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage,
-                              advisory_text: str = "") -> str | None:
+                              advisory_text: str = "", advisory_subject: str = "") -> str | None:
     """Return FP reason for advisory preconditions impossible in this deployment.
 
-    `advisory_text` is the advisory the dependency chain fetched. The scanner's own
-    title is often too short to name the component ("Misuse of ServerConfig.PublicKeyCallback
-    ... in golang.org/x/crypto" never says SSH), so the rule must also read the full text.
+    `advisory_text` is the advisory the dependency chain fetched; `advisory_subject` its
+    summary and the packages and symbols it names. The scanner's own title is often too
+    short to name the component ("Misuse of ServerConfig.PublicKeyCallback ... in
+    golang.org/x/crypto" never says SSH); the vulnerable package path does
+    (golang.org/x/crypto/ssh).
+
+    A component the platform does not run is looked for in what the advisory is about —
+    its title, summary, packages — not anywhere in its text: an Immutable.js DoS names
+    the "kernel OOM-kill" among its effects, a PostCSS file read lists "SSH keys" among
+    what it can read, and both were closed as kernel and SSH advisories.
     """
     from ..testpaths import is_local_environment
 
@@ -111,39 +118,49 @@ def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage,
     )
     if not details:
         return None
+    subject = "\n".join(
+        text
+        for text in (
+            str(advisory.get("summary", "")),
+            advisory_subject,
+            finding.title or "",
+            finding.dependency.package if finding.dependency else "",
+        )
+        if text
+    )
 
-    if re.search(r"\b(?:kernel|syscall|sys\.call|kmod)\b", details, re.IGNORECASE):
+    if re.search(r"\b(?:kernel|syscall|sys\.call|kmod)\b", subject, re.IGNORECASE):
         return (
             "Advisory describes kernel-level behavior; application code cannot modify the kernel. "
             "The vulnerability does not apply to this application."
         )
 
-    if re.search(r"\bssh\b|\bsshd\b", details, re.IGNORECASE):
+    if re.search(r"\bssh\b|\bsshd\b", subject, re.IGNORECASE):
         return (
             "Advisory describes SSH behavior; SSH is not part of the application deployment. "
             "The vulnerability does not apply to this application."
         )
 
-    if re.search(r"\bldap\b|\bgo-ntlmssp\b", details, re.IGNORECASE):
+    if re.search(r"\bldap\b|\bgo-ntlmssp\b", subject, re.IGNORECASE):
         return (
             "Advisory describes LDAP behavior; LDAP is not part of the application deployment. "
             "The vulnerability does not apply to this application."
         )
 
-    if re.search(r"\bftp\b", details, re.IGNORECASE):
+    if re.search(r"\bftp\b", subject, re.IGNORECASE):
         return (
             "Advisory describes FTP behavior; FTP is not part of the application deployment. "
             "The vulnerability does not apply to this application."
         )
 
-    if re.search(r"\b(?:nfs|smb|cifs)\b", details, re.IGNORECASE):
+    if re.search(r"\b(?:nfs|smb|cifs)\b", subject, re.IGNORECASE):
         return (
             "Advisory describes network file-sharing behavior; legacy file-sharing is not part of the application "
             "deployment. The vulnerability does not apply to this application."
         )
 
     # Windows is never part of the supported application deployment.
-    if re.search(r"\bWindows\b", details) and not re.search(r"\bcross[- ]platform\b", details, re.IGNORECASE):
+    if re.search(r"\bWindows\b", subject) and not re.search(r"\bcross[- ]platform\b", details, re.IGNORECASE):
         return (
             "Advisory describes Windows behavior; Windows is not a supported deployment platform. "
             "The vulnerability does not apply to this application."
@@ -302,7 +319,12 @@ def _project_site(site: str) -> bool:
     if not path or not line.rstrip(",;").isdigit():
         return False
     parts = set(path.replace("\\", "/").split("/"))
-    return not parts & {"node_modules", "vendor"}
+    if parts & {"node_modules", "vendor"}:
+        return False
+    from ..sca import registries
+
+    # A Go module's file, read from the module cache.
+    return registries.go_module_of(path) is None
 
 
 def _call_resolved(sca) -> bool:
@@ -742,13 +764,21 @@ def cap_unproven_dependency_confirmation(
     parent_reaches = parent is not None and any(
         re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", parent[1].code)
         for name in {expected, *entries} if name)
+    # A Go call graph (govulncheck, run by the agent or inside wolfee) traces the program
+    # to the symbol the vulnerability database lists: the step from the public API to the
+    # vulnerable function is exactly what it proves. The name the model resolved can
+    # differ (DecodeElement behind xml.Unmarshal) without the path being any less real.
+    graph = getattr(chain, "reachability", None)
+    graph_called = bool(
+        (getattr(finding.dependency, "ecosystem", "") or "").lower() in ("go", "golang")
+        and getattr(graph, "reachable", False) and getattr(graph, "trace", None))
     if getattr(symbol, "declared_in_installed", None) is False:
         missing = "уязвимый символ отсутствует в установленной версии; проверьте механизм по её исходникам"
-    elif expected and matched != expected and matched not in entries and not parent_reaches:
+    elif expected and matched != expected and matched not in entries and not parent_reaches and not graph_called:
         missing = "путь ведёт к публичному API, но не доказан переход к уязвимой функции"
     elif condition_state == "external":
         missing = "обязательное условие эксплуатации в окружении не проверено"
-    elif not proven and not parent_reaches:
+    elif not proven and not parent_reaches and not graph_called:
         missing = "путь до уязвимого вызова не доказан"
     else:
         return result

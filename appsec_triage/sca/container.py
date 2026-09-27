@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -90,11 +91,128 @@ if yaml is not None:  # pragma: no branch - trivial
     _SymfonyLoader.add_multi_constructor("!", _ignore_tag)
 
 
+# Symfony reads an unquoted value inside `{ ... }` or `[ ... ]` up to the next `,` or
+# closing bracket, so `{ path: ^/v2/x/([a-z\d]+), roles: ROLE_USER }` is fine to it.
+# YAML proper ends the value at the `[`, and PyYAML rejects the whole file — over an
+# access_control regex, a common line of security.yaml. The line PyYAML stops at is
+# rewritten the way Symfony reads it (as JSON, which is YAML too) and read again.
+_FLOW_START = re.compile(r"""^(\s*(?:-\s+)*(?:[^\s#'"{\[][^#]*?:\s+)?)[\[{]""")
+MAX_REWRITES = 50
+
+
+def parse_yaml(text: str):
+    """A Symfony configuration file as Symfony reads it; raises yaml.YAMLError."""
+    lines = text.split("\n")
+    for _ in range(MAX_REWRITES):
+        try:
+            return yaml.load("\n".join(lines), Loader=_SymfonyLoader)
+        except yaml.MarkedYAMLError as exc:
+            mark = exc.problem_mark or exc.context_mark
+            if mark is None or not 0 <= mark.line < len(lines):
+                raise
+            fixed = _symfony_inline(lines[mark.line])
+            if fixed is None or fixed == lines[mark.line]:
+                raise
+            lines[mark.line] = fixed
+    return yaml.load("\n".join(lines), Loader=_SymfonyLoader)
+
+
+def _symfony_inline(line: str) -> str | None:
+    """The line with its inline collection read by Symfony's rules; None when it has none."""
+    match = _FLOW_START.match(line)
+    if not match:
+        return None
+    start = match.end(1)
+    try:
+        value, end = _inline_value(line, start, "")
+    except (ValueError, IndexError):
+        return None
+    return line[:start] + json.dumps(value, ensure_ascii=False, default=str) + line[end:]
+
+
+def _inline_value(text: str, i: int, stops: str):
+    while text[i] == " ":
+        i += 1
+    if text[i] == "[":
+        items: list = []
+        i += 1
+        while True:
+            while text[i] in " ,":
+                i += 1
+            if text[i] == "]":
+                return items, i + 1
+            item, i = _inline_value(text, i, ",]")
+            items.append(item)
+            while text[i] == " ":
+                i += 1
+            if text[i] not in ",]":
+                raise ValueError(text[i:])
+    if text[i] == "{":
+        mapping: dict = {}
+        i += 1
+        while True:
+            while text[i] in " ,":
+                i += 1
+            if text[i] == "}":
+                return mapping, i + 1
+            if text[i] in "\"'":
+                end = _quoted_end(text, i)
+                key = _scalar(text[i:end])
+                i = end
+                while text[i] == " ":
+                    i += 1
+            else:
+                end = text.index(":", i)
+                key = text[i:end].strip()
+                i = end
+            if text[i] != ":":
+                raise ValueError(text[i:])
+            mapping[str(key)], i = _inline_value(text, i + 1, ",}")
+            while text[i] == " ":
+                i += 1
+            if text[i] not in ",}":
+                raise ValueError(text[i:])
+    if text[i] in "\"'":
+        end = _quoted_end(text, i)
+        return _scalar(text[i:end]), end
+    end = i
+    while end < len(text) and text[end] not in stops:
+        end += 1
+    if stops and end >= len(text):
+        raise ValueError("unclosed")
+    return _scalar(text[i:end].strip()), end
+
+
+def _quoted_end(text: str, i: int) -> int:
+    quote, j = text[i], i + 1
+    while j < len(text):
+        if quote == '"' and text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == quote:
+            if quote == "'" and text[j + 1:j + 2] == "'":
+                j += 2
+                continue
+            return j + 1
+        j += 1
+    raise ValueError("unclosed quote")
+
+
+def _scalar(raw: str):
+    if not raw:
+        return None
+    try:
+        value = yaml.load(raw, Loader=_SymfonyLoader)
+    except yaml.YAMLError:
+        return raw
+    return raw if isinstance(value, (dict, list)) else value
+
+
 def _read(path: Path) -> dict | None:
     if yaml is None:
         return None
     try:
-        loaded = yaml.load(path.read_text(encoding="utf-8"), Loader=_SymfonyLoader)
+        loaded = parse_yaml(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         log.warning("configuration file %s could not be parsed: %s", path, exc)
         return None

@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path, PurePosixPath
 
+from .. import sourcetext
 from ..testpaths import is_test
+from .client import MAX_OPEN_BYTES
 from .client import path_to_uri, uri_to_path
 
 log = logging.getLogger(__name__)
@@ -18,6 +21,10 @@ _KINDS = {1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "
           23: "struct", 24: "event", 25: "operator", 26: "type parameter"}
 _SKIP = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv", "target"}
 _MAX_LISTED = 20
+# One lsp_find_usages through the server: a definition request per line naming the
+# symbol, each up to the request timeout — twenty lines of a slow server were minutes.
+_USAGES_BUDGET_S = 60.0
+_MAX_SCANNED = 2 * 1024 * 1024
 _MAX_SCAN = 20000
 _READ_LINES = 80
 _SYMBOL_LINES = 160
@@ -57,7 +64,7 @@ class CodeTools:
         self.lsp = lsp
         self.root = Path(root)
         self._languages: list[str] | None = None
-        self._opened: set[str] = set()
+        self._files: list[tuple[Path, str, bool, str]] | None = None
 
     # ---- which servers this project needs ---------------------------------
 
@@ -91,10 +98,9 @@ class CodeTools:
         return self.lsp._path_map_for(language)
 
     def _open(self, client, language: str, path: Path) -> None:
-        key = f"{language}:{path}"
-        if key not in self._opened:
-            client.open_document(path, self._language_id(language))
-            self._opened.add(key)
+        # The client knows what its server has open: a file not sent during a pause, or
+        # opened before a restart, goes out again here.
+        client.open_document(path, self._language_id(language))
 
     def _first_file(self, language: str) -> Path | None:
         for parent, dirnames, filenames in os.walk(self.root):
@@ -277,6 +283,13 @@ class CodeTools:
         client = self._client(language)
         if client is None:
             return None, None, None, f"языковой сервер {language} не запустился"
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size > MAX_OPEN_BYTES:
+            return None, None, None, (f"{file}: {size // 1024} КБ — слишком большой для языкового сервера; "
+                                      "используйте read_file и search_code")
         self._open(client, language, path)
         return path, language, client, ""
 
@@ -368,35 +381,47 @@ class CodeTools:
         short = re.split(r"::|\\|\.", wanted)[-1].strip().rstrip("()")
         if not short or not re.match(r"^[A-Za-z_$][\w$]*$", short):
             return "Not run: give a function, method or class name."
+        if (answer := self._usages_by_psalm(wanted)) is not None:
+            return answer
         pattern = re.compile(rf"(?<![\w$]){re.escape(short)}(?![\w$])")
         rows: list[str] = []
         unresolved = 0
         scanned = 0
         tests = 0
-        for parent, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
-            for filename in sorted(filenames):
-                language = self.lsp.cfg.language_for(filename)
-                if not language or language not in self.available():
-                    continue
-                path = Path(parent) / filename
-                try:
-                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-                except OSError:
-                    continue
-                if is_test(self.relative(path)):
-                    tests += sum(1 for text in lines if pattern.search(text))
-                    continue
+        silent = 0
+        deadline = time.monotonic() + _USAGES_BUDGET_S
+        out_of_time = False
+        usable = {language: self._answering(language) for language in self.available()}
+        for path, rel, test, language in self._code_files():
+            if language not in usable:
+                continue
+            if not test:
                 scanned += 1
-                for number, text in enumerate(lines, 1):
-                    match = pattern.search(text)
-                    if not match or text.lstrip().startswith(("//", "#", "*", "/*")):
-                        continue
+            text_all = sourcetext.read(path, _MAX_SCANNED)
+            if text_all is None or not pattern.search(text_all):
+                continue
+            lines = text_all.splitlines()
+            if test:
+                tests += sum(1 for text in lines if pattern.search(text))
+                continue
+            for number, text in enumerate(lines, 1):
+                match = pattern.search(text)
+                if not match or text.lstrip().startswith(("//", "#", "*", "/*")):
+                    continue
+                if not usable[language] or len(text_all) > MAX_OPEN_BYTES:
+                    # No server to ask, or a file too big to hand it: the place is listed as found
+                    # by text, which says nothing about what it resolves to.
+                    silent += 1
+                    rows.append(f"- {rel}:{number}: {text.strip()[:90]} → не разрешено: "
+                                + ("сервер недоступен" if not usable[language] else "файл слишком большой для сервера"))
+                elif time.monotonic() > deadline:
+                    out_of_time = True
+                    break
+                else:
                     client = self._client(language)
                     self._open(client, language, path)
                     reply = self._request(client, language, "textDocument/definition", path, number, match.start())
                     places = self._locations(reply, language) if reply is not None else []
-                    rel = self.relative(path)
                     if places:
                         target, target_line = places[0]
                         rows.append(f"- {rel}:{number}: {text.strip()[:90]} → {self.relative(target)}:{target_line} "
@@ -405,11 +430,9 @@ class CodeTools:
                         unresolved += 1
                         rows.append(f"- {rel}:{number}: {text.strip()[:90]} → не разрешено сервером "
                                     "(пакет не установлен или имя не является вызовом)")
-                    if len(rows) >= _MAX_LISTED:
-                        break
                 if len(rows) >= _MAX_LISTED:
                     break
-            if len(rows) >= _MAX_LISTED:
+            if out_of_time or len(rows) >= _MAX_LISTED:
                 break
         skipped = (f"\nв тестовых файлах ещё {tests} упоминаний — не продакшен, пропущены" if tests else "")
         if not rows:
@@ -417,7 +440,68 @@ class CodeTools:
                     f"({', '.join(self.available())}){skipped}")
         tail = (f"\n{unresolved} мест не разрешено: без установленных зависимостей сервер не видит их "
                 "объявлений — это не значит, что вызова нет") if unresolved else ""
+        if silent:
+            tail += (f"\n{silent} мест найдено только текстом: сервер их не разрешал — куда они ведут, "
+                     "не проверено")
+        if out_of_time:
+            tail += (f"\nпоиск остановлен через {_USAGES_BUDGET_S:.0f} с: сервер отвечает медленно, "
+                     "остальные места не проверены — это не значит, что их нет")
         return "\n".join(rows) + tail + skipped
+
+    def _answering(self, language: str) -> bool:
+        """The language's server is up and not paused: worth asking about a line."""
+        client = self._client(language)
+        return bool(client is not None and getattr(client, "started", True) and not getattr(client, "disabled", None))
+
+    def _code_files(self) -> list[tuple[Path, str, bool, str]]:
+        """(path, relative path, is test, language) of the project's code files, walked once."""
+        if self._files is None:
+            files = []
+            for parent, dirnames, filenames in os.walk(self.root):
+                dirnames[:] = sorted(d for d in dirnames if d not in _SKIP and not d.startswith("."))
+                for filename in sorted(filenames):
+                    language = self.lsp.cfg.language_for(filename)
+                    if language:
+                        path = Path(parent) / filename
+                        rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+                        files.append((path, rel, is_test(rel), language))
+            self._files = files
+        return self._files
+
+    def _usages_by_psalm(self, name: str) -> str | None:
+        """PHP usages from the run's Psalm call index; None to search with the language server.
+
+        The index already knows every call and class reference with its type resolved;
+        the server would open each file with the name in it and ask about every line —
+        for `parse` or `resolve` that kept phpactor silent for minutes.
+        """
+        from ..sca import psalm_api
+
+        found = psalm_api.usages(self.root, name)
+        if not found:
+            return None                      # no index, or a plain function: the server looks
+        rows: list[str] = []
+        tests = 0
+        lines: dict[str, list[str]] = {}
+        for symbol, file, line in found:
+            if is_test(file):
+                tests += 1
+                continue
+            if file not in lines:
+                try:
+                    lines[file] = (self.root / file).read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    lines[file] = []
+            text = lines[file][line - 1].strip()[:90] if 0 < line <= len(lines[file]) else ""
+            rows.append(f"- {file}:{line}: {text} → {symbol}")
+        more = len(rows) - _MAX_LISTED
+        listed = rows[:_MAX_LISTED]
+        if more > 0:
+            listed.append(f"… и ещё {more}")
+        skipped = f"\nв тестовых файлах ещё {tests} — не продакшен, пропущены" if tests else ""
+        if not listed:
+            return f"Psalm: {name!r} используется только в тестах{skipped}"
+        return ("Psalm (типы разрешены анализом всего проекта):\n" + "\n".join(listed) + skipped)
 
     def definition(self, file: str, line: int, name: str) -> str:
         path, language, client, problem = self._for_file(file)

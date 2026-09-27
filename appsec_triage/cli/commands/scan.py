@@ -138,6 +138,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("error: scanners produced no readable report", file=sys.stderr)
         return 1
     wolfee_report = scan_dir / "wolfee.sarif.json"
+    _drop_stale_dependencies(scan_dir)
     if not getattr(args, "no_deps", False):
         # One cdxgen pass per run, whoever found the vulnerabilities. wolfee reports
         # npm names without their scope and without edges; the SBOM has both, so the
@@ -151,5 +152,54 @@ def cmd_run(args: argparse.Namespace) -> int:
                                            sbom=str(sbom_file) if sbom_file else None,
                                            limit=0)) != 0:
                 print("  ! зависимости не разобраны — триаж пойдёт только по находкам сканеров", file=sys.stderr)
+    if not getattr(args, "govulncheck", None):
+        _go_call_graph(args, target, out)
     args.scan_dir = scan_dir
     return run_triage(args, scan_dir, out, [target])
+
+
+def _drop_stale_dependencies(scan_dir: Path) -> None:
+    """Remove dependencies.json when wolfee reported this time.
+
+    The file is written only when wolfee has no report; next to a fresh wolfee report it
+    is a previous run's, and every .json in scans/ is read as findings — the same
+    advisories were triaged twice, once from each.
+    """
+    stale = scan_dir / "dependencies.json"
+    if (scan_dir / "wolfee.sarif.json").is_file() and stale.is_file():
+        stale.unlink()
+        print("→ dependencies.json прошлого прогона убран: wolfee отработал", file=sys.stderr)
+
+
+def _go_call_graph(args: argparse.Namespace, target: Path, out: Path) -> None:
+    """govulncheck over every Go module of the tree, for reachability only.
+
+    wolfee runs it at the root, and a repository with its Go module in a subdirectory
+    (backend/go.mod) got no call graph at all. The report feeds the chain's
+    reachability; it adds no findings of its own — wolfee has reported them already.
+    Outside scans/: every .json there is read as a scanner report.
+    """
+    import shutil
+
+    from ...sca import govulncheck as govulncheck_mod
+
+    wanted = {e.strip().lower() for e in os.environ.get("APPSEC_ECOSYSTEMS", "").split(",") if e.strip()}
+    if wanted and not wanted & {"go", "golang"}:
+        return
+    if shutil.which("govulncheck") is None or not govulncheck_mod.modules(target):
+        return
+    from ...sca import gotoolchain
+
+    for module in govulncheck_mod.modules(target):
+        release, where = gotoolchain.project_release(target, module)
+        if release:
+            relative = module.relative_to(target).as_posix()
+            print(f"→ Go {'' if relative == '.' else relative + ' '}собирается на {release} ({where}) — "
+                  f"stdlib проверяется по нему (образ: {gotoolchain.local_release() or '?'})", file=sys.stderr)
+    report = out / "govulncheck-reach.json"
+    count, findings, problems = govulncheck_mod.run(target, report)
+    print(f"→ govulncheck: Go-модулей {count}, записей о достижимости {findings}", file=sys.stderr)
+    for problem in problems[:3]:
+        print(f"  ! govulncheck: {problem}", file=sys.stderr)
+    if findings:
+        args.govulncheck_reach = str(report)

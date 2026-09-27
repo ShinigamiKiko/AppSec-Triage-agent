@@ -6,7 +6,9 @@ import json
 import os
 import re
 import stat
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from ..redact import redact_secrets
 from .source import SourceResolver
@@ -57,6 +59,10 @@ _STATIC_NOTE = (
 
 def _installed_package(path) -> str | None:
     """The package an installed-tree path belongs to ("" if unnamed); None for project code."""
+    from ..sca import registries
+
+    if module := registries.go_module_of(path):
+        return module
     parts = [p for p in str(path).replace("\\", "/").split("/") if p]
     for index, part in enumerate(parts):
         if part.lower() not in _INSTALLED:
@@ -67,7 +73,8 @@ def _installed_package(path) -> str | None:
     return None
 
 
-_PACKAGE_NAME = re.compile(r"^@?[\w.-]+(?:/[\w.-]+)?$")
+# Two segments for npm and Composer; a Go module or package path has more.
+_PACKAGE_NAME = re.compile(r"^@?[\w.~-]+(?:/[\w.~-]+)*$")
 
 
 def _search_fact(pattern: str, matches: int, files_hit: int, scanned: int, in_tests: int,
@@ -202,6 +209,15 @@ class RepositoryEvidence:
     def __init__(self, source: SourceResolver, max_chars: int = 32000):
         self.source = source
         self.max_chars = max(0, max_chars)
+        # The tree and its text, read once per run: the code does not change while it is
+        # triaged, and every search_code call walked and read the whole project again —
+        # minutes of Python on a large one, with eight findings sharing one interpreter.
+        self._walks: dict[tuple, tuple[list[Path], list[str]]] = {}
+        self._texts: dict[Path, tuple[list[str], str] | None] = {}
+        self._tests: dict[Path, bool] = {}
+        # What a package search read, and why it read nothing: {requested name: (scope, problem)}.
+        self._scopes: dict[str, tuple[str, str]] = {}
+        self._cache_lock = threading.Lock()
 
     @staticmethod
     def _note(pkg, text):
@@ -254,10 +270,54 @@ class RepositoryEvidence:
             for root in self.source.roots:
                 if self._safe(candidate, root, installed):
                     return candidate.resolve()
+        if installed and (found := self._module_file(path)) is not None:
+            return found
         self._note(pkg, "Source path unavailable, excluded, unreadable, or outside configured roots.")
         return None
 
+    def _module_file(self, path: Path) -> Path | None:
+        """A file of a Go module in the module cache — named by its full path, or by its
+        path in the cache (`github.com/jackc/pgx/v5@v5.6.0/pgproto3/bind.go`)."""
+        from ..sca import registries
+
+        module = registries.go_module_root(path)
+        if module is None:
+            return None
+        candidate = path if path.is_absolute() else registries.go_mod_cache() / path
+        # Unresolved: the module cache may sit behind a link, and the file must still be
+        # recognised as a dependency's when it is shown.
+        return candidate if self._safe(candidate, module, installed=True) else None
+
     def _paths(self, pkg, files_limit: int = MAX_FILES, entries_limit: int = MAX_ENTRIES):
+        return self._walked(pkg, ("tree", files_limit, entries_limit),
+                            lambda probe: self._walk(probe, files_limit, entries_limit))
+
+    def _package_paths(self, pkg, package: str, files_limit: int = SEARCH_FILES) -> list[Path]:
+        """Files of one installed package: `vendor/<name>`, `node_modules/<name>`, or the
+        Go module the name means, in the module cache."""
+        return self._walked(pkg, ("package", package, files_limit),
+                            lambda probe: self._walk_package(probe, package, files_limit))
+
+    def _package_scope(self, package: str) -> tuple[str, str]:
+        """(what a search of this package read, why it read nothing)."""
+        with self._cache_lock:
+            return self._scopes.get(package, (package, ""))
+
+    def _walked(self, pkg, key, walk) -> list[Path]:
+        """A walk done once per run; the notes it made are made again for this package."""
+        with self._cache_lock:
+            cached = self._walks.get(key)
+        if cached is None:
+            probe = SimpleNamespace(context_notes=[])
+            cached = (walk(probe), list(probe.context_notes))
+            with self._cache_lock:
+                cached = self._walks.setdefault(key, cached)
+        paths, notes = cached
+        for note in notes:
+            self._note(pkg, note)
+        return list(paths)
+
+    def _walk(self, pkg, files_limit: int, entries_limit: int):
         paths = set()
         entries = 0
 
@@ -290,8 +350,7 @@ class RepositoryEvidence:
                             return sorted(paths, key=self._priority)
         return sorted(paths, key=self._priority)
 
-    def _package_paths(self, pkg, package: str, files_limit: int = SEARCH_FILES) -> list[Path]:
-        """Files of one installed package: `vendor/<name>` or `node_modules/<name>`."""
+    def _walk_package(self, pkg, package: str, files_limit: int) -> list[Path]:
         paths: list[Path] = []
         for root in self.source.roots:
             for tree in _INSTALLED:
@@ -308,6 +367,38 @@ class RepositoryEvidence:
                             if len(paths) >= files_limit:
                                 self._note(pkg, "Package search truncated at file limit.")
                                 return paths
+        if paths:
+            return paths
+        return self._walk_go_module(pkg, package, files_limit)
+
+    def _walk_go_module(self, pkg, package: str, files_limit: int) -> list[Path]:
+        """A Go project keeps no `vendor/` as a rule: its modules sit in the module cache,
+        at the version go.mod selected."""
+        from ..sca import registries
+
+        lookup = registries.go_lookup(self.source.roots, package)
+        if not lookup.go_project:
+            return []
+        paths: list[Path] = []
+        for module, sub in lookup.modules:
+            base = module.directory / sub if sub else module.directory
+            for directory, dirs, files in os.walk(base, followlinks=False):
+                dirs[:] = sorted(d for d in dirs if not (Path(directory) / d).is_symlink()
+                                 and d.lower() not in {"node_modules", ".git", "testdata", "vendor"})
+                for name in sorted(files):
+                    path = Path(directory) / name
+                    if self._safe(path, module.directory, installed=True):
+                        paths.append(path)
+                        if len(paths) >= files_limit:
+                            self._note(pkg, "Package search truncated at file limit.")
+                            break
+                if len(paths) >= files_limit:
+                    break
+            if len(paths) >= files_limit:
+                break
+        scope = ", ".join(module.label(sub) for module, sub in lookup.modules)
+        with self._cache_lock:
+            self._scopes[package] = (scope or package, lookup.problem)
         return paths
 
     @staticmethod
@@ -346,26 +437,43 @@ class RepositoryEvidence:
             facts.append(fact)
 
     def _relative(self, path) -> str:
+        from ..sca import registries
+
         for root in self.source.roots:
             try:
                 return Path(path).resolve().relative_to(root).as_posix()
             except ValueError:
                 continue
-        return str(path)
+        # `github.com/jackc/pgx/v5@v5.6.0/pgproto3/bind.go` — readable back as it is.
+        return registries.go_cache_path(path) or str(path)
 
     def _is_test(self, path) -> bool:
         from ..testpaths import is_test
 
-        return is_test(self._relative(path))
+        with self._cache_lock:
+            known = self._tests.get(path)
+        if known is None:
+            known = is_test(self._relative(path))
+            with self._cache_lock:
+                self._tests[path] = known
+        return known
 
     def _scan(self, path):
-        """A file's lines for a search, outside the evidence budget; None if unreadable or too big."""
+        """(lines, text) of a file for a search, outside the evidence budget; None if unreadable or too big."""
+        with self._cache_lock:
+            if path in self._texts:
+                return self._texts[path]
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
-                return None
-            return path.read_text(encoding="utf-8", errors="replace").splitlines()
+                scanned = None
+            else:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                scanned = (text.splitlines(), text)
         except OSError:
-            return None
+            scanned = None
+        with self._cache_lock:
+            self._texts[path] = scanned
+        return scanned
 
     def _add(self, pkg, path, lines, lo, hi, label="source", limit=None) -> bool:
         header = _redact("File: " + json.dumps(str(path), ensure_ascii=True))
@@ -540,9 +648,11 @@ class RepositoryEvidence:
                     continue
                 candidates = (self._package_paths(pkg, package) if package
                               else self._paths(pkg, SEARCH_FILES, SEARCH_ENTRIES))
+                scope, problem = self._package_scope(package) if package else ("", "")
                 if package and not candidates:
-                    self._fact(pkg, f"search_code «{pattern}» in {package} → the package is not installed "
-                                    "here; nothing was searched, so an absence is not established")
+                    self._fact(pkg, f"search_code «{pattern}» in {package} → "
+                                    f"{problem or 'the package is not installed here'}; nothing was "
+                                    "searched, so an absence is not established")
                     continue
                 for path in candidates:
                     if skip and path.name.lower().endswith(skip):
@@ -550,14 +660,16 @@ class RepositoryEvidence:
                         continue
                     # Scanning is not reading: only the windows it adds count against the
                     # evidence budget, or one search over the code would exhaust it.
-                    lines = self._scan(path)
-                    if lines is None:
+                    found = self._scan(path)
+                    if found is None:
                         continue
+                    lines, whole = found
                     if self._is_test(path):
-                        in_tests += sum(1 for text in lines if pattern in text)
+                        if pattern in whole:
+                            in_tests += sum(1 for text in lines if pattern in text)
                         continue
                     scanned += 1
-                    if not any(pattern in text for text in lines):
+                    if pattern not in whole:
                         continue
                     files_hit += 1
                     for n, text in enumerate(lines, 1):
@@ -576,7 +688,7 @@ class RepositoryEvidence:
                                     "docker-compose files: not production code.")
                 self._fact(pkg, _search_fact(pattern, matches, files_hit, scanned, in_tests,
                                              truncated=len(candidates) >= SEARCH_FILES, samples=samples,
-                                             package=package))
+                                             package=scope))
                 if skipped:
                     # Never a silent "nothing found" over code the search did not read.
                     self._note(pkg, f"search_code did not read {skipped} source file(s) a language server "

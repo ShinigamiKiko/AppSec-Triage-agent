@@ -26,6 +26,27 @@ _PURL_ECOSYSTEM = {
 }
 
 
+# The languages the agent triages: PHP, JS/TS, Go — and no others. cdxgen catalogues
+# every type it recognises unless told which, and for some it asks the type's registry:
+# on a Go project it built a C# bill, api.nuget.org did not answer in 10 s, and cdxgen
+# exited 1 — taking the whole wolfee scan with it.
+_CDXGEN_TYPES = {"go": "go", "golang": "go", "npm": "js", "yarn": "js", "js": "js", "javascript": "js",
+                 "typescript": "js", "ts": "js", "composer": "php", "packagist": "php", "php": "php"}
+_ALL_TYPES = ("go", "js", "php")
+
+
+def cdxgen_types() -> list[str]:
+    """cdxgen project types for this run: APPSEC_ECOSYSTEMS within PHP, JS/TS, Go; all three when unset."""
+    wanted = [e.strip().lower() for e in os.environ.get("APPSEC_ECOSYSTEMS", "").split(",") if e.strip()]
+    types = list(dict.fromkeys(_CDXGEN_TYPES[e] for e in wanted if e in _CDXGEN_TYPES))
+    return types or list(_ALL_TYPES)
+
+
+def type_args() -> list[str]:
+    """`-t <type>` for each of the run's types."""
+    return [arg for kind in cdxgen_types() for arg in ("-t", kind)]
+
+
 def available() -> str | None:
     """Path to cdxgen, or None."""
     return shutil.which("cdxgen")
@@ -62,7 +83,7 @@ def generate(project: Path, *, timeout_s: int = _TIMEOUT_S) -> tuple[dict | None
 
     with tempfile.TemporaryDirectory() as work:
         out = Path(work) / "sbom.json"
-        argv = [exe, "-r", "-o", str(out), "--no-install-deps"]
+        argv = [exe, "-r", "-o", str(out), "--no-install-deps", *type_args()]
         from .install import composer_vendor
 
         if composer_vendor(project):

@@ -31,6 +31,7 @@ max_callers: 8
 startup_timeout_s: 120     # индексация репозитория на первом запросе
 index_timeout_s: 90         # индекс строится асинхронно после initialize
 request_timeout_s: 20
+search_timeout_s: 60        # references/symbol по всему проекту: на больших проектах долго
 
 servers:
   # Ставится `pipx install python-lsp-server` → бинарь `pylsp` в ~/.local/bin.

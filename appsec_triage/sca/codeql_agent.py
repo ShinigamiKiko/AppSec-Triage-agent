@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from .. import timing
 from ..prompts import registry
 from . import codeql_reach
 
@@ -547,7 +548,7 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
         if not stop and rest:
             if len(rest) > 1 and parallel > 1:
                 with ThreadPoolExecutor(max_workers=min(parallel, len(rest))) as pool:
-                    for index, answer in zip(rest, pool.map(ask, rest)):
+                    for index, answer in zip(rest, pool.map(timing.carry(ask), rest)):
                         answers[index] = answer
             else:
                 for index in rest:

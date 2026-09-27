@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
 from ..prompts import registry
+from .. import sourcetext
 from ..testpaths import is_test
 
 log = logging.getLogger(__name__)
@@ -132,9 +135,34 @@ def check_against_deployment(condition: Condition, deployment, client) -> Condit
     return condition
 
 
+# The files a condition is looked for in, listed once per root and file types: every
+# condition of every finding walked the whole tree, vendor/ with it, again.
+_FILE_LISTS: dict[tuple[str, frozenset], list[Path]] = {}
+_FILE_LISTS_LOCK = threading.Lock()
+
+
 def _files(root: Path, suffixes: set[str]):
+    key = (str(root), frozenset(suffixes))
+    with _FILE_LISTS_LOCK:
+        cached = _FILE_LISTS.get(key)
+    if cached is None:
+        cached = _list_files(root, suffixes)
+        with _FILE_LISTS_LOCK:
+            cached = _FILE_LISTS.setdefault(key, cached)
+    return list(cached)
+
+
+def _walk(root: Path):
+    for directory, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs
+                         if d not in _SKIP_DIRS and not d.lower().startswith("appsec-out"))
+        for name in sorted(names):
+            yield Path(directory) / name
+
+
+def _list_files(root: Path, suffixes: set[str]):
     out = []
-    for path in root.rglob("*"):
+    for path in _walk(root):
         if len(out) >= _MAX_FILES:
             break
         if not path.is_file() or path.suffix.lower() not in suffixes:
@@ -241,11 +269,8 @@ def check(
         for path in _files(Path(root), suffixes):
             if all(len(hits) >= _HITS_PER_PART for hits in found):
                 break
-            try:
-                if path.stat().st_size > _MAX_BYTES:
-                    continue
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            text = sourcetext.read(path, _MAX_BYTES)
+            if text is None:
                 continue
             scanned += 1
             for index, part in enumerate(compiled):

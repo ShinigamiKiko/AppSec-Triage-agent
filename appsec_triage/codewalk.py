@@ -192,11 +192,13 @@ class CodeWalk:
             """Whose code this is. Read without it, a line from an installed package
             reads like the project's own — and a library always contains the
             vulnerable function, so that mistake confirms every CVE."""
+            from .sca import registries
             from .testpaths import is_test
 
             parts = {p for p in str(path or "").replace("\\", "/").split("/")}
-            if "node_modules" in parts or "vendor" in parts:
-                package = _installed_package(path)
+            module = registries.go_module_of(path) if path else None
+            if module or "node_modules" in parts or "vendor" in parts:
+                package = module or _installed_package(path)
                 return (f"[код зависимости{f' — пакет {package}' if package else ''}: "
                         "доказывает только то, что делает сама библиотека, "
                         "не то, что делает этот проект]")
@@ -288,7 +290,9 @@ class CodeWalk:
                                        "description": "Short literal: a symbol or a configuration key."},
                            "package": {"type": "string",
                                        "description": "Optional installed package name, e.g. "
-                                                      "sentry/sentry or axios; omit to search the project."}},
+                                                      "sentry/sentry or axios, or a Go module or package "
+                                                      "path such as github.com/jackc/pgx/v5; omit to "
+                                                      "search the project."}},
                           ["pattern"]),
         ]
         handlers = {"read_file": read, "search_code": search}

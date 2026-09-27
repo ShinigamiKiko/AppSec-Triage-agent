@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from .. import sourcetext
 from ..testpaths import is_test
 from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
 
@@ -67,11 +68,8 @@ def _first_file_matching(
         return None
 
     for path in files:
-        try:
-            if path.stat().st_size > _MAX_BYTES:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = sourcetext.read(path, _MAX_BYTES)
+        if text is None:
             continue
         for index, pattern in enumerate(patterns):
             if pattern.search(text):
@@ -137,11 +135,8 @@ def package_usage(root: Path | str, ecosystem: str, package: str) -> tuple[bool 
 
     test_hit = ""
     for path in files:
-        try:
-            if path.stat().st_size > _MAX_BYTES:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = sourcetext.read(path, _MAX_BYTES)
+        if text is None:
             continue
         index = next((i for i, pattern in enumerate(patterns) if pattern.search(text)), None)
         if index is None:

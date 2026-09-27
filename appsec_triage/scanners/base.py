@@ -225,6 +225,10 @@ class Scanner(ABC):
         return 0
 
 
+    def _scan_env(self, target: Path) -> dict[str, str]:
+        """The environment a native scan runs with."""
+        return _native_scanner_env()
+
     def scan(self, target: Path, out_dir: Path) -> ScanResult:
         avail = self.available()
         if not avail.usable:
@@ -253,7 +257,7 @@ class Scanner(ABC):
                 text=True,
                 timeout=self.cfg.timeout_s,
                 cwd=str(target) if self.cfg.run_in_target else None,
-                env=_native_scanner_env() if avail.mode == "native" else None,
+                env=self._scan_env(target) if avail.mode == "native" else None,
                 encoding="utf-8",
                 errors="replace",
                 check=False,

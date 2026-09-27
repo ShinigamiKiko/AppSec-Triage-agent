@@ -133,6 +133,7 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     if (resolve := getattr(args, "resolve_symbols", None)) is not None:
         cfg.resolve_vulnerable_symbols = resolve
     if getattr(args, "govulncheck", None): cfg.govulncheck_report = str(args.govulncheck)
+    elif getattr(args, "govulncheck_reach", None): cfg.govulncheck_report = str(args.govulncheck_reach)
     if getattr(args, "scan_dir", None): cfg.scan_out_dir = str(args.scan_dir)
     if getattr(args, "sbom", None): cfg.sbom_path = str(args.sbom)
     elif getattr(args, "scan_dir", None) and (Path(args.scan_dir) / ".sbom.json").is_file():

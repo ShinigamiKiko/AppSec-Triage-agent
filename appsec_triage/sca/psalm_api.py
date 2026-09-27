@@ -5,15 +5,19 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass, field
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
+from .. import timing
 from .codeql_api import ApiAnswer, Target, _hit
 from .codeql_reach import Reached
 
@@ -29,6 +33,25 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _REFERENCES: dict[tuple[str, str], list[tuple[str, int]]] = {}
 _REFERENCES_PENDING: dict[tuple[str, str], threading.Event] = {}
 _REFERENCES_LOCK = threading.Lock()
+# One Psalm on a large project holds several GB (3.3 GB for a reference search over 3400
+# files and their vendor tree, more for taint analysis), and three at once froze a 15 GB
+# machine. No guess per process: as many at once as the memory holds by the largest
+# Psalm this run has measured, one at a time until one has finished.
+# APPSEC_PSALM_PARALLEL sets the number by hand.
+_PSALM_RESERVE = 3 << 30
+_PSALM_FLOOR = 1 << 30
+_GATE = threading.Condition()
+_RUNNING = 0
+# The most one analysis held, its worker processes included: Psalm's `--threads` forks
+# workers, and the largest single process no longer says what a run costs.
+_PEAK_RUN = 0
+_SAMPLER: threading.Thread | None = None
+# Workers per analysis: the CPUs shared among the analyses running. Psalm merges the
+# workers' call locations and taint graphs into the main process, so the index and the
+# paths come out the same; a single thread left 23 of 24 cores idle on api-develop.
+_MAX_THREADS = 8
+_MEASURED = False
+_ANNOUNCED = 0
 # A crash exits 1, the code Psalm also uses for "issues found": told apart by its text,
 # or an analysis that died reads as "no calls, no path" — a closure nobody checked.
 _CRASHED = "crashed due to an uncaught Throwable"
@@ -45,45 +68,68 @@ _OVERLAY: dict[str, Path] = {}
 _OVERLAY_PREFIX = "sca-psalm-overlay-"
 _DOCBLOCK = re.compile(r"/\*\*.*?\*/", re.S)
 
-# One batch at a time: a second batch waits and then finds most of its methods cached.
-_BATCH_LOCK = threading.Lock()
 # The first path from input to each method, or None: a path into one method does not
-# depend on which other methods the stub marks as sinks, so it too holds for the run.
+# depend on which other methods the stub marks as sinks, so it too holds for the run —
+# and one analysis answers for any number of methods. The methods asked for while an
+# analysis waits for room in `_slot` join it (`_TAINT_NEXT`): eight findings queued
+# behind one Psalm cost two or three analyses, not eight. A method already in an
+# analysis is waited for (`_TAINT_PENDING`), never computed twice.
 _TAINT: dict[tuple[str, str], Reached | None] = {}
+_TAINT_PENDING: dict[tuple[str, str], "_TaintRun"] = {}
+_TAINT_NEXT: dict[str, "_TaintRun"] = {}
 _TAINT_LOCK = threading.Lock()
-# Batches run one at a time, so they can share Psalm's own cache: the vendor tree is
-# parsed once per run instead of once per batch. Its config, plugin and files keep one
-# path for the whole run, so Psalm never sees a "new" config and drops the cache.
-_BATCH_HOME: Path | None = None
 
-# `--find-references-to` takes one method, but the codebase it analyses answers any
-# number: this plugin asks it for all of them once the analysis is done. The CLI option
-# still names one method — that is what switches on the collection of call locations.
-_REFERENCES_PLUGIN = r"""<?php
+# Where every method is called, from one analysis per run. Psalm keeps the call sites of
+# all methods once `--find-references-to` switches location collection on;
+# `findReferencesToSymbol(m)` reads that table one method at a time, and this plugin
+# writes out the whole of it — the same answers as a search per method, for one
+# analysis instead of one per finding. The table is Psalm's internal one, read by
+# reflection: when a Psalm release renames it, the plugin says so and every method is
+# searched on its own, as before.
+_INDEX_PLUGIN = r"""<?php
 use Psalm\Plugin\EventHandler\AfterAnalysisInterface;
 use Psalm\Plugin\EventHandler\Event\AfterAnalysisEvent;
 
-final class ScaReferences implements AfterAnalysisInterface
+final class ScaCallIndex implements AfterAnalysisInterface
 {
     public static function afterAnalysis(AfterAnalysisEvent $event): void
     {
-        $codebase = $event->getCodebase();
-        $methods = json_decode((string) file_get_contents(%(input)s), true);
-        $out = [];
-        foreach (is_array($methods) ? $methods : [] as $method) {
-            try {
-                $out[$method] = array_map(
-                    static fn($location) => [$location->file_path, $location->getLineNumber()],
-                    $codebase->findReferencesToSymbol($method)
-                );
-            } catch (\Throwable $e) {
-                $out[$method] = ['error' => $e->getMessage()];
+        $out = ['error' => '', 'methods' => [], 'classes' => []];
+        try {
+            $provider = $event->getCodebase()->file_reference_provider;
+            foreach (['methods' => 'class_method_locations', 'classes' => 'class_locations'] as $key => $name) {
+                $table = new \ReflectionProperty(get_class($provider), $name);
+                foreach ((array) $table->getValue() as $symbol => $locations) {
+                    foreach ($locations as $location) {
+                        $out[$key][$symbol][] = [$location->file_path, $location->getLineNumber()];
+                    }
+                }
             }
+        } catch (\Throwable $e) {
+            $out['error'] = get_class($e) . ': ' . $e->getMessage();
         }
-        file_put_contents(%(output)s, json_encode($out));
+        file_put_contents(%(output)s, json_encode($out, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES));
     }
 }
 """
+# Any method name switches the collection on; this one has no calls to print.
+_INDEX_PROBE = "ScaCallIndex\\Probe::probe"
+_INDEX_HOME: Path | None = None
+_INDEX_LOCK = threading.Lock()
+
+
+@dataclass(eq=False)
+class _Index:
+    """The call sites of every method, by lower-case method id; None when the build failed."""
+
+    methods: dict[str, list[tuple[str, int]]] | None = None
+    classes: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    problem: str = ""
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+_INDEXES: dict[str, _Index] = {}
+
 _REFERENCE = re.compile(r"^(?P<file>\S+\.php):(?P<line>\d+)$")
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\\[A-Za-z_][A-Za-z0-9_]*)*$")
@@ -153,22 +199,29 @@ def exclude_crashed_file(project: Path | str, text: str) -> str:
     one file's fault, and the run reports it instead of shrinking the project further.
     """
     project = Path(project).resolve()
+    for relative in _crashed_files(project, text):
+        with _UNREADABLE_LOCK:
+            known = _UNREADABLE.setdefault(str(project), set())
+            if relative in known or len(known) >= MAX_UNREADABLE:
+                return ""
+            known.add(relative)
+        _overlay_copy(project, relative)
+        return relative
+    return ""
+
+
+def _crashed_files(project: Path, text: str) -> list[str]:
+    """The project files a crash names, relative to the project; vendor and node_modules aside."""
     cause = crash_cause(text) or ("Uncaught" in (text or "") and text) or ""
+    files: list[str] = []
     for match in _CRASH_FILE.finditer(cause):
         try:
             relative = Path(match.group(1)).resolve().relative_to(project)
         except (ValueError, OSError):
             continue
-        if not relative.parts or relative.parts[0] in ("vendor", "node_modules"):
-            continue
-        with _UNREADABLE_LOCK:
-            known = _UNREADABLE.setdefault(str(project), set())
-            if relative.as_posix() in known or len(known) >= MAX_UNREADABLE:
-                return ""
-            known.add(relative.as_posix())
-        _overlay_copy(project, relative.as_posix())
-        return relative.as_posix()
-    return ""
+        if relative.parts and relative.parts[0] not in ("vendor", "node_modules"):
+            files.append(relative.as_posix())
+    return files
 
 
 def _overlay_copy(project: Path, relative: str) -> None:
@@ -486,55 +539,140 @@ def _php_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def _batch_home(project: Path) -> Path:
-    """The run's directory for batches: config, plugin, their files and Psalm's cache."""
-    global _BATCH_HOME
-    if _BATCH_HOME is None:
-        _BATCH_HOME = Path(tempfile.mkdtemp(prefix="sca-psalm-batch-"))
-        atexit.register(shutil.rmtree, _BATCH_HOME, True)
-    home = _BATCH_HOME / re.sub(r"[^\w.-]+", "_", str(project)).strip("_")[-80:]
+def _index_home(project: Path) -> Path:
+    """The run's directory for the call index of this project: config, plugin, output, cache."""
+    global _INDEX_HOME
+    with _INDEX_LOCK:
+        if _INDEX_HOME is None:
+            _INDEX_HOME = Path(tempfile.mkdtemp(prefix="sca-psalm-index-"))
+            atexit.register(shutil.rmtree, _INDEX_HOME, True)
+        home = _INDEX_HOME / re.sub(r"[^\w.-]+", "_", str(project)).strip("_")[-80:]
     (home / "cache").mkdir(parents=True, exist_ok=True)
     return home
 
 
-def _batch_references(methods: list[str], *, binary: str, project: Path,
-                      timeout_s: float) -> dict[str, list[tuple[str, int]]]:
-    """References to every method from one analysis of the project; {} when the batch fails.
+def _build_index(project: Path, binary: str, timeout_s: float) -> tuple[dict[str, list[tuple[str, int]]] | None,
+                                                                        dict[str, list[tuple[str, int]]], str]:
+    """(method id -> call sites, class -> reference sites, "") from one analysis, or (None, {}, problem).
 
-    Call it under `_BATCH_LOCK`: batches share one Psalm cache and one set of files.
-    """
-    if not methods:
-        return {}
-    home = _batch_home(project)
+    Ids are lower-case, as Psalm keeps them."""
+    home = _index_home(project)
     config = _config(home / "psalm.xml", project, cache=home / "cache")
-    source, result = home / "references-in.json", home / "references-out.json"
-    plugin = home / "ScaReferences.php"
+    result, plugin = home / "calls.json", home / "ScaCallIndex.php"
     result.unlink(missing_ok=True)
-    source.write_text(json.dumps(methods), encoding="utf-8")
-    plugin.write_text(_REFERENCES_PLUGIN % {"input": _php_string(str(source)),
-                                            "output": _php_string(str(result))}, encoding="utf-8")
-    _, problem = _run([binary, f"--config={config}", f"--root={project}", "--no-progress",
-                       "--threads=1", f"--find-references-to={methods[0]}", f"--plugin={plugin}"],
-                      home, timeout_s, f"поиск вызовов пачкой ({len(methods)} методов)")
+    plugin.write_text(_INDEX_PLUGIN % {"output": _php_string(str(result))}, encoding="utf-8")
+    started = time.monotonic()
+    _, problem = _psalm([binary, f"--config={config}", f"--root={project}", "--no-progress",
+                         f"--find-references-to={_INDEX_PROBE}", f"--plugin={plugin}"],
+                        home, timeout_s, "индекс вызовов")
+    if problem:
+        return None, {}, problem
     try:
         payload = json.loads(result.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        log.info("psalm api: batch of %d methods gave no answer (%s); asking one by one",
-                 len(methods), problem or "no output")
-        return {}
-    found: dict[str, list[tuple[str, int]]] = {}
-    for method, rows in (payload.items() if isinstance(payload, dict) else ()):
-        if not isinstance(rows, list):
-            continue          # {"error": ...}: this method is asked on its own
-        sites: list[tuple[str, int]] = []
-        for row in rows:
-            if isinstance(row, list) and len(row) == 2:
-                file = _relative(str(row[0]), home, project)
-                site = (file, int(row[1])) if file else None
-                if site and site not in sites:
-                    sites.append(site)
-        found[method] = sites
-    return found
+    except (OSError, ValueError) as exc:
+        return None, {}, f"индекс вызовов не прочитан: {exc}"
+    if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("methods"), dict):
+        error = payload.get("error") if isinstance(payload, dict) else ""
+        return None, {}, f"индекс вызовов не собран: {error or 'нет таблицы вызовов'}"
+    places: dict[str, str | None] = {}
+
+    def table(raw_table) -> dict[str, list[tuple[str, int]]]:
+        out: dict[str, list[tuple[str, int]]] = {}
+        for symbol, rows in (raw_table.items() if isinstance(raw_table, dict) else ()):
+            sites: dict[tuple[str, int], None] = {}
+            for row in rows if isinstance(rows, list) else ():
+                if not (isinstance(row, list) and len(row) == 2 and isinstance(row[1], int)):
+                    continue
+                raw = str(row[0])
+                if raw not in places:
+                    places[raw] = _relative(raw, home, project)
+                if places[raw]:
+                    sites[(places[raw], row[1])] = None
+            out[str(symbol).lower()] = list(sites)
+        return out
+
+    index, classes = table(payload["methods"]), table(payload.get("classes"))
+    log.info("psalm api: call index of %s: %d method(s) called at %d site(s), %d class(es) referenced, "
+             "built in %.0fs", project.name, len(index), sum(len(v) for v in index.values()), len(classes),
+             time.monotonic() - started)
+    return index, classes, ""
+
+
+def _call_index(project: Path, binary: str, timeout_s: float) -> _Index:
+    """The project's call index: the first asker builds it, the rest wait for that build."""
+    key = str(project)
+    with _INDEX_LOCK:
+        index = _INDEXES.get(key)
+        build = index is None
+        if build:
+            index = _INDEXES[key] = _Index()
+    if not build:
+        with timing.measure("psalm-wait"):
+            index.done.wait()
+        return index
+    try:
+        index.methods, index.classes, index.problem = _build_index(project, binary, timeout_s)
+    except Exception as exc:  # noqa: BLE001 - the askers fall back to one search per method
+        log.exception("psalm api: call index failed")
+        index.problem = f"индекс вызовов: {exc}"
+    finally:
+        if index.methods is None:
+            log.info("psalm api: no call index (%s); methods are searched one by one", index.problem[:300])
+            if crash_cause(index.problem):
+                # `run` leaves the file out and asks again: built again, without it.
+                with _INDEX_LOCK:
+                    if _INDEXES.get(key) is index:
+                        del _INDEXES[key]
+        index.done.set()
+    return index
+
+
+def usages(project_root: Path | str, name: str) -> list[tuple[str, str, int]] | None:
+    """(symbol, file, line) where the project calls a method or refers to a class of this name.
+
+    From the call index, so typed like Psalm's own analysis; None when the index is not
+    built (yet) for this project — the caller asks elsewhere. `name` is `method`,
+    `Class::method`, `Class` or a fully qualified class.
+    """
+    with _INDEX_LOCK:
+        index = _INDEXES.get(str(Path(project_root).resolve()))
+    if index is None or not index.done.is_set() or index.methods is None:
+        return None
+    wanted = str(name or "").strip().lstrip("\\").rstrip("()").lower()
+    klass, _, member = wanted.rpartition("::") if "::" in wanted else ("", "", wanted)
+    short = re.split(r"\\|\.", member)[-1]
+    if not short:
+        return []
+
+    def same_class(declared: str) -> bool:
+        return not klass or declared == klass or declared.endswith("\\" + klass)
+
+    rows: dict[tuple[str, str, int], None] = {}
+    for method, sites in index.methods.items():
+        declared, _, function = method.rpartition("::")
+        if function == short and same_class(declared):
+            rows.update(((method, file, line), None) for file, line in sites)
+    if not klass:
+        for referenced, sites in index.classes.items():
+            if referenced == member or referenced.rpartition("\\")[2] == short:
+                rows.update(((referenced, file, line), None) for file, line in sites)
+    return sorted(rows, key=lambda row: (row[1], row[2], row[0]))
+
+
+def prefetch(project_root: Path | str, binary: str, timeout_s: float = _TIMEOUT_S) -> None:
+    """Start building the call index now, while the findings' advisories are still being read."""
+    project = Path(project_root).resolve()
+    if not (project / "vendor" / "autoload.php").is_file():
+        return
+
+    def build() -> None:
+        for _ in range(MAX_UNREADABLE + 1):
+            index = _call_index(project, binary, timeout_s)
+            if index.methods is not None or not (skipped := exclude_crashed_file(project, index.problem)):
+                return
+            log.warning("psalm api: %s left out — Psalm cannot read it; building the call index again", skipped)
+
+    threading.Thread(target=build, name="psalm-call-index", daemon=True).start()
 
 
 def _references(key: tuple[str, str], compute) -> tuple[list[tuple[str, int]], str]:
@@ -558,6 +696,255 @@ def _references(key: tuple[str, str], compute) -> tuple[list[tuple[str, int]], s
         with _REFERENCES_LOCK:
             _REFERENCES_PENDING.pop(key, None)
         pending.set()
+
+
+@dataclass(eq=False)
+class _TaintRun:
+    """One taint analysis; the methods asked for while it waits for Psalm join it."""
+
+    project: Path
+    signatures: dict[tuple[str, str], Signature] = field(default_factory=dict)
+    references: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    led: bool = False
+    problem: str = ""
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+def _join_taint(project: Path, signatures: list[Signature], keys: dict[str, tuple[str, str]],
+                references: dict[str, list[tuple[str, int]]]) -> list[_TaintRun]:
+    """The analyses that answer these methods, joining the gathering one for methods no analysis has."""
+    runs: dict[int, _TaintRun] = {}
+    with _TAINT_LOCK:
+        for sig in signatures:
+            key = keys[sig.label]
+            if key in _TAINT:
+                continue
+            taint_run = _TAINT_PENDING.get(key)
+            if taint_run is None:
+                taint_run = _TAINT_NEXT.get(str(project))
+                if taint_run is None:
+                    taint_run = _TAINT_NEXT[str(project)] = _TaintRun(project)
+                # One label per method whichever finding asked: the method id itself.
+                taint_run.signatures[key] = replace(sig, label=key[1])
+                taint_run.references[key[1]] = references.get(sig.label, [])
+                _TAINT_PENDING[key] = taint_run
+            runs[id(taint_run)] = taint_run
+    return list(runs.values())
+
+
+def _take_part(taint_run: _TaintRun, binary: str, timeout_s: float) -> None:
+    """Lead the analysis if nobody does yet, else wait for it."""
+    with _TAINT_LOCK:
+        lead, taint_run.led = not taint_run.led, True
+    if not lead:
+        with timing.measure("psalm-wait"):
+            taint_run.done.wait()
+        return
+    project = str(taint_run.project)
+    try:
+        with _slot():
+            with _TAINT_LOCK:
+                if _TAINT_NEXT.get(project) is taint_run:
+                    del _TAINT_NEXT[project]          # sealed: later askers start the next one
+                signatures = list(taint_run.signatures.values())
+                references = dict(taint_run.references)
+            if len(signatures) > 1:
+                log.info("psalm api: one taint analysis for %d method(s)", len(signatures))
+            fresh, taint_run.problem = _taint_analysis(signatures, references, taint_run.project,
+                                                       binary, timeout_s)
+        if not taint_run.problem:
+            with _TAINT_LOCK:
+                for key, sig in taint_run.signatures.items():
+                    _TAINT[key] = fresh.get(sig.label)
+    except Exception as exc:  # noqa: BLE001 - the waiters must hear of it, not hang
+        log.exception("psalm api: taint analysis failed")
+        taint_run.problem = f"taint-анализ: {exc}"
+    finally:
+        with _TAINT_LOCK:
+            if _TAINT_NEXT.get(project) is taint_run:
+                del _TAINT_NEXT[project]
+            for key in taint_run.signatures:
+                if _TAINT_PENDING.get(key) is taint_run:
+                    del _TAINT_PENDING[key]
+        taint_run.done.set()
+
+
+def _taint_analysis(signatures: list[Signature], references: dict[str, list[tuple[str, int]]],
+                    project: Path, binary: str, timeout_s: float) -> tuple[dict[str, Reached], str]:
+    """Taint analysis with these methods as sinks: (first path per label, problem). The caller holds a slot."""
+    with tempfile.TemporaryDirectory(prefix="sca-psalm-taint-") as tmp:
+        work = Path(tmp)
+        # Without Psalm's cache: the stub marks different methods as sinks on every run,
+        # and a cached storage could carry the previous run's sinks.
+        stub_path = work / "sca-sinks.php"
+        stub_path.write_text(stub(signatures), encoding="utf-8")
+        taint_config = _config(work / "psalm-taint.xml", project, stub_path)
+        report = work / "taint.sarif"
+        _, problem = _run([binary, f"--config={taint_config}", f"--root={project}", "--taint-analysis",
+                           "--no-cache", "--no-progress", f"--threads={_threads()}", f"--report={report}"],
+                          work, timeout_s, "taint-анализ")
+        if problem:
+            return {}, problem
+        try:
+            document = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {}, f"отчёт taint-анализа не прочитан: {exc}"
+        return parse_taint(document, work, project, signatures, references), ""
+
+
+def _memory_limit() -> int:
+    """Bytes this process may use: the container's cgroup limit or the machine's memory; 0 unknown."""
+    limits: list[int] = []
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            text = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text.isdigit():
+            limits.append(int(text))
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                limits.append(int(line.split()[1]) * 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return min(limits) if limits else 0
+
+
+def _largest_child() -> int:
+    """Peak resident size of the largest finished child process, bytes; 0 before one.
+
+    Any child counts, so it is read only after a Psalm of ours has finished: then it is
+    at least that Psalm's peak, not a small `composer dump-autoload` that ran before.
+    """
+    if not _MEASURED:
+        return 0
+    try:
+        import resource
+    except ImportError:          # pragma: no cover - not on Linux
+        return 0
+    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024
+
+
+def _cpu_count() -> int:
+    """CPUs this process may use: its affinity and the container's CPU quota."""
+    try:
+        count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        count = os.cpu_count() or 1
+    quota = 0.0
+    try:
+        limit, period = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").split()[:2]
+        if limit != "max":
+            quota = int(limit) / int(period)
+    except (OSError, ValueError):
+        try:
+            limit = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text(encoding="utf-8"))
+            period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="utf-8"))
+            if limit > 0 and period > 0:
+                quota = limit / period
+        except (OSError, ValueError):
+            pass
+    if quota > 0:
+        count = min(count, max(1, int(quota + 0.5)))
+    return max(1, count)
+
+
+def _threads() -> int:
+    """Psalm worker processes for the analysis about to start, its slot already taken."""
+    raw = os.environ.get("APPSEC_PSALM_THREADS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    with _GATE:
+        running = max(1, _RUNNING)
+    return max(1, min(_MAX_THREADS, _cpu_count() // running))
+
+
+def _psalm_memory() -> int:
+    """Resident bytes of the Psalm processes this process started, workers included."""
+    me, page = os.getpid(), os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    parents: dict[int, int] = {}
+    sizes: dict[int, int] = {}
+    try:
+        entries = [e.name for e in os.scandir("/proc") if e.name.isdigit()]
+    except OSError:
+        return 0
+    for name in entries:
+        try:
+            stat = Path(f"/proc/{name}/stat").read_text(encoding="utf-8", errors="replace")
+            parents[int(name)] = int(stat.rsplit(")", 1)[1].split()[1])
+            if b"psalm" in Path(f"/proc/{name}/cmdline").read_bytes():
+                sizes[int(name)] = int(Path(f"/proc/{name}/statm").read_text().split()[1]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+    total = 0
+    for pid, size in sizes.items():
+        seen, parent = 0, parents.get(pid)
+        while parent and parent != me and seen < 64:
+            parent, seen = parents.get(parent), seen + 1
+        if parent == me:
+            total += size
+    return total
+
+
+def _watch_memory() -> None:
+    """While Psalm runs: the most one analysis holds, workers included."""
+    global _PEAK_RUN, _SAMPLER
+    while True:
+        with _GATE:
+            running = _RUNNING
+            if not running:
+                _SAMPLER = None
+                return
+        if total := _psalm_memory():
+            _PEAK_RUN = max(_PEAK_RUN, total // running)
+        time.sleep(1.0)
+
+
+def parallel_limit() -> int:
+    """How many Psalm processes may run at once: one until one has been measured."""
+    raw = os.environ.get("APPSEC_PSALM_PARALLEL", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    memory, peak = _memory_limit(), max(_largest_child(), _PEAK_RUN if _MEASURED else 0)
+    if not memory or not peak:
+        return 1
+    each = max(peak, _PSALM_FLOOR) * 5 // 4
+    return max(1, min(os.cpu_count() or 1, (memory - _PSALM_RESERVE) // each))
+
+
+@contextmanager
+def _slot():
+    """Room for one Psalm process: a finding waits here rather than running the memory out."""
+    global _RUNNING, _ANNOUNCED, _MEASURED, _SAMPLER
+    queued = time.monotonic()
+    with _GATE:
+        while _RUNNING >= (limit := parallel_limit()):
+            _GATE.wait()
+        if limit != _ANNOUNCED:
+            _ANNOUNCED = limit
+            log.info("psalm api: up to %d Psalm analysis(es) at once, %d worker(s) each "
+                     "(largest so far %.1f GB)", limit, max(1, min(_MAX_THREADS, _cpu_count() // limit)),
+                     max(_largest_child(), _PEAK_RUN) / (1 << 30))
+        _RUNNING += 1
+        if _SAMPLER is None and os.path.isdir("/proc"):
+            _SAMPLER = threading.Thread(target=_watch_memory, name="psalm-memory", daemon=True)
+            _SAMPLER.start()
+    timing.add("psalm-wait", time.monotonic() - queued)
+    try:
+        with timing.measure("psalm"):
+            yield
+    finally:
+        with _GATE:
+            _RUNNING -= 1
+            _MEASURED = True
+            _GATE.notify_all()
+
+
+def _psalm(argv: list[str], cwd: Path, timeout_s: float, what: str) -> tuple[str, str]:
+    """`_run` for Psalm itself, in a slot."""
+    with _slot():
+        return _run([*argv, f"--threads={_threads()}"], cwd, timeout_s, what)
 
 
 def _run(argv: list[str], cwd: Path, timeout_s: float, what: str) -> tuple[str, str]:
@@ -585,11 +972,21 @@ def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm
     docblock must not cost every PHP dependency its call search.
     """
     project = Path(project_root).resolve()
+    before = set(unreadable_files(project))
     answer = _run_once(project, targets, binary=binary, php=php, timeout_s=timeout_s)
     for _ in range(MAX_UNREADABLE):
-        if not answer.problem or not (skipped := exclude_crashed_file(project, answer.problem)):
+        if not answer.problem:
             break
+        skipped = exclude_crashed_file(project, answer.problem)
+        if not skipped:
+            # The analyses are shared: another finding may have left the file out while
+            # this one waited for the answer. Then it is worth asking again, once more.
+            newly = set(unreadable_files(project)) - before
+            skipped = next((f for f in _crashed_files(project, answer.problem) if f in newly), "")
+            if not skipped:
+                break
         log.warning("psalm api: %s left out — Psalm cannot read it; asking again", skipped)
+        before = set(unreadable_files(project))
         answer = _run_once(project, targets, binary=binary, php=php, timeout_s=timeout_s)
     return answer
 
@@ -635,60 +1032,43 @@ def _run_once(project: Path, targets: list[Target], *, binary: str, php: str,
         answer = ApiAnswer(engine="psalm")
         references: dict[str, list[tuple[str, int]]] = {}
         base_config = _config(work / "psalm.xml", project)
-        wanted = list(dict.fromkeys(f"{_clean_class(sig.declaring)}::{sig.function}"
-                                    for sig in signatures if sig.kind != "function"))
-        if len(wanted) > 1:
-            with _BATCH_LOCK:
-                with _REFERENCES_LOCK:
-                    missing = [m for m in wanted if (str(project), m) not in _REFERENCES]
-                if len(missing) > 1:
-                    batch = _batch_references(missing, binary=binary, project=project, timeout_s=timeout_s)
-                    with _REFERENCES_LOCK:
-                        for method, sites in batch.items():
-                            _REFERENCES[(str(project), method)] = sites
+        index = None
+        if any(sig.kind != "function" for sig in signatures):
+            index = _call_index(project, binary, timeout_s)
+            if index.methods is None and crash_cause(index.problem):
+                return ApiAnswer(problem=index.problem, engine="psalm")
         for sig in signatures:
             if sig.kind == "function":
                 continue
             method = f"{_clean_class(sig.declaring)}::{sig.function}"
+            if index is not None and index.methods is not None:
+                references[sig.label] = index.methods.get(method.lower(), [])
+            else:
+                def find(method=method, sig=sig):
+                    output, problem = _psalm([binary, f"--config={base_config}", f"--root={project}",
+                                              "--no-cache", "--no-progress",
+                                              f"--find-references-to={method}"],
+                                             work, timeout_s, f"поиск вызовов {sig.label}")
+                    return ([], problem) if problem else (parse_references(output, work, project), "")
 
-            def find(method=method, sig=sig):
-                output, problem = _run([binary, f"--config={base_config}", f"--root={project}", "--no-cache",
-                                        "--no-progress", "--threads=1", f"--find-references-to={method}"],
-                                       work, timeout_s, f"поиск вызовов {sig.label}")
-                return ([], problem) if problem else (parse_references(output, work, project), "")
-
-            found, problem = _references((str(project), method), find)
-            if problem:
-                return ApiAnswer(problem=problem, engine="psalm")
-            references[sig.label] = found
+                found, problem = _references((str(project), method), find)
+                if problem:
+                    return ApiAnswer(problem=problem, engine="psalm")
+                references[sig.label] = found
             if references[sig.label]:
                 answer.calls[sig.label] = [_hit(project, file, line) for file, line in references[sig.label]]
 
-        methods = {sig.label: f"{_clean_class(sig.declaring)}::{sig.function}" for sig in signatures}
+        keys = {sig.label: (str(project), f"{_clean_class(sig.declaring)}::{sig.function}")
+                for sig in signatures}
+        runs = _join_taint(project, signatures, keys, references)
+        # The ones nobody leads yet first: the others are under way without this finding.
+        for taint_run in sorted(runs, key=lambda r: r.led):
+            _take_part(taint_run, binary, timeout_s)
+        if failure := next((r.problem for r in runs if r.problem), ""):
+            return ApiAnswer(calls=answer.calls, problem=failure, engine="psalm")
         with _TAINT_LOCK:
-            todo = [sig for sig in signatures if (str(project), methods[sig.label]) not in _TAINT]
-            if todo:
-                # Without Psalm's cache: the stub marks different methods as sinks on
-                # every run, and a cached storage could carry the previous run's sinks.
-                stub_path = work / "sca-sinks.php"
-                stub_path.write_text(stub(todo), encoding="utf-8")
-                taint_config = _config(work / "psalm-taint.xml", project, stub_path)
-                report = work / "taint.sarif"
-                _, problem = _run([binary, f"--config={taint_config}", f"--root={project}", "--taint-analysis",
-                                   "--no-cache", "--no-progress", "--threads=1", f"--report={report}"],
-                                  work, timeout_s, "taint-анализ")
-                if problem:
-                    return ApiAnswer(calls=answer.calls, problem=problem, engine="psalm")
-                try:
-                    document = json.loads(report.read_text(encoding="utf-8"))
-                except (OSError, ValueError) as exc:
-                    return ApiAnswer(calls=answer.calls, problem=f"отчёт taint-анализа не прочитан: {exc}",
-                                     engine="psalm")
-                fresh = parse_taint(document, work, project, todo, references)
-                for sig in todo:
-                    _TAINT[(str(project), methods[sig.label])] = fresh.get(sig.label)
-            answer.reached = {label: reached for label, method in methods.items()
-                              if (reached := _TAINT.get((str(project), method))) is not None}
+            answer.reached = {label: reached for label, key in keys.items()
+                              if (reached := _TAINT.get(key)) is not None}
         for label, reached in answer.reached.items():
             site = _hit(project, reached.file, reached.line)
             if all((hit.file, hit.line) != (site.file, site.line) for hit in answer.calls.get(label, [])):

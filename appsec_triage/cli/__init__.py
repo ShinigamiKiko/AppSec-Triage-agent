@@ -75,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, ingest.IngestError, registry.PromptError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        # Exit now: at a normal exit Python joins the triage worker threads, each of
+        # which finishes its finding first — the process, and its container, lived on.
+        print("\ninterrupted", file=sys.stderr)
+        for stream in (sys.stdout, sys.stderr):
+            stream.flush()
+        logging.shutdown()
+        os._exit(130)
 
 
 if __name__ == "__main__":

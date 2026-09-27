@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .. import timing
+
 DIR_ENV = "APPSEC_HTTP_CASSETTE"
 MODE_ENV = "APPSEC_HTTP_MODE"
 
@@ -48,9 +50,10 @@ def urlopen(request: urllib.request.Request, *, timeout: float, opener=None):
     """`urllib.request.urlopen` (or `opener.open`), routed through the cassette when one is set."""
     directory = os.environ.get(DIR_ENV)
     if not directory:
-        if opener is not None:
-            return opener.open(request, timeout=timeout)
-        return urllib.request.urlopen(request, timeout=timeout)
+        with timing.measure("network"):
+            if opener is not None:
+                return opener.open(request, timeout=timeout)
+            return urllib.request.urlopen(request, timeout=timeout)
 
     path = Path(directory) / f"{_key(request)}.json"
     if os.environ.get(MODE_ENV, "replay").strip().lower() != "record":

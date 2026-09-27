@@ -50,7 +50,27 @@ class WolfeeScanner(Scanner):
     def _native_version_argv(self) -> list[str] | None:
         return [self.resolve_binary("wolfee"), "version"]
 
+    _toolchain: dict[str, str] = {}
+
+    def _scan_env(self, target: Path) -> dict[str, str]:
+        # govulncheck inside wolfee judges the standard library by the `go` it runs:
+        # the project's release, not the image's (sca/gotoolchain.py).
+        return {**super()._scan_env(target), **self._toolchain}
+
     def scan(self, target: Path, out_dir: Path) -> ScanResult:
+        from ..sca import gotoolchain
+
+        self._toolchain = gotoolchain.env_for(Path(target).resolve())
+        result = self._scan(target, out_dir)
+        if not result.ok and self._toolchain:
+            wanted, self._toolchain = self._toolchain["GOTOOLCHAIN"], {}
+            log.warning("wolfee failed with GOTOOLCHAIN=%s; scanning again with the image's Go", wanted)
+            result = self._scan(target, out_dir)
+            result.note = (f"stdlib проверена по {gotoolchain.local_release() or 'Go образа'}, "
+                           f"а не по {wanted} проекта: с ним wolfee не отработал")
+        return result
+
+    def _scan(self, target: Path, out_dir: Path) -> ScanResult:
         from ..sca.install import composer_vendor
 
         target = Path(target).resolve()
@@ -68,9 +88,17 @@ class WolfeeScanner(Scanner):
             return super().scan(view, out_dir)
 
     def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
+        # cdxgen as the agent's own call runs it: no package installs, and only the
+        # project types the agent triages (PHP, JS/TS, Go). Left to itself, cdxgen built a
+        # C# bill on a Go project, api.nuget.org did not answer, and it crashed — taking
+        # the whole wolfee scan with it.
+        from ..sca.sbom import type_args
+
         return [
             self.resolve_binary("wolfee"), "scan", "--reachable", str(target),
             "--format", "sarif", "--output", str(out_file), "--quiet",
+            "--cdxgen-arg=--no-install-deps",
+            *(f"--cdxgen-arg={arg}" for arg in type_args()),
         ]
 
     def _docker_scan_argv(self, target: Path, out_file: Path) -> list[str]:
