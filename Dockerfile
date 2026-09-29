@@ -36,7 +36,9 @@ FROM python:3.12-slim-bookworm AS main
 # --- versions: bump deliberately, each is checked at build time ---------------
 # CodeQL: the *bundle* (CLI + precompiled standard query packs) so analysis works
 # offline. Tag must exist under github/codeql-action releases.
-ARG CODEQL_BUNDLE_TAG=codeql-bundle-v2.25.6
+# 2.27.1: the GitHub Security Lab community packs are published for it and older CLIs
+# cannot read their registry manifests.
+ARG CODEQL_BUNDLE_TAG=codeql-bundle-v2.27.1
 # gopls sets the floor here, not Go's own release cadence: v0.23.0 requires
 # Go >= 1.26, and with GOTOOLCHAIN=local the build fails outright instead of
 # quietly pulling a newer toolchain. Bump this when gopls raises its floor.
@@ -154,6 +156,14 @@ RUN curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODE
          codeql resolve languages | grep -q "^$lang " \
            || { echo "CodeQL lost $lang while being trimmed" >&2; exit 1; }; \
        done
+
+# Third-party query and model packs, from ghcr.io, named in configs/scanners/codeql.yaml.
+# In their own directory rather than ~/.codeql: a CI job's HOME is not always /root.
+# A pack missing at run time is skipped with a note; the standard suites always run.
+ARG CODEQL_EXTRA_PACKS="trailofbits/go-queries githubsecuritylab/codeql-javascript-queries githubsecuritylab/codeql-go-extensions"
+ENV APPSEC_CODEQL_PACKS=/opt/codeql-packs
+RUN codeql pack download --dir="${APPSEC_CODEQL_PACKS}" ${CODEQL_EXTRA_PACKS} \
+    && codeql resolve qlpacks --additional-packs="${APPSEC_CODEQL_PACKS}" | grep -E "trailofbits|githubsecuritylab"
 
 # Wolfee provides SCA inventory and Go reachability traces for the triage run.
 COPY --from=wolfee-builder /build/wolfee/bin/wolfee /usr/local/bin/wolfee

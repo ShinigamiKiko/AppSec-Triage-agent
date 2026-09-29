@@ -525,7 +525,7 @@ def run_imports_many(database: Path | str, packages: list[str], root: Path | str
         work_dir = Path(work)
         rows = write_external(work_dir, "wantedPackage", [(p,) for p in wanted])
         results = work_dir / "imports.bqrs"
-        _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
+        _, problem = _codeql([binary, "query", "run", *query_flags(language), f"--database={database}",
                               f"--external=wantedPackage={rows}",
                               f"--output={results}", str(query)], timeout_s, "поиск импортов")
         if problem:
@@ -585,7 +585,7 @@ def run(database: Path | str, targets: list[Target], root: Path | str, *,
         external = f"--external=target={rows}"
         results, reach_bqrs, sarif = work_dir / "calls.bqrs", work_dir / "reach.bqrs", work_dir / "reach.sarif"
 
-        _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
+        _, problem = _codeql([binary, "query", "run", *query_flags(language), f"--database={database}",
                               external, f"--output={results}", str(calls_file)], timeout_s, "поиск вызовов")
         if problem:
             return ApiAnswer(problem=problem)
@@ -607,7 +607,7 @@ def run(database: Path | str, targets: list[Target], root: Path | str, *,
         if answer.calls:
             # `query run` + `bqrs interpret` is what `database analyze` does inside,
             # but it takes the external predicate and keeps the compiled query cached.
-            _, problem = _codeql([binary, "query", "run", *query_flags(), f"--database={database}",
+            _, problem = _codeql([binary, "query", "run", *query_flags(language), f"--database={database}",
                                   external, f"--output={reach_bqrs}", str(reach_file)],
                                  timeout_s, "поиск пути")
             if problem:

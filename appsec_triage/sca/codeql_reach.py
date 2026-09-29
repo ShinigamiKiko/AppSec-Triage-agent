@@ -19,9 +19,44 @@ _THREADS = os.environ.get("APPSEC_CODEQL_THREADS", "0")
 _RAM_MB = os.environ.get("APPSEC_CODEQL_RAM_MB", "6000")
 
 
-def query_flags() -> list[str]:
-    """What an evaluating command may use."""
-    return [f"--threads={_THREADS}", f"--ram={_RAM_MB}"]
+# The agent's own library models, per language: request sources CodeQL does not ship
+# (configs/codeql/models/<language>/).
+_MODEL_PACKS = {"go": "appsec-triage/go-models"}
+
+
+def pack_dirs() -> list[str]:
+    """Where packs live outside the bundle: the agent's own models, then third-party
+    packs downloaded at image build (APPSEC_CODEQL_PACKS, /opt/codeql-packs)."""
+    from ..config import CONFIG_DIR
+
+    dirs = [str(CONFIG_DIR / "codeql" / "models")]
+    downloaded = os.environ.get("APPSEC_CODEQL_PACKS", "/opt/codeql-packs")
+    if downloaded and Path(downloaded).is_dir():
+        dirs.append(downloaded)
+    return dirs
+
+
+def packs_flag() -> str:
+    return "--additional-packs=" + os.pathsep.join(pack_dirs())
+
+
+def model_flags(language: str, extra: list[str] | tuple[str, ...] = (), ours: bool = True) -> list[str]:
+    """Flags that load model packs for this language: the agent's own, then `extra`."""
+    from ..config import CONFIG_DIR
+
+    models: list[str] = []
+    pack = _MODEL_PACKS.get(language)
+    if ours and pack and (CONFIG_DIR / "codeql" / "models" / language / "qlpack.yml").is_file():
+        models.append(pack)
+    models.extend(extra)
+    if not models:
+        return []
+    return [packs_flag(), *(f"--model-packs={name}" for name in models)]
+
+
+def query_flags(language: str = "") -> list[str]:
+    """What an evaluating command may use, and the models its language needs."""
+    return [f"--threads={_THREADS}", f"--ram={_RAM_MB}", *model_flags(language)]
 
 
 _DATABASE_LOCKS: dict[str, threading.Lock] = {}
@@ -239,7 +274,7 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         evaluated_results = work_dir / "evaluated.bqrs"
 
         def run_query(query_path: Path, output_path: Path, query_name: str):
-            argv = [binary, "query", "run", *query_flags(), f"--database={database}",
+            argv = [binary, "query", "run", *query_flags(language), f"--database={database}",
                     f"--external=target={rows}", f"--output={output_path}", str(query_path)]
             start = time.monotonic()
             try:

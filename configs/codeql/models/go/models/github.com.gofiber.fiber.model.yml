@@ -1,0 +1,59 @@
+# Fiber: where a request's data comes out. CodeQL ships only Fiber's sinks
+# (SendFile, Download, SaveFile, Redirect), so a Fiber handler had no source at all
+# and every dataflow question about one answered "no user input".
+#
+# A package path without a major-version suffix matches every major version:
+# the rows cover v2 (*fiber.Ctx) and v3 (the Ctx and Req interfaces, *Bind).
+# Getters hand the data back; binders write it into their argument.
+extensions:
+  - addsTo:
+      pack: codeql/go-all
+      extensible: sourceModel
+    data:
+      # v2 *Ctx, v3 Ctx and Req: the body, the query, the path, the form, headers, cookies.
+      - ["github.com/gofiber/fiber", "Ctx", True, "Body", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "BodyRaw", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Query", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Queries", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Params", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "AllParams", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "FormValue", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "FormFile", "", "", "ReturnValue[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "MultipartForm", "", "", "ReturnValue[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Get", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "GetReqHeaders", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Cookies", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "OriginalURL", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Path", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "Hostname", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Body", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "BodyRaw", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Query", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Queries", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Params", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "FormValue", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "FormFile", "", "", "ReturnValue[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "MultipartForm", "", "", "ReturnValue[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Get", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Cookies", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "OriginalURL", "", "", "ReturnValue", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Req", True, "Hostname", "", "", "ReturnValue", "remote", "manual"]
+      # v2 binders: the parsed request lands in the argument.
+      - ["github.com/gofiber/fiber", "Ctx", True, "BodyParser", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "QueryParser", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "ParamsParser", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "ReqHeaderParser", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Ctx", True, "CookieParser", "", "", "Argument[0]", "remote", "manual"]
+      # v3 c.Bind().X(&out)
+      - ["github.com/gofiber/fiber", "Bind", True, "Body", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "JSON", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "XML", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "Form", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "Query", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "Header", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "Cookie", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "URI", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "All", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "MsgPack", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "CBOR", "", "", "Argument[0]", "remote", "manual"]
+      - ["github.com/gofiber/fiber", "Bind", True, "Custom", "", "", "Argument[1]", "remote", "manual"]

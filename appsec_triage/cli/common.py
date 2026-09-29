@@ -11,7 +11,8 @@ from pathlib import Path
 from .. import coverage as coverage_report
 from .. import ingest
 from .. import reuse as reuse_mod
-from ..config import load_lsp_config, load_pipeline_config, load_provider_config
+from ..config import (OLLAMA_PIPELINE, keep_ollama_only_settings, load_lsp_config, load_pipeline_config,
+                      load_provider_config, provider_kind)
 from ..context.source import SourceResolver
 from ..llm.base import LLMAuthError, LLMError
 from ..llm.factory import build_client
@@ -119,7 +120,12 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     # cache it. APPSEC_CACHE_DIR points it elsewhere; set it empty to turn the cache off.
     os.environ.setdefault("APPSEC_CACHE_DIR", str(Path(out) / ".appsec-cache"))
 
-    cfg = load_pipeline_config(args.config)
+    config_path = args.config
+    requested = getattr(args, "provider", None)
+    if config_path is None and requested and provider_kind(requested) == "ollama":
+        # A local model gets its own, lighter pipeline: configs/pipeline-ollama.yaml.
+        config_path = OLLAMA_PIPELINE
+    cfg = load_pipeline_config(config_path)
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack
     if getattr(args, "workers", None): cfg.max_workers = args.workers
@@ -141,6 +147,17 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     if os.environ.get("NVD_API_KEY"): cfg.nvd_api_key = os.environ["NVD_API_KEY"]
 
     provider_cfg = load_provider_config(cfg.provider)
+    if provider_cfg.kind != "ollama" and config_path is not None \
+            and Path(config_path).resolve() == OLLAMA_PIPELINE.resolve():
+        print(f"error: {OLLAMA_PIPELINE.name} is for the ollama provider only, not '{cfg.provider}'",
+              file=sys.stderr)
+        return 2
+    keep_ollama_only_settings(cfg, provider_cfg.kind)
+    if provider_cfg.kind == "ollama":
+        print(f"→ облегчённый профиль Ollama ({Path(config_path).name if config_path else 'pipeline.yaml'}): "
+              f"вопросов на находку {cfg.max_tool_calls}, раундов проверки места вызова "
+              f"{cfg.callsite_search_rounds}, без перепроверки закрытий: "
+              f"{', '.join(cfg.skip_closure_audits) or 'нет'}", file=sys.stderr)
     if provider_cfg.leaves_the_perimeter: cfg.redact_secrets = True
     log_path = attach_file_log(out)
     print(f"→ подробный лог: {log_path}", file=sys.stderr)

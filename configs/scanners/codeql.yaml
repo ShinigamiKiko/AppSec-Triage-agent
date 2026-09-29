@@ -20,3 +20,26 @@ language: null             # null = определить по расширени
 # database create — дорогая фаза; для компилируемых языков нужен рабочий билд.
 timeout_s: 3600
 docker_network: false
+
+# Наборы запросов по языку — идут одним `database analyze`. Сторонние пакеты
+# скачиваются при сборке образа (Dockerfile); пакет, которого нет, пропускается с
+# пометкой в выводе сканера, а пакет, который не собрался на этой версии CodeQL,
+# откатывает анализ на стандартный набор — без стандартного набора прогон не
+# остаётся никогда. Community Packs для Go не включены: их два запроса повторяют
+# стандартные (log-injection, command-injection) и давали те же находки дважды.
+suites:
+  go:
+    - codeql/go-queries:codeql-suites/go-security-extended.qls
+    - trailofbits/go-queries:codeql-suites/tob-go-security.qls
+    - trailofbits/go-queries:codeql-suites/tob-go-crypto.qls
+  javascript:
+    - codeql/javascript-queries:codeql-suites/javascript-security-extended.qls
+    - githubsecuritylab/codeql-javascript-queries:suites/javascript.qls
+# Дополнительные модели — только для SAST. Модели агента (configs/codeql/models,
+# источники Fiber) подключаются всегда и отдельно: их же видят вопросы агента
+# «доходит ли ввод пользователя до вызова». Community-модели объявляют вводом
+# атакующего os.Getenv, os.Args, флаги и содержимое файлов — для SAST это шире
+# покрытие, но в вопросы агента они не идут: там «ввод» — это данные запроса.
+model_packs:
+  go:
+    - githubsecuritylab/codeql-go-extensions

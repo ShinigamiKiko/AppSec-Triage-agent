@@ -178,6 +178,13 @@ def _patterns_by_tools(client, system: str, header: str, root: Path, limit: int,
     return searched[:limit]
 
 
+def not_rechecked(kind: str) -> Audit:
+    """A closure the profile accepts without the model's recheck (Ollama's, for kinds that
+    no recheck has ever overturned): it counts as checked, and the report says how."""
+    return Audit(kind=kind, checked=True,
+                 detail=f"закрытие «{kind}» принято без перепроверки моделью (профиль Ollama)")
+
+
 def audit(reachability, root: Path | str, advisory, symbol, client, parallel: int = 1) -> Audit:
     """Check a "not reached" answer for the paths a static graph cannot resolve."""
     if client is None:

@@ -129,6 +129,9 @@ class ScannerConfig:
     docker_network: bool = False
     docker_args: list[str] = field(default_factory=list)
     run_in_target: bool = False
+    # CodeQL only: query suites and extra model packs per language (`go`, `javascript`).
+    suites: dict[str, list[str]] = field(default_factory=dict)
+    model_packs: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, name: str) -> ScannerConfig:
@@ -242,6 +245,14 @@ class PipelineConfig:
     # выносился по недоисследованному. Число в конфиге, а не в коде: вопросы
     # стоят времени и денег, и общий раннер может позволить себе меньше.
     max_tool_calls: int = 20
+    # Только для Ollama (configs/pipeline-ollama.yaml); у других провайдеров
+    # сбрасываются к этим значениям при запуске, что бы ни стояло в файле.
+    # Раунды поиска на шаге «проверка места вызова» и вопросов к CodeQL в них.
+    callsite_search_rounds: int = 3
+    callsite_dataflow_requests: int = 4
+    # Виды механических закрытий, которые модель не перепроверяет: закрытие
+    # принимается как есть, с пометкой в отчёте. Пусто — перепроверяются все.
+    skip_closure_audits: list[str] = field(default_factory=list)
     # SBOM, снятый один раз за прогон: тот же документ идёт в граф и на починку имён.
     sbom_path: str = ""
     # Does the build process input nobody on the team wrote — pull requests from
@@ -272,9 +283,54 @@ def load_provider_config(name: str, *, config_dir: Path | None = None) -> Provid
     return ProviderConfig.from_dict(data, name=name)
 
 
+def provider_kind(name: str, *, config_dir: Path | None = None) -> str:
+    """The profile's `kind` without resolving its environment (keys may not be set yet)."""
+    path = (config_dir or CONFIG_DIR) / "providers" / f"{name}.yaml"
+    if not path.is_file():
+        return ""
+    return str((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("kind", ""))
+
+
+# A local model gets its own pipeline: fewer questions per finding, fewer rechecks.
+OLLAMA_PIPELINE = CONFIG_DIR / "pipeline-ollama.yaml"
+_OLLAMA_ONLY = ("callsite_search_rounds", "callsite_dataflow_requests", "skip_closure_audits")
+
+
+def keep_ollama_only_settings(cfg: PipelineConfig, provider_kind: str) -> None:
+    """The lightened checks are Ollama's alone: any other provider gets the defaults back,
+    whatever the file said."""
+    from dataclasses import MISSING
+
+    if provider_kind == "ollama":
+        return
+    for f in PipelineConfig.__dataclass_fields__.values():  # type: ignore[attr-defined]
+        if f.name in _OLLAMA_ONLY:
+            setattr(cfg, f.name, f.default_factory() if f.default_factory is not MISSING else f.default)
+
+
+def _read_pipeline(path: Path, seen: tuple[Path, ...] = ()) -> dict:
+    """The file's keys over those of the file it `extends:`, section by section."""
+    raw = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}) if path.is_file() else {}
+    parent = raw.pop("extends", None)
+    if not parent:
+        return raw
+    parent_path = (path.parent / parent).resolve()
+    if parent_path in seen or parent_path == path.resolve():
+        raise ConfigError(f"{path}: extends loops back to {parent_path}")
+    if not parent_path.is_file():
+        raise ConfigError(f"{path}: extends a missing file {parent_path}")
+    merged = _read_pipeline(parent_path, (*seen, path.resolve()))
+    for key, value in raw.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_pipeline_config(path: Path | None = None) -> PipelineConfig:
     path = path or (CONFIG_DIR / "pipeline.yaml")
-    raw = _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {}) if path.is_file() else {}
+    raw = _expand_env(_read_pipeline(path))
     scope = ScopeConfig(**raw.pop("scope", {}) or {})
     queue = TriageQueueConfig(**raw.pop("queue", {}) or {})
     verify = VerificationConfig(**raw.pop("verification", {}) or {})

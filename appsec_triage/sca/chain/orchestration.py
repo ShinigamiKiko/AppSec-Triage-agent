@@ -13,6 +13,7 @@ from .. import codeql_agent, codeql_api, codeql_reach, components as components_
 from .. import conditions as conditions_mod, llm_advisory
 from .. import exploitable as exploitable_mod, govulncheck as govulncheck_mod, psalm_api
 from .. import presence as presence_mod, reach as reach_mod, receiver as receiver_mod
+from .. import request_readers
 from .. import lsp_tools as lsp_tools_mod, registries, unreached as unreached_mod
 from .. import verdict as verdict_mod, versions as versions_mod
 from ...lsp import code_tools as lsp_code_tools
@@ -227,15 +228,19 @@ class DependencyChain(ChainSupport):
             call_site = exploitable_mod.assess(
                 reachability, self._roots[0], advisory, self._client,
                 dataflow_context=dataflow_context, dataflow_query=query_dataflow,
-                parallel=self._parallel_llm)
+                parallel=self._parallel_llm, search_rounds=self._callsite_rounds,
+                dataflow_requests=self._callsite_dataflow)
             if call_site.detail and not call_site.lowers:
                 problems.append(call_site.detail)
 
         graph_audit = None
         if reachability is not None and not reachability.reachable and self._roots:
-            graph_audit = unreached_mod.audit(
-                reachability, self._roots[0], advisory, symbol, self._client,
-                parallel=self._parallel_llm)
+            if "not_reached" in self._skip_audits:
+                graph_audit = unreached_mod.not_rechecked("not_reached")
+            else:
+                graph_audit = unreached_mod.audit(
+                    reachability, self._roots[0], advisory, symbol, self._client,
+                    parallel=self._parallel_llm)
             if graph_audit.detail and not graph_audit.reopens:
                 problems.append(graph_audit.detail)
 
@@ -430,6 +435,14 @@ class DependencyChain(ChainSupport):
         if isinstance(model_reached, codeql_reach.Reached) and not isinstance(dataflow, codeql_reach.Reached):
             # A path CodeQL traced for a query the model chose is still CodeQL's path.
             dataflow = model_reached
+        if dataflow is False and found is not None and self._roots:
+            # `ctx.BodyParser(&req)` reads the request itself: no input reaches its argument
+            # by construction, so "no path" is not an answer to close on.
+            readers = request_readers.in_lines(self._roots[0], [(h.file, h.line) for h in found.hits])
+            if readers:
+                problems.append(f"CodeQL не нашёл пути от ввода к вызову, но вызов сам читает запрос "
+                                f"({readers[0]}) — отсутствие потока в его аргументы не доказательство")
+                dataflow = None
         if isinstance(dataflow, str):
             dataflow_status = dataflow
         elif dataflow is False and not dataflow_status:
@@ -492,10 +505,13 @@ class DependencyChain(ChainSupport):
                     f"все найденные вызовы {symbol} лежат в тестовом коде")
             else:
                 closure_kind, claim = "", ""
-            if closure_kind:
+            if closure_kind in self._skip_audits:
+                closure_audit = unreached_mod.not_rechecked(closure_kind)
+            elif closure_kind:
                 closure_audit = unreached_mod.audit_closure(
                     closure_kind, claim, self._roots[0], advisory, symbol, self._client,
                     parallel=self._parallel_llm)
+            if closure_kind:
                 if closure_audit.detail and not closure_audit.reopens:
                     problems.append(closure_audit.detail)
 

@@ -102,15 +102,25 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
         others = sorted({m.scanner for m in members} - {primary.scanner})
         merged.append(primary.model_copy(update={"corroborated_by": others}) if others else primary)
 
-        for m in members:
+        # One scanner running several query packs reports the same query twice under
+        # two ids (`go/log-injection`, `githubsecuritylab/log-injection`): one finding.
+        seen = {_rule_name(primary.rule_id)}
+        for m in sorted(members, key=_richness, reverse=True):
             if (
                 m is not primary
                 and m.scanner == primary.scanner
                 and m.rule_id != primary.rule_id
+                and _rule_name(m.rule_id) not in seen
                 and not _is_secret_family(m.cwe)
             ):
+                seen.add(_rule_name(m.rule_id))
                 merged.append(m)
     return merged
+
+
+def _rule_name(rule_id: str | None) -> str:
+    """A query's name without the pack it came from: `go/log-injection` -> `log-injection`."""
+    return (rule_id or "").rsplit("/", 1)[-1].lower()
 
 
 __all__ = ["IngestError", "detect_format", "load", "native", "sarif"]

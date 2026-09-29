@@ -225,6 +225,9 @@ class TriagePipeline:
                 parallel_llm=cfg.parallel_llm,
                 max_tool_calls=cfg.max_tool_calls,
                 sbom_path=getattr(cfg, "sbom_path", ""),
+                callsite_search_rounds=cfg.callsite_search_rounds,
+                callsite_dataflow_requests=cfg.callsite_dataflow_requests,
+                skip_closure_audits=cfg.skip_closure_audits,
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []

@@ -1,0 +1,9 @@
+# Request sources CodeQL's own Go library does not model. Loaded as a model pack by
+# every CodeQL evaluation the agent runs: the SAST suites and its own reach queries.
+name: appsec-triage/go-models
+version: 0.0.1
+library: true
+extensionTargets:
+  codeql/go-all: "*"
+dataExtensions:
+  - models/*.model.yml

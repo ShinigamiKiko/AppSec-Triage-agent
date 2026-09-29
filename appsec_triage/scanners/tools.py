@@ -331,33 +331,111 @@ class CodeQLScanner(Scanner):
             "runs": [run for doc in docs for run in (doc.get("runs") or [])],
         }
 
-    def _analyze_one(self, exe: str, target: Path, out_dir: Path, language: str, part: Path) -> str | None:
+    STANDARD_SUITE = "codeql/{language}-queries:codeql-suites/{language}-security-extended.qls"
+
+    def _installed_packs(self, exe: str) -> set[str] | None:
+        """Pack names this CodeQL resolves; None when it cannot say."""
+        from ..sca.codeql_reach import pack_dirs, packs_flag
+
+        cached = getattr(self, "_packs_cache", None)
+        if cached is not None:
+            return cached or None
+        packs: set[str] = set()
+        try:
+            proc = subprocess.run([exe, "resolve", "qlpacks", "--format=json", packs_flag()], capture_output=True,
+                                  text=True, timeout=120, encoding="utf-8", errors="replace", check=False)
+            if proc.returncode == 0:
+                packs = set(json.loads(proc.stdout or "{}"))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        if packs:
+            # `resolve qlpacks` leaves out packs in the download cache (`pack download`
+            # without --dir): they resolve all the same, laid out as <scope>/<name>/<version>.
+            for root in [*pack_dirs(), str(Path.home() / ".codeql" / "packages")]:
+                for manifest in Path(root).glob("*/*/*/qlpack.yml"):
+                    packs.add(f"{manifest.parent.parent.parent.name}/{manifest.parent.parent.name}")
+        self._packs_cache = packs
+        return packs or None
+
+    @staticmethod
+    def _pack_of(spec: str) -> str:
+        """`scope/name` of a query or model pack reference (`scope/name@1.0:path`)."""
+        return spec.split(":", 1)[0].split("@", 1)[0]
+
+    def _query_plan(self, exe: str, language: str) -> tuple[list[str], list[str], list[str]]:
+        """(suites, extra model packs, what was left out and why) for one language."""
+        standard = self.STANDARD_SUITE.format(language=language)
+        suites = list((self.cfg.suites or {}).get(language) or [standard])
+        models = list((self.cfg.model_packs or {}).get(language) or [])
+        installed = self._installed_packs(exe)
+        skipped: list[str] = []
+        if installed is not None:
+            for spec in [*suites, *models]:
+                if self._pack_of(spec) not in installed and f"{self._pack_of(spec)} не установлен" not in skipped:
+                    skipped.append(f"{self._pack_of(spec)} не установлен")
+            suites = [s for s in suites if self._pack_of(s) in installed] or [standard]
+            models = [m for m in models if self._pack_of(m) in installed]
+        return suites, models, skipped
+
+    def _run_phase(self, phase: str, argv: list[str]) -> str | None:
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=self.cfg.timeout_s, encoding="utf-8", errors="replace",
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return f"'{phase}' timed out after {self.cfg.timeout_s}s (a compiled language needs a working build)"
+        except OSError as exc:
+            return str(exc)
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+            return f"'{phase}' exited {proc.returncode}: {tail[:300]}"
+        return None
+
+    def _analyze_one(self, exe: str, target: Path, out_dir: Path, language: str, part: Path,
+                     notes: list[str] | None = None) -> str | None:
         """Create a database for one language and analyze it into `part`."""
+        from ..sca.codeql_reach import model_flags, packs_flag
+
         db_dir = self.database_dir(out_dir, language)
         shutil.rmtree(db_dir, ignore_errors=True)
         create = [
             exe, "database", "create", str(db_dir),
             f"--language={language}", f"--source-root={target}", "--overwrite",
         ]
-        analyze = [
-            exe, "database", "analyze", str(db_dir),
-            f"codeql/{language}-queries:codeql-suites/{language}-security-extended.qls",
-            "--format=sarif-latest", f"--output={part}",
-        ]
-        try:
-            for phase, argv in (("database create", create), ("database analyze", analyze)):
-                proc = subprocess.run(
-                    argv, capture_output=True, text=True,
-                    timeout=self.cfg.timeout_s, encoding="utf-8", errors="replace",
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
-                    return f"'{phase}' exited {proc.returncode}: {tail[:300]}"
-        except subprocess.TimeoutExpired:
-            return f"timed out after {self.cfg.timeout_s}s (a compiled language needs a working build)"
-        except OSError as exc:
-            return str(exc)
+        if err := self._run_phase("database create", create):
+            return err
+
+        suites, models, skipped = self._query_plan(exe, language)
+        if skipped and notes is not None:
+            notes.append(f"{language}: " + "; ".join(skipped))
+
+        def analyze(queries: list[str], extra_models: list[str], ours: bool) -> list[str]:
+            # The agent's own request sources come first: without them a Fiber handler has
+            # none, and every query that starts from user input stays silent on it.
+            models = model_flags(language, extra_models, ours)
+            return [
+                exe, "database", "analyze", str(db_dir), *queries,
+                "--format=sarif-latest", f"--output={part}",
+                *(models or [packs_flag()]),
+            ]
+
+        standard = self.STANDARD_SUITE.format(language=language)
+        # A pack that does not compile on this CodeQL must not cost the standard queries:
+        # each step drops what may have failed, and the note says what was lost.
+        attempts = [(suites, models, True), ([standard], [], True), ([standard], [], False)]
+        err = None
+        for number, (queries, extra, ours) in enumerate(dict.fromkeys(
+                (tuple(q), tuple(m), o) for q, m, o in attempts)):
+            err = self._run_phase("database analyze", analyze(list(queries), list(extra), ours))
+            if not err:
+                if number and notes is not None:
+                    notes.append(f"{language}: " + ("дополнительные наборы не выполнились — только стандартные"
+                                                    if ours else "модели агента не загрузились — стандартные без них"))
+                break
+        if err:
+            return err
         return None if part.is_file() else "analyze produced no SARIF"
 
     def scan(self, target: Path, out_dir: Path) -> ScanResult:
@@ -381,16 +459,15 @@ class CodeQLScanner(Scanner):
         started = time.monotonic()
         docs: list[dict] = []
         failures: list[str] = []
+        notes: list[str] = []
         built: dict[str, str] = {}
         last_cmd = [exe, "database", "analyze"]
         for language in languages:
             part = out_dir / f".codeql-{language}.sarif.json"
             part.unlink(missing_ok=True)
-            last_cmd = [
-                exe, "database", "analyze", f"--language={language}",
-                f"codeql/{language}-queries:codeql-suites/{language}-security-extended.qls",
-            ]
-            if err := self._analyze_one(exe, target, out_dir, language, part):
+            last_cmd = [exe, "database", "analyze", f"--language={language}",
+                        *((self.cfg.suites or {}).get(language) or [self.STANDARD_SUITE.format(language=language)])]
+            if err := self._analyze_one(exe, target, out_dir, language, part, notes):
                 failures.append(f"{language}: {err}")
                 continue
             built[language] = str(self.database_dir(out_dir, language))
@@ -423,6 +500,7 @@ class CodeQLScanner(Scanner):
             duration_s=duration, command=last_cmd, version=avail.version, mode="native",
             error=None if out_file.is_file() else "failed to write merged SARIF",
             stderr_tail=f"partial: {note}" if failures else "",
+            note="; ".join(notes),
         )
 
 
