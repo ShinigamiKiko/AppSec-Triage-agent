@@ -18,8 +18,6 @@ MAX_ENTRIES = 4000
 MAX_FILE_BYTES = 256_000
 MAX_TOTAL_BYTES = 2_000_000
 MAX_LOCATIONS = 48
-# A search reads files, it does not keep them: its limits are far above the walk's,
-# so that "no match" can mean the whole project rather than its first 500 files.
 SEARCH_FILES = 8000
 SEARCH_ENTRIES = 80000
 _EXTENSIONS = frozenset({
@@ -36,9 +34,6 @@ _EXCLUDED = frozenset({
     "__pycache__", ".venv", "venv",
 })
 _CODE_EXTENSIONS = _EXTENSIONS - {".yaml", ".yml", ".xml", ".json"}
-# Where package managers install dependencies. Never walked, but an explicit read of
-# one file there is allowed: the open question is often "what does the installed
-# version do", and only its source answers that.
 _INSTALLED = frozenset({"vendor", "node_modules"})
 _SECRET_NAME = r"(?:[\w.-]+[_.-])?(?:passwords?|secrets?|tokens?|api_keys?|private_keys?)"
 _SECRET_HEAD = re.compile(
@@ -73,7 +68,6 @@ def _installed_package(path) -> str | None:
     return None
 
 
-# Two segments for npm and Composer; a Go module or package path has more.
 _PACKAGE_NAME = re.compile(r"^@?[\w.~-]+(?:/[\w.~-]+)*$")
 
 
@@ -93,8 +87,6 @@ def _search_fact(pattern: str, matches: int, files_hit: int, scanned: int, in_te
     if truncated:
         tail += "; the search stopped at its file limit, so an absence is not established"
     if samples:
-        # The windows may not survive the evidence budget; the lines themselves always do,
-        # so a count never stands alone ("3 matches" that are `ForRequest::createFrom...`).
         tail += "; matched lines: " + " | ".join(samples)
     return f"search_code «{pattern}» → {found}{tail}"
 
@@ -107,7 +99,6 @@ def _redact(text: str) -> str:
         return f"~P{len(placeholders) - 1}~"
 
     text = _PLACEHOLDER.sub(protect, text)
-    # Class/service references are configuration, including for the entropy pass.
     text = re.sub(r'''[\\A-Za-z_]\w*(?:\\+\w+)+(?:\:\:class)?|\b\w+::class\b''', protect, text)
 
     def hide(value):
@@ -115,10 +106,8 @@ def _redact(text: str) -> str:
             return value
         if value.strip().lower() in {"true", "false", "yes", "no", "on", "off", "null", "~"}:
             return value
-        # Keep line numbers valid even for multi-line literals.
         return "<REDACTED>" + "\n" * value.count("\n")
 
-    # Hide balanced flow collections in full, not just their first scalar.
     spans = []
     for match in _SECRET_HEAD.finditer(text):
         start = match.end()
@@ -153,7 +142,6 @@ def _redact(text: str) -> str:
         if not any(lo < start < hi for lo, hi in spans):
             text = text[:start] + hide(text[start:end]) + text[end:]
 
-    # YAML credential collections and block scalars retain their original lines.
     lines = text.splitlines(keepends=True)
     secret_indent = None
     for i, line in enumerate(lines):
@@ -209,13 +197,9 @@ class RepositoryEvidence:
     def __init__(self, source: SourceResolver, max_chars: int = 32000):
         self.source = source
         self.max_chars = max(0, max_chars)
-        # The tree and its text, read once per run: the code does not change while it is
-        # triaged, and every search_code call walked and read the whole project again —
-        # minutes of Python on a large one, with eight findings sharing one interpreter.
         self._walks: dict[tuple, tuple[list[Path], list[str]]] = {}
         self._texts: dict[Path, tuple[list[str], str] | None] = {}
         self._tests: dict[Path, bool] = {}
-        # What a package search read, and why it read nothing: {requested name: (scope, problem)}.
         self._scopes: dict[str, tuple[str, str]] = {}
         self._cache_lock = threading.Lock()
 
@@ -261,7 +245,6 @@ class RepositoryEvidence:
         candidates = []
         if path.is_absolute():
             candidates.append(path)
-            # The only virtual mount mapping: /src/foo -> <source root>/foo.
             if path.parts[:2] == ("/", "src") and not path.exists():
                 candidates.extend(root / Path(*path.parts[2:]) for root in self.source.roots)
         else:
@@ -284,8 +267,6 @@ class RepositoryEvidence:
         if module is None:
             return None
         candidate = path if path.is_absolute() else registries.go_mod_cache() / path
-        # Unresolved: the module cache may sit behind a link, and the file must still be
-        # recognised as a dependency's when it is shown.
         return candidate if self._safe(candidate, module, installed=True) else None
 
     def _paths(self, pkg, files_limit: int = MAX_FILES, entries_limit: int = MAX_ENTRIES):
@@ -415,7 +396,6 @@ class RepositoryEvidence:
             if size > MAX_FILE_BYTES or size > remaining:
                 self._note(pkg, "Source reading truncated at file or total byte limit.")
                 return None, 0
-            # A bounded read also handles files growing since stat().
             with path.open("rb") as stream:
                 data = stream.read(min(MAX_FILE_BYTES, remaining) + 1)
             if len(data) > min(MAX_FILE_BYTES, remaining):
@@ -444,7 +424,6 @@ class RepositoryEvidence:
                 return Path(path).resolve().relative_to(root).as_posix()
             except ValueError:
                 continue
-        # `github.com/jackc/pgx/v5@v5.6.0/pgproto3/bind.go` — readable back as it is.
         return registries.go_cache_path(path) or str(path)
 
     def _is_test(self, path) -> bool:
@@ -489,8 +468,6 @@ class RepositoryEvidence:
         if package is None and self._is_test(path):
             label = "test code — not production: what is called here the application does not call"
         if package is not None:
-            # Read as the project's own, a library line confirms every CVE: every
-            # vulnerable package contains its vulnerable function.
             label = (f"installed dependency source — package {package or 'unknown'}; "
                      "shows what the library does, not what this project does")
         block = header + "\n[" + _redact(label) + "]"
@@ -564,7 +541,6 @@ class RepositoryEvidence:
                     self._note(pkg, "Configuration window truncated to 80 lines; imports are not followed.")
             elif special:
                 label = "deployment/build evidence"
-                # Extract CGO_ENABLED and Go version for deployment gate checks
                 if path.name.lower().startswith("dockerfile"):
                     for line_text in lines:
                         if "CGO_ENABLED" in line_text:
@@ -592,7 +568,6 @@ class RepositoryEvidence:
         if len(requests) > 6:
             self._note(pkg, "Retrieval truncated to six requests per round.")
         added = False
-        # Use cumulative byte counter from pkg to enforce budget across tool calls
         remaining = MAX_TOTAL_BYTES - getattr(pkg, "repository_bytes_read", 0)
         cache = {}
 
@@ -602,12 +577,10 @@ class RepositoryEvidence:
             if path not in cache:
                 cache[path], used = self._load(pkg, path, remaining)
                 remaining = max(0, remaining - used)
-                # Track cumulative bytes read
                 if hasattr(pkg, "repository_bytes_read"):
                     pkg.repository_bytes_read += used
             return cache[path]
 
-        # Explicit locations take precedence over speculative repository searches.
         for request in sorted(requests[:6], key=lambda r: _get(r, "action") != "read"):
             if sum(map(len, pkg.evidence_blocks)) >= self.max_chars:
                 self._note(pkg, "Repository evidence truncated at character budget.")
@@ -658,8 +631,6 @@ class RepositoryEvidence:
                     if skip and path.name.lower().endswith(skip):
                         skipped += 1
                         continue
-                    # Scanning is not reading: only the windows it adds count against the
-                    # evidence budget, or one search over the code would exhaust it.
                     found = self._scan(path)
                     if found is None:
                         continue
@@ -690,7 +661,6 @@ class RepositoryEvidence:
                                              truncated=len(candidates) >= SEARCH_FILES, samples=samples,
                                              package=scope))
                 if skipped:
-                    # Never a silent "nothing found" over code the search did not read.
                     self._note(pkg, f"search_code did not read {skipped} source file(s) a language server "
                                     "covers; for code use lsp_find_usages / lsp_find_symbol — no match here "
                                     "says nothing about them.")

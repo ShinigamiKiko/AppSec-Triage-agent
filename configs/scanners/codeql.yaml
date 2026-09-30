@@ -1,32 +1,14 @@
-# CodeQL — основной анализатор там, где он есть.
-#
-# ВАЖНО: PHP не поддерживается и поддержан не будет. Языки CodeQL: C/C++, C#,
-# Go, Java/Kotlin, JS/TS, Python, Ruby, Swift, Rust. Для PHP-проектов основным
-# используется CodeQL, а для PHP отдельный Psalm — это ограничение инструмента.
-#
-# Ценность CodeQL здесь — не «более правильные вердикты», а `codeFlows` в SARIF:
-# настоящая трасса потока данных, которую pattern-only анализаторы не дают, и
-# без неё вердикт по CWE-89 выносится по окну кода, а не по пути.
-mode: native               # docker не предлагается: БД должна пережить обе фазы
-# Бандл распакован в WSL; прежний путь указывал на временную Windows-директорию,
-# которой больше нет — codeql молча выпадал из прогонов Go/TS.
+mode: native
 binary:
   - codeql
   - /opt/codeql/codeql
   - ~/tools/codeql/codeql
 image: null
 rules: []
-language: null             # null = определить по расширениям файлов
-# database create — дорогая фаза; для компилируемых языков нужен рабочий билд.
+language: null
 timeout_s: 3600
 docker_network: false
 
-# Наборы запросов по языку — идут одним `database analyze`. Сторонние пакеты
-# скачиваются при сборке образа (Dockerfile); пакет, которого нет, пропускается с
-# пометкой в выводе сканера, а пакет, который не собрался на этой версии CodeQL,
-# откатывает анализ на стандартный набор — без стандартного набора прогон не
-# остаётся никогда. Community Packs для Go не включены: их два запроса повторяют
-# стандартные (log-injection, command-injection) и давали те же находки дважды.
 suites:
   go:
     - codeql/go-queries:codeql-suites/go-security-extended.qls
@@ -35,11 +17,6 @@ suites:
   javascript:
     - codeql/javascript-queries:codeql-suites/javascript-security-extended.qls
     - githubsecuritylab/codeql-javascript-queries:suites/javascript.qls
-# Дополнительные модели — только для SAST. Модели агента (configs/codeql/models,
-# источники Fiber) подключаются всегда и отдельно: их же видят вопросы агента
-# «доходит ли ввод пользователя до вызова». Community-модели объявляют вводом
-# атакующего os.Getenv, os.Args, флаги и содержимое файлов — для SAST это шире
-# покрытие, но в вопросы агента они не идут: там «ввод» — это данные запроса.
 model_packs:
   go:
     - githubsecuritylab/codeql-go-extensions

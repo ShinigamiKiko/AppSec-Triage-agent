@@ -51,7 +51,6 @@ def package_namespaces(ecosystem: str, package: str) -> list[str]:
         if project:
             out.append(f"{camel(vendor)}\\{camel(project)}")
         return [o for o in out if o]
-    # A scoped npm package must match its complete coordinate.
     return [name]
 
 
@@ -94,7 +93,6 @@ def installed_namespaces(root: Path | str, ecosystem: str, package: str) -> list
             name = str(prefix).strip().strip("\\")
             if name and name not in names:
                 names.append(name)
-    # Classmap: global classes with no namespace, often in "classmap": ["lib/"]
     for entry in (autoload.get("classmap") or []):
         path = Path(root) / "vendor" / package / str(entry)
         if not path.exists():
@@ -103,10 +101,9 @@ def installed_namespaces(root: Path | str, ecosystem: str, package: str) -> list
             files_to_scan = [path]
         else:
             files_to_scan = list(path.rglob("*.php")) if path.is_dir() else []
-        for php_file in files_to_scan[:20]:  # cap at 20 files
+        for php_file in files_to_scan[:20]:
             try:
                 text = php_file.read_text(encoding="utf-8", errors="replace")
-                # Extract global class names: class TCPDF, class Foo_Bar
                 for match in re.finditer(r"^\s*(?:abstract\s+|final\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE):
                     name = match.group(1)
                     if name and name not in names:
@@ -206,8 +203,6 @@ class PresenceResult:
     files_scanned: int = 0
     truncated: bool = False
     detail: str = ""
-    # How a call was attributed to the package: "import" when its receiver is a name the
-    # file bound to the package, "name" when only the name matched.
     evidence: str = ""
 
     @property

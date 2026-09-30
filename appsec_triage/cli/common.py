@@ -115,22 +115,16 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
             print(f"error: invalid APPSEC_ECOSYSTEMS: {exc}", file=sys.stderr)
             return 2
 
-    # The advisory's resolved symbol is kept between runs (sca/resolve_cache.py). By default
-    # next to the report: a mounted output directory survives the container, and CI can
-    # cache it. APPSEC_CACHE_DIR points it elsewhere; set it empty to turn the cache off.
     os.environ.setdefault("APPSEC_CACHE_DIR", str(Path(out) / ".appsec-cache"))
 
     config_path = args.config
     requested = getattr(args, "provider", None)
     if config_path is None and requested and provider_kind(requested) == "ollama":
-        # A local model gets its own, lighter pipeline: configs/pipeline-ollama.yaml.
         config_path = OLLAMA_PIPELINE
     cfg = load_pipeline_config(config_path)
     if getattr(args, "provider", None): cfg.provider = args.provider
     if getattr(args, "prompt_pack", None): cfg.prompt_pack = args.prompt_pack
     if getattr(args, "workers", None): cfg.max_workers = args.workers
-    # Only an explicit flag overrides the file: an argparse default would quietly
-    # replace `parallel_llm` from pipeline.yaml on every run.
     if (parallel := getattr(args, "parallel_llm", None)) is not None:
         if parallel < 1:
             print("error: --parallel-llm must be 1 or more", file=sys.stderr)
@@ -157,7 +151,8 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
         print(f"→ облегчённый профиль Ollama ({Path(config_path).name if config_path else 'pipeline.yaml'}): "
               f"вопросов на находку {cfg.max_tool_calls}, раундов проверки места вызова "
               f"{cfg.callsite_search_rounds}, без перепроверки закрытий: "
-              f"{', '.join(cfg.skip_closure_audits) or 'нет'}", file=sys.stderr)
+              f"{', '.join(cfg.skip_closure_audits) or 'нет'}, второй проход по подтверждённым: "
+              f"{'да' if cfg.verification.challenge_verdicts else 'нет'}", file=sys.stderr)
     if provider_cfg.leaves_the_perimeter: cfg.redact_secrets = True
     log_path = attach_file_log(out)
     print(f"→ подробный лог: {log_path}", file=sys.stderr)
@@ -268,11 +263,8 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     audit.write_jsonl(run, out / f"verdicts-{stem}.jsonl")
     journal_path.unlink(missing_ok=True)
     audit.write_summary(run, out / f"summary-{stem}.json")
-    title = f"SAST LLM Triage — {provider_cfg.name}"
+    title = f"AppSec-триаж — {provider_cfg.name}"
     report = html.write(run, out / f"report-{stem}.html", title=title)
-    # The same report with the advisories retold in Russian. Two files rather
-    # than one bilingual page: each reads as one language, and the original
-    # wording stays available in the finding's own block.
     html.write(run, out / f"report-{stem}-ru.html", title=title, russian=True)
     from ..models import VerdictLabel
     counts = run.counts()

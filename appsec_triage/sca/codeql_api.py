@@ -84,8 +84,6 @@ select n.getFile().getRelativePath() as file, n.getStartLine() as line, pkg
 """
 
 
-# The functions asked about arrive as rows of `target(package, function, class, label)`,
-# so the query text — and therefore its compiled form — is the same for every question.
 _JS_CALL_PREDICATE = """external predicate target(string pkg, string fn, string klass, string label);
 
 predicate vulnerableCall(DataFlow::CallNode c, string label) {
@@ -228,7 +226,6 @@ def default_exports(root: Path | str, package: str) -> set[str] | None:
             continue
         names |= decl.default_export_names(text)
         names |= {name for match in _ESM_DEFAULT.finditer(text) for name in match.groups() if name}
-        # `module.exports = require('./lib/express')`: the export lives one file further.
         for rel in _REEXPORT.findall(text):
             target = (entry.parent / rel).resolve()
             for candidate in (target, target.with_suffix(".js"), target / "index.js"):
@@ -255,8 +252,6 @@ def target_rows(targets: list[Target], language: str = "javascript",
         rows.append((target.package, target.function, klass, target.label))
         if language != "javascript" or klass or defaults is None:
             continue
-        # Calling the module calls its default export whatever it is called inside;
-        # the package name is how applications and advisories name it.
         known = defaults.get(target.package) or set()
         is_default = (target.function in known
                       or target.function == _package_as_name(target.package))
@@ -605,8 +600,6 @@ def run(database: Path | str, targets: list[Target], root: Path | str, *,
                 continue
 
         if answer.calls:
-            # `query run` + `bqrs interpret` is what `database analyze` does inside,
-            # but it takes the external predicate and keeps the compiled query cached.
             _, problem = _codeql([binary, "query", "run", *query_flags(language), f"--database={database}",
                                   external, f"--output={reach_bqrs}", str(reach_file)],
                                  timeout_s, "поиск пути")

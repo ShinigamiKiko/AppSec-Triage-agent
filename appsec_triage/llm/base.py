@@ -38,8 +38,6 @@ class LLMTruncated(LLMError):
 
 log = logging.getLogger(__name__)
 
-# The output limit a step asks for, on this thread: the profile's `max_tokens` is sized
-# for a verdict, and a step that returns lists of quoted symbols needs more.
 _BUDGET = threading.local()
 
 
@@ -150,7 +148,6 @@ class BaseHTTPClient(ABC):
         self.completion_tokens_total = 0
         self.spend_usd = 0.0
         self._native_tools_rejected = False
-        # Set once on HTTP 401/403; every later call raises it immediately.
         self.fatal_error: LLMAuthError | None = None
         self._client = httpx.Client(
             base_url=cfg.base_url,
@@ -196,7 +193,6 @@ class BaseHTTPClient(ABC):
             try:
                 return self._complete(system, user, json_schema)
             except LLMTruncated as exc:
-                # Once, with twice the room: a long answer fits, a runaway one fails again.
                 limit = self._max_tokens() * 2
                 log.info("%s; asking once more with max_tokens=%d", exc, limit)
                 with output_budget(limit):
@@ -231,8 +227,6 @@ class BaseHTTPClient(ABC):
                 text, ptok, ctok = self._parse(resp.json())
                 if json_schema is not None and text:
                     try:
-                        # Hand on a reply the consumers can parse strictly, so a
-                        # newline inside a quoted line does not cost three calls.
                         text = to_strict_json(text)
                     except ValueError as exc:
                         raise _UnparsableReply(
@@ -255,7 +249,6 @@ class BaseHTTPClient(ABC):
 
         raise LLMRetryableError(f"{self.name}: exhausted {self.cfg.max_retries} retries: {last_exc}") from last_exc
 
-    #: Set by providers whose API carries native tool calls.
     _NATIVE_TOOLS = False
 
     @property
@@ -299,7 +292,6 @@ class BaseHTTPClient(ABC):
                     raise LLMRetryableError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:300]}")
                 self._auth_failure(resp)
                 if resp.status_code >= 400:
-                    # HTTP 400 with tools often means the model doesn't support them
                     error_text = resp.text[:500]
                     if resp.status_code == 400 and ("tool" in error_text.lower() or "function" in error_text.lower()):
                         self._native_tools_rejected = True
@@ -329,7 +321,7 @@ class BaseHTTPClient(ABC):
     def _record_spend(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
         """Add one answered call to the run total."""
         cost = self.estimate_cost(prompt_tokens, completion_tokens) or 0.0
-        with self._spend_lock:  # findings are triaged in parallel
+        with self._spend_lock:
             self.calls += 1
             self.prompt_tokens_total += prompt_tokens or 0
             self.completion_tokens_total += completion_tokens or 0

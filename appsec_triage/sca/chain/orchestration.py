@@ -51,8 +51,6 @@ class DependencyChain(ChainSupport):
                 progress: Callable[[int, int], None] | None = None) -> None:
         """Ask the database once per package, before any finding is triaged."""
         findings = list(findings)
-        # The PHP call index is one Psalm analysis: started now, it is built while the
-        # findings' advisories are read, not after the first finding asks for it.
         if any(self._uses_psalm(f.dependency) for f in findings if getattr(f, "dependency", None)):
             psalm_api.prefetch(self._roots[0], self._psalm_binary)
         if not self._roots or not self._databases:
@@ -66,7 +64,6 @@ class DependencyChain(ChainSupport):
             if language not in codeql_api.SUPPORTED or language not in self._databases:
                 continue
             candidates.append((finding, dependency, language, dependency.package))
-        # One imports query per database for the whole run, not one per package.
         wanted: dict[str, set[str]] = {}
         for _, _, language, package in candidates:
             wanted.setdefault(language, set()).add(package)
@@ -192,7 +189,6 @@ class DependencyChain(ChainSupport):
             if rendered := reachability.render():
                 context_parts.append(f"Wolfee reachability:\n{rendered}")
         dataflow_status = ""
-        # Every question put to CodeQL for this finding, by whom, and its answer.
         codeql_calls: list[str] = []
         dataflow_context = "\n\n".join(context_parts)
         if _needs_llm_advisory(advisory) and reachability is not None and reachability.reachable:
@@ -264,7 +260,6 @@ class DependencyChain(ChainSupport):
             """Look for the first of `pairs` this code calls."""
             nonlocal found, matched_symbol, receiver_class, api_answer
             if self._uses_psalm(dependency):
-                # PHP names from a fix diff carry no class; the installed package says which.
                 pairs = self._qualify_php_pairs(api_package, pairs)
             fresh = []
             for function, klass in pairs:
@@ -289,7 +284,6 @@ class DependencyChain(ChainSupport):
                         return
             for function, klass in fresh:
                 label = f"{klass}::{function}" if klass else function
-                # The class-bound text search matches a short class name, not a namespace path.
                 short_class = klass.rpartition("\\")[2]
                 for root in self._roots:
                     result = presence_mod.find_symbol(
@@ -318,8 +312,6 @@ class DependencyChain(ChainSupport):
                 and not not_loaded):
             engine = self._engine_name(dependency)
             asker = f"модель (запрос к {engine})"
-            # One investigation per package, version and vulnerable function: nineteen
-            # advisories of one HTTP client name the same `get` and `post` over and over.
             investigation_key = (dependency.package or "", dependency.installed_version or "",
                                  api_package, symbol.function, symbol.klass or "")
             investigation, reused = self._once(self._investigations, investigation_key, lambda: codeql_agent.investigate(
@@ -365,9 +357,6 @@ class DependencyChain(ChainSupport):
             if entry is not None:
                 search(entry.candidates, lead=True)
 
-        # The vulnerable function is often a private helper nobody calls by name. Ask
-        # the engine about every public entry that reaches it: a call of one of them
-        # is a call of the flaw, and zero calls of all of them is a checked absence.
         if (found is not None and found.presence is presence_mod.SymbolPresence.ABSENT
                 and symbol.function and not symbol.not_distributed
                 and api_package == (dependency.package or "")
@@ -380,8 +369,6 @@ class DependencyChain(ChainSupport):
                 lsp_audit = entry_audit
 
         if lsp_audit is not None and symbol.function and not lsp_audit.reopens:
-            # "No call from the project" closes nothing for a method the package hands to
-            # the framework: an event listener, a template filter, a handler.
             registered = unreached_mod.callback_registration(
                 symbol.function, self._resolver._source_for(
                     dependency.ecosystem or "", dependency.package or "",
@@ -396,8 +383,6 @@ class DependencyChain(ChainSupport):
 
         if (lsp_audit is not None and not lsp_audit.reopens
                 and not (bridge is not None and bridge.closes)):
-            # A direct dependency can be a framework's too: Twig is rendered by twig-bundle,
-            # symfony/yaml parsed by swagger-php. The project's own calls are not all calls.
             users = self._dependents(dependency.package or "")
             if users:
                 lsp_audit.invisible_path = True
@@ -433,11 +418,8 @@ class DependencyChain(ChainSupport):
                 problems.append(dataflow)
                 dataflow = None
         if isinstance(model_reached, codeql_reach.Reached) and not isinstance(dataflow, codeql_reach.Reached):
-            # A path CodeQL traced for a query the model chose is still CodeQL's path.
             dataflow = model_reached
         if dataflow is False and found is not None and self._roots:
-            # `ctx.BodyParser(&req)` reads the request itself: no input reaches its argument
-            # by construction, so "no path" is not an answer to close on.
             readers = request_readers.in_lines(self._roots[0], [(h.file, h.line) for h in found.hits])
             if readers:
                 problems.append(f"CodeQL не нашёл пути от ввода к вызову, но вызов сам читает запрос "
@@ -515,7 +497,6 @@ class DependencyChain(ChainSupport):
                 if closure_audit.detail and not closure_audit.reopens:
                     problems.append(closure_audit.detail)
 
-        # Which machinery the verdict actually rests on, for the report and the bench.
         if reachability is not None:
             route = "callgraph"
         elif api_answer is not None and api_answer.engine == "psalm":
@@ -532,8 +513,6 @@ class DependencyChain(ChainSupport):
             route = "unknown"
 
         entry_names: list[str] = []
-        # A transitive package is reached through its parent's call of a public
-        # entry; which entries reach the flaw is what the verdict is checked against.
         transitive = placement is not None and not getattr(placement, "direct", False)
         if symbol is not None and symbol.function and (transitive or (
                 matched_symbol and matched_symbol.rsplit("::", 1)[-1] != symbol.function)):

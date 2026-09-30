@@ -13,10 +13,8 @@ import yaml
 from ..config import REPO_ROOT
 
 PROMPTS_ROOT = REPO_ROOT / "prompts"
-# common.md goes to every request; <ecosystem>.md only when APPSEC_ECOSYSTEMS lists it.
 TRAINING_CONTEXT_PATH = PROMPTS_ROOT / "context"
 _COMMON_CONTEXT = "common"
-# Names APPSEC_ECOSYSTEMS accepts for the same ecosystem file.
 _ECOSYSTEM_FILE = {"golang": "go", "packagist": "composer", "python": "pypi", "java": "maven"}
 _FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
@@ -91,10 +89,6 @@ def all_training_context() -> str:
     return _context(context_ecosystems())
 
 
-# The report is read in Russian, so the model writes its prose in Russian. What
-# it must NOT translate is anything that is checked character by character: a
-# quote is verified verbatim against the input it came from, and a translated
-# quote fails that check and is thrown away along with the reasoning it carried.
 _ANSWER_LANGUAGE = """## Язык ответа
 
 Все объяснения, обоснования и выводы пиши по-русски.

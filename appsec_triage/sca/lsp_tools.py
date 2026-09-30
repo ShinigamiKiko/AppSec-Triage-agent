@@ -26,11 +26,7 @@ class Language:
     """
 
     suffixes: tuple[str, ...]
-    #: name, class -> the pattern that finds the declaration
     declaration: Callable[[str, str], re.Pattern[str]]
-    #: class -> the pattern that must also appear in the file, when the
-    #: language declares a method inside a named container. None when a
-    #: function stands on its own, as in Go and JavaScript.
     container: Callable[[str], re.Pattern[str]] | None = None
 
 
@@ -110,7 +106,6 @@ class LSPTools:
             return "языковые серверы в этом прогоне выключены"
         return f"языковой сервер {self.language} не запустился"
 
-    # ---- helpers -----------------------------------------------------------
 
     def _language_id(self) -> str:
         spec = self.lsp.cfg.servers.get(self.language) or {}
@@ -171,7 +166,6 @@ class LSPTools:
             return "код проекта"
         return "другая зависимость"
 
-    # ---- the three questions ----------------------------------------------
 
     def usages(self, klass: str, name: str) -> Usages:
         label = f"{klass}::{name}" if klass else name

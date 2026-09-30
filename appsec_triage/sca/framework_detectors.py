@@ -72,12 +72,10 @@ class NuxtDetector(FrameworkDetector):
                 except OSError:
                     continue
                 
-                # SSR mode check
                 if "ssr" in [t.lower() for t in tokens]:
                     dynamic = _dynamic_result(text, "ssr", name)
                     if dynamic:
                         return dynamic
-                    # Match: ssr: false, ssr:false, "ssr": false
                     ssr_false = re.search(r"""['"]?ssr['"]?\s*:\s*false""", text, re.IGNORECASE)
                     if ssr_false:
                         return DetectorResult(
@@ -95,9 +93,7 @@ class NuxtDetector(FrameworkDetector):
                             file=str(config_path.relative_to(root))
                         )
                 
-                # Component usage check (UForm, UAuthForm, etc.)
                 if any(t.startswith("U") and t[1:2].isupper() for t in tokens):
-                    # Search for component usage in .vue files
                     component_names = [t for t in tokens if t.startswith("U") and t[1:2].isupper()]
                     found = self._search_components(root, component_names)
                     if found:
@@ -114,12 +110,10 @@ class NuxtDetector(FrameworkDetector):
                         file="source tree"
                     )
                 
-                # SVGO configuration
                 if "removeScripts" in tokens or "svgo" in [t.lower() for t in tokens]:
                     dynamic = _dynamic_result(text, "svgo", name)
                     if dynamic:
                         return dynamic
-                    # Match: svgo: false, svgo: { ... }, svgoConfig
                     svgo_false = re.search(r"""['"]?svgo['"]?\s*:\s*false""", text, re.IGNORECASE)
                     if svgo_false:
                         return DetectorResult(
@@ -129,7 +123,6 @@ class NuxtDetector(FrameworkDetector):
                             file=str(config_path.relative_to(root))
                         )
                     
-                    # Check for removeScripts in svgo config block
                     svgo_config = re.search(
                         r"""svgo\s*:\s*\{([^}]+)\}""", text, re.IGNORECASE | re.DOTALL
                     )
@@ -143,7 +136,7 @@ class NuxtDetector(FrameworkDetector):
                                 file=str(config_path.relative_to(root))
                             )
         
-        return None  # Nuxt not detected
+        return None
     
     def _search_components(self, root: Path, component_names: list[str]) -> list[str]:
         """Search for component usage in .vue files."""
@@ -155,7 +148,7 @@ class NuxtDetector(FrameworkDetector):
         
         count = 0
         for vue_file in root.rglob("*.vue"):
-            if count >= 100:  # limit search
+            if count >= 100:
                 break
             if any(skip in vue_file.parts for skip in ("node_modules", ".nuxt", "dist")):
                 continue
@@ -190,9 +183,7 @@ class NextDetector(FrameworkDetector):
             except OSError:
                 continue
             
-            # SSR/SSG check
             if "ssr" in [t.lower() for t in tokens] or "ssg" in [t.lower() for t in tokens]:
-                # Next.js is SSR by default; check for output: 'export'
                 if re.search(r"""output\s*:\s*['"]export['"]""", text):
                     return DetectorResult(
                         "absent",
@@ -209,7 +200,6 @@ class SymfonyDetector(FrameworkDetector):
     
     def detect(self, roots: list[Path], tokens: list[str]) -> DetectorResult | None:
         for root in roots:
-            # Check config/packages/*.yaml
             config_dir = root / "config" / "packages"
             if not config_dir.is_dir():
                 continue
@@ -234,7 +224,6 @@ class SymfonyDetector(FrameworkDetector):
                                 reason=f"значение {token} задаётся окружением Symfony",
                                 file=str(yaml_file.relative_to(root)),
                             )
-                        # Check if it's set to true/false/enabled/disabled
                         pattern = re.compile(
                             rf"{re.escape(token)}\s*:\s*(true|false|enabled|disabled|yes|no)",
                             re.IGNORECASE
@@ -262,7 +251,6 @@ class LaravelDetector(FrameworkDetector):
             if not config_dir.is_dir():
                 continue
             
-            # Laravel stores config in config/*.php
             for php_file in config_dir.glob("*.php"):
                 try:
                     text = _clean_comments(php_file.read_text(encoding="utf-8", errors="replace"))
@@ -270,7 +258,6 @@ class LaravelDetector(FrameworkDetector):
                     continue
                 
                 for token in tokens:
-                    # Match: 'key' => true, "key" => false, etc.
                     pattern = re.compile(
                         rf"""['"]{re.escape(token)}['"]\s*=>\s*(true|false|env\s*\()""",
                         re.IGNORECASE
@@ -300,12 +287,11 @@ class GoDetector(FrameworkDetector):
     
     def detect(self, roots: list[Path], tokens: list[str]) -> DetectorResult | None:
         for root in roots:
-            # Search main.go, cmd/*/main.go, and config files
             candidates = list(root.glob("main.go"))
             candidates.extend(root.glob("cmd/*/main.go"))
             candidates.extend(root.glob("**/*.go"))
             
-            for go_file in candidates[:50]:  # limit search
+            for go_file in candidates[:50]:
                 if any(skip in go_file.parts for skip in ("vendor", "testdata")):
                     continue
                 
@@ -315,7 +301,6 @@ class GoDetector(FrameworkDetector):
                     continue
                 
                 for token in tokens:
-                    # Look for: token := true, token = false, token: true
                     assignments = re.findall(
                         rf"\b{re.escape(token)}\s*[:=]+\s*(?:true|false|[A-Za-z_]\w*)",
                         text, re.IGNORECASE,
@@ -352,7 +337,6 @@ class GoDetector(FrameworkDetector):
         return None
 
 
-# Registry of all detectors
 _DETECTORS: list[FrameworkDetector] = [
     NuxtDetector(),
     NextDetector(),

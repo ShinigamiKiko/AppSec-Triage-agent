@@ -62,18 +62,10 @@ class Location:
         return f"{self.file_path}:{self.line}  |  {self.text}".rstrip()
 
 
-# Searches over the whole workspace are slow by nature on a large project — phpactor
-# looks for references file by file — so they get a longer wait, and running out of it
-# says nothing about the server being gone.
 _SEARCHES = frozenset({"textDocument/references", "textDocument/implementation", "workspace/symbol",
                        "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"})
 _MAX_OVERDUE = 64
-# Stopping the server: its `shutdown`, `exit` and the wait for the process, each bounded,
-# so the end of a run never hangs on a server that stopped listening.
 _STOP_S = 5.0
-# A generated or vendored giant (a 1.5 MB PHP file on api-develop) keeps a PHP server
-# parsing for minutes, silent to every other request. Such a file is not sent; text
-# search still reads it.
 MAX_OPEN_BYTES = 256 * 1024
 
 
@@ -98,23 +90,12 @@ class LSPClient:
     started: bool = field(default=False, init=False)
     error: str | None = field(default=None, init=False)
     capabilities: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    # Health guard: a server that times out again and again, or answers slowly, is
-    # paused and then switched off for the run instead of costing every finding its full
-    # timeout on every question.
     max_consecutive_timeouts: int = 3
     slow_median_s: float = 5.0
     disabled: str | None = field(default=None, init=False)
     _timeouts_in_row: int = field(default=0, init=False, repr=False)
-    # Requests given up on: an answer to one of them arriving later shows the server was
-    # busy, not gone. One slow search used to time out the requests queued behind it,
-    # and three of those in a row switched a working server off for the whole run.
     _overdue: set[int] = field(default_factory=set, init=False, repr=False)
-    # When the server last said anything — an answer, a late answer, a progress note. A
-    # busy server keeps talking or answers late; a hung one goes quiet.
     _last_heard: float = field(default_factory=time.monotonic, init=False, repr=False)
-    # A silent server is paused, then asked again: phpactor searching references for a
-    # name like `parse` over thousands of files says nothing for minutes, and comes back.
-    # Off for the rest of the run only after the pauses ran out.
     cooldown_s: float = 120.0
     max_pauses: int = 2
     _paused_until: float = field(default=0.0, init=False, repr=False)
@@ -122,13 +103,8 @@ class LSPClient:
     _latencies: list[float] = field(default_factory=list, init=False, repr=False)
     _slow_reported: bool = field(default=False, init=False, repr=False)
     _inbox: Any = field(default=None, init=False, repr=False)
-    # The server's input, non-blocking. A busy server stops reading it; a blocking write
-    # into the full pipe held the client's lock — and every finding's request behind it —
-    # with no timeout to end it. Now a write has a deadline like everything else.
     write_timeout_s: float = 10.0
     _fd: int | None = field(default=None, init=False, repr=False)
-    # A connection given up on: part of a message went out, so the stream is corrupt. The
-    # server is killed and started again by the next request, a few times per run.
     max_restarts: int = 2
     _broken: str | None = field(default=None, init=False, repr=False)
     _restarts: int = field(default=0, init=False, repr=False)
@@ -147,7 +123,7 @@ class LSPClient:
             raise LSPError(self._broken or "server is not running")
         body = json.dumps(payload).encode("utf-8")
         frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
-        if self._fd is None:              # no non-blocking pipe here: a test double, or not POSIX
+        if self._fd is None:
             proc.stdin.write(frame)
             proc.stdin.flush()
             return
@@ -211,7 +187,7 @@ class LSPClient:
         if not self._broken:
             return True
         if not self._restart_lock.acquire(blocking=False):
-            return False                          # being started already
+            return False
         if self._restarts >= self.max_restarts:
             if not self.disabled:
                 self.disabled, self._paused_until = self._broken, 0.0
@@ -291,8 +267,6 @@ class LSPClient:
             return
         if not answered:
             self._timeouts_in_row += 1
-            # Timeouts alone do not mean a dead server: behind one long search, every
-            # request queued there times out too. Off only when it has also gone quiet.
             silent = time.monotonic() - self._last_heard
             if (self._timeouts_in_row >= self.max_consecutive_timeouts and silent >= self.search_timeout_s
                     and not self.disabled):
@@ -343,7 +317,7 @@ class LSPClient:
         try:
             timing.add("lsp-wait", time.monotonic() - queued)
             if method not in ("initialize", "shutdown") and (self._broken or self.disabled):
-                return None                       # paused or dropped while this one waited
+                return None
             self._next_id += 1
             request_id = self._next_id
             started = time.monotonic()
@@ -362,7 +336,7 @@ class LSPClient:
                         return None
                     if "method" not in message and message.get("id") in self._overdue:
                         self._overdue.discard(message.get("id"))
-                        self._timeouts_in_row = 0          # late, but alive
+                        self._timeouts_in_row = 0
                         continue
                     if message.get("id") == request_id and "method" not in message:
                         if track:
@@ -532,8 +506,6 @@ class LSPClient:
             text = Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return False
-        # Not sent while paused or restarting: then it is not marked open, and goes out
-        # the next time the file is asked about.
         if not self._notify(
             "textDocument/didOpen",
             {"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}},

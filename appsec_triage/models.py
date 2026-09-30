@@ -52,9 +52,7 @@ class DependencyInfo(BaseModel):
     advisory_url: str | None = None
     dev_only: bool | None = None
     imported: bool | None = None
-    # runtime | image_only | build_only | unknown, from the shipping check (sca/shipping.py).
     shipped: str | None = None
-    # browser | node | both | unknown — where the code that loads the package runs.
     runtime: str | None = None
     reachability: str | None = None
     call_site: str | None = None
@@ -157,8 +155,6 @@ class EvidencePackage(BaseModel):
     repository_code_collected: bool = False
     repository_bytes_read: int = 0
     code_questions: list[str] = Field(default_factory=list)
-    # Searches and language-server lookups the walk made, with their answers verbatim —
-    # a "no match" among them. Shown to the verdict, so an absence can be quoted.
     code_facts: list[str] = Field(default_factory=list)
 
     def quotable_text(self) -> str:
@@ -283,19 +279,13 @@ class SCASummary(BaseModel):
     route: str = ""
     codeql_calls: list[str] = Field(default_factory=list)
     problems: list[str] = Field(default_factory=list)
-    # runtime | image_only | build_only | unknown — does the running application load it.
     shipped: str = ""
-    # browser | node | both | unknown — where the code that loads it runs.
     runtime: str = ""
     loaded_via: list[str] = Field(default_factory=list)
-    # import | codeql | lsp | name — how a call site was attributed to the package.
     call_evidence: str = ""
     severity: str = ""
-    # critical | high | medium | low | none — how urgent the fix is, separate from the verdict.
     priority: str = ""
-    # Which rule of sca/policy.py decided it.
     policy: str = ""
-    # What the policy could not settle and handed to the model.
     open_question: str = ""
 
 
@@ -333,5 +323,4 @@ class TriageRecord(BaseModel):
     reused: bool = False
     sca: SCASummary | None = None
     code_questions: list[str] = Field(default_factory=list)
-    # Seconds per stage (chain, walk, verdict, retrieval, challenge, total) — where the time went.
     timings: dict[str, float] = Field(default_factory=dict)

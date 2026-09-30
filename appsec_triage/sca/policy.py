@@ -42,16 +42,9 @@ from .verdict import CVEVerdict
 
 PRIORITIES = ("critical", "high", "medium", "low", "none")
 
-# Outcomes the model is asked about; everything else is decided here.
 _NEEDS_MODEL = {CVEVerdict.PRESENT_UNPROVEN, CVEVerdict.CALL_UNCONFIRMED, CVEVerdict.MENTIONED_ONLY,
                 CVEVerdict.UNDECIDED, CVEVerdict.INFRASTRUCTURE}
 
-# The package itself is hostile: it runs on every machine that installs it, input or not.
-# "malicious" alone is not enough — advisories say "a malicious user could…" about ReDoS.
-# Phrased the way such advisories are: "Malicious code in X", "contains malicious code",
-# "the maintainer account was compromised". "Crafted malicious code" is input, not this.
-# Nor is "a supply chain attack": advisories list it as one way to plant the input of an
-# ordinary flaw (PHPUnit: "a supply chain attack inserting malicious files").
 _SUPPLY_CHAIN = re.compile(
     r"\bmalicious (?:code|package|version|release|payload) in\b|"
     r"\b(?:contains?|contained|embedded|ships?|shipped|injected)\s+(?:\w+\s+)?malicious (?:code|payload)|"
@@ -60,15 +53,9 @@ _SUPPLY_CHAIN = re.compile(
     r"(?:package|account|maintainer|version|release|token)s? (?:was|were|has been|had been) compromised",
     re.IGNORECASE)
 _SUPPLY_CHAIN_CWES = {"CWE-506", "CWE-912"}
-# A flaw that runs code, but only on input crafted for it: a build is exposed only if
-# it processes input it did not write (pull requests from forks, uploaded sources).
 _CODE_EXECUTION = re.compile(
     r"arbitrary code execution|remote code execution|code injection|command injection", re.IGNORECASE)
 _CODE_EXECUTION_CWES = {"CWE-94", "CWE-78", "CWE-77", "CWE-829"}
-# An exploit that needs another flaw first: a prototype-pollution gadget reads a polluted
-# Object.prototype, a DOM-clobbering gadget reads injected markup. A deserialization
-# "gadget chain" is the opposite — the flaw itself, not a precondition — so a bare
-# "gadget" counts only next to prototype pollution or DOM clobbering.
 _GADGET = re.compile(r"(?:pollution|dom[- ]clobbering|script)\s+gadgets?\b", re.IGNORECASE)
 _GADGET_WORD = re.compile(r"\bgadgets?\b", re.IGNORECASE)
 _OTHER_FLAW = re.compile(
@@ -87,7 +74,7 @@ _NEEDS_POLLUTION = re.compile(
 
 @dataclass(slots=True)
 class DependencyPolicy:
-    label: str = ""                 # confirmed | false_positive | unknown | "" (the model decides)
+    label: str = ""
     priority: str = "medium"
     needs_person: bool = False
     reason: str = ""
@@ -95,8 +82,6 @@ class DependencyPolicy:
 
     @property
     def needs_model(self) -> bool:
-        # `unknown` is a question the checks could not settle, not an answer: the model
-        # gets it with the code in front of it, and its confidence decides who looks next.
         return self.label in ("", "unknown")
 
 
@@ -192,7 +177,7 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
             f"Если такая уязвимость найдётся в проекте, находка возвращается; {fix}",
             "needs_other_vuln")
 
-    if installed_symbol_absent:
+    if installed_symbol_absent and outcome is not CVEVerdict.NOT_REACHED:
         return DependencyPolicy(
             "unknown", "medium", True,
             "функция из advisory отсутствует в установленной версии; вызов другого API не доказывает "
@@ -216,9 +201,6 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
             "build_only")
 
     if parent_calls is False and severity in ("critical", "high"):
-        # A name search over the parent misses what a framework wires by itself (a
-        # middleware Guzzle adds, a runtime jmespath picks): for a severe advisory it is a
-        # lead for the model, not a closure.
         return DependencyPolicy(
             "unknown", _lift("medium", severity), True,
             f"проверенный родитель{via_text} не вызывает уязвимую функцию по имени, но для "
@@ -246,8 +228,6 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
             "external_condition")
 
     if outcome is CVEVerdict.ACTUAL:
-        # "Актуальна" by a call alone — the chain's rule for flaws that need no input.
-        # With no traced path and an outside condition that is a lead, not a proof.
         return DependencyPolicy("", "high" if severity in ("critical", "high") else "medium", False, "",
                                 "model_called")
 
@@ -263,7 +243,6 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
     if outcome in _NEEDS_MODEL or outcome is None:
         return DependencyPolicy("", _lift("medium", severity), False, "", "model")
 
-    # Every other outcome closes on a checked fact (see CVEDecision.closes).
     return DependencyPolicy("false_positive", "none", False, "", "closed")
 
 

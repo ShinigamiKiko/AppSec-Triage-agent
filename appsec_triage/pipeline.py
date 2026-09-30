@@ -79,12 +79,6 @@ _CONTEXT_REQUEST_SCHEMA = {
 }
 
 
-
-
-
-
-
-
 _GOVULNCHECK_GATE_SYSTEM = """The scanner supplied a positioned source-to-sink govulncheck trace.
 Treat that trace as authoritative confirmation by default. You may return false_positive
 ONLY if the supplied repository/package evidence contains a concrete contradiction, such
@@ -208,8 +202,6 @@ class TriagePipeline:
                 from .config import ConfigError, load_scanner_config
                 from .scanners.tools import PsalmScanner
 
-                # The binary that answers `--version`, not the first `psalm` on PATH: a
-                # project's own Psalm there can be broken, or too old for our stub.
                 psalm = PsalmScanner(load_scanner_config("psalm"))
                 if psalm.available().usable:
                     psalm_binary = psalm.resolve_binary("psalm")
@@ -245,8 +237,6 @@ class TriagePipeline:
         """One finding, with the seconds each stage took written into the record."""
         timings: dict[str, float] = {}
         started = time.monotonic()
-        # Model, language server, Psalm and the wait for Psalm are added up from wherever
-        # they run: "chain 900s" alone does not say which of them held a finding up.
         with timing.collecting(timings):
             record = self._triage_one(finding, timings)
         timings["total"] = round(time.monotonic() - started, 1)
@@ -339,10 +329,6 @@ class TriagePipeline:
         chain = None
         dep_policy = None
         if self.dep_chain is not None and finding.dependency and not authoritative_gov:
-            # The scanner's title may not name the component ("Misuse of
-            # ServerConfig.PublicKeyCallback" never says SSH); the advisory does. It is
-            # already fetched and cached by the batch pass, so the deployment boundary
-            # is checked against it before the chain spends a single model call.
             try:
                 advisory = self.dep_chain._advisory_for(finding, finding.dependency)
             except Exception:  # noqa: BLE001 - a lookup failure only skips this check
@@ -428,13 +414,10 @@ class TriagePipeline:
         repaired = False
         responses = []
         if self._walk.ready():
-            # The walk only adds evidence; a failure leaves the package as it was.
             stage = time.monotonic()
             walk_key = _walk_key(finding)
             cached = self._walk_cache.get(walk_key) if walk_key else None
             if cached is not None:
-                # Same package, same version: what the walk found in the project's code for
-                # one advisory is what it would find for the next one.
                 blocks, questions, facts = cached
                 pkg.evidence_blocks.extend(b for b in blocks if b not in pkg.evidence_blocks)
                 pkg.code_questions.extend(q for q in questions if q not in pkg.code_questions)
@@ -497,10 +480,6 @@ class TriagePipeline:
         stage = time.monotonic()
         asked: set[str] = set()
         for _ in range(max(0, min(self.cfg.context_retrieval_rounds, 3))):
-            # Only a verdict the model could not reach, or a question whose answer would change
-            # it, is worth another walk. `missing_information` is a note for the reviewer: the
-            # SCA prompt tells the model to put unresolved conditions there, so treating it as a
-            # trigger ran every finding through the maximum number of rounds.
             question = (raw_verdict.blocking_question or "").strip()
             if self.repository_evidence is None or not (
                 raw_verdict.verdict is VerdictLabel.unknown or question
@@ -514,7 +493,6 @@ class TriagePipeline:
                 pkg.context_notes.append("Additional context retrieval stopped: provider budget exhausted.")
                 break
             try:
-                # The brief, not the whole package: see `_walk_brief`.
                 question = codewalk.brief(finding, base.get("sca")) + "\n\nUnresolved questions:\n" + json.dumps({
                     "missing_information": raw_verdict.missing_information,
                     "blocking_question": raw_verdict.blocking_question,
@@ -582,9 +560,6 @@ class TriagePipeline:
             )
             objection = " ".join(x for x in (result.counterargument, result.why) if x).strip()
             if not result.survives and not result.error and objection and self._walk.ready():
-                # An objection is a question about the code ("the evidence does not show
-                # that X reaches Y"). The code can answer it: walk for exactly that, then
-                # let the reviewer look again at what came back.
                 try:
                     question = (f"{codewalk.brief(finding, base.get('sca'))}\n\n"
                                 f"A reviewer objects to the verdict `{verdict.verdict.value}`:\n"
@@ -636,7 +611,6 @@ class TriagePipeline:
         )
 
 
-
     def _dependency_policy(self, finding: Finding, chain):
         from .sca import policy as policy_mod
         from .sca.verdict import CVEVerdict
@@ -652,8 +626,6 @@ class TriagePipeline:
             outcome = None
         named_function = getattr(chain.symbol, "function", "") if chain.symbol is not None else ""
         matched_function = (chain.matched_symbol or "").rsplit("::", 1)[-1]
-        # A call of the vulnerable function itself, or of a public entry of its package
-        # that reaches it inside the package (Yaml::parse over parseBlock).
         call_bound_to_flaw = bool(named_function and (
             named_function == matched_function
             or matched_function in (getattr(chain, "entry_points", None) or ())))
@@ -667,7 +639,6 @@ class TriagePipeline:
             build_risk=policy_mod.is_build_risk(
                 advisory,
                 untrusted_build_input=getattr(getattr(self, "cfg", None), "build_untrusted_input", False)),
-            # A call graph establishes reachability, but not attacker-controlled input.
             proven=bool(call_bound_to_flaw and chain.dataflow is not None),
             parent_calls=(chain.bridge.calls_it if chain.bridge is not None else None),
             bridge_present=chain.bridge is not None,
@@ -765,8 +736,6 @@ class TriagePipeline:
                     if fid not in warned:
                         warned.add(fid)
                         log.warning("finding %s still running after %.0f s", fid, elapsed)
-                # Nothing finished for that long: once per stall, what every thread is
-                # doing — a run that sat silent for an hour left nothing to go on.
                 if idle > limit and dumped != since:
                     dumped = since
                     log.warning("no finding finished for %.0f s; the threads now:\n%s", idle, _thread_stacks())
@@ -780,8 +749,6 @@ class TriagePipeline:
             for done, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
                 if getattr(self.client, "fatal_error", None) is not None:
-                    # A rejected key fails every later call the same way: stop here
-                    # rather than journal the rest of the run as errors.
                     for pending in futures:
                         pending.cancel()
                     finished.set()
@@ -799,10 +766,6 @@ class TriagePipeline:
                 if progress:
                     progress(done, len(items))
         except KeyboardInterrupt:
-            # Ctrl+C: the findings not started are dropped and the ones under way are not
-            # waited for. Waiting meant minutes of Psalm and of model calls on a client
-            # already closed, in a container that outlived the Ctrl+C and competed with
-            # the next run for memory. What was decided is in the journal already.
             finished.set()
             pool.shutdown(wait=False, cancel_futures=True)
             raise
@@ -849,7 +812,6 @@ def _with_advisory_severity(finding: Finding, chain) -> Finding:
         return finding.model_copy(update={"severity": Severity(level)})
     except ValueError:
         return finding
-
 
 
 def _deployment_closed(base: dict, finding: Finding, reason: str) -> TriageRecord:

@@ -91,11 +91,6 @@ if yaml is not None:  # pragma: no branch - trivial
     _SymfonyLoader.add_multi_constructor("!", _ignore_tag)
 
 
-# Symfony reads an unquoted value inside `{ ... }` or `[ ... ]` up to the next `,` or
-# closing bracket, so `{ path: ^/v2/x/([a-z\d]+), roles: ROLE_USER }` is fine to it.
-# YAML proper ends the value at the `[`, and PyYAML rejects the whole file — over an
-# access_control regex, a common line of security.yaml. The line PyYAML stops at is
-# rewritten the way Symfony reads it (as JSON, which is YAML too) and read again.
 _FLOW_START = re.compile(r"""^(\s*(?:-\s+)*(?:[^\s#'"{\[][^#]*?:\s+)?)[\[{]""")
 MAX_REWRITES = 50
 

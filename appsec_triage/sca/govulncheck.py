@@ -31,8 +31,6 @@ class Reach(str, Enum):
 
 
 _STRENGTH = {Reach.CALLED: 3, Reach.IMPORTED: 2, Reach.MODULE_ONLY: 1}
-# Paths kept per advisory. One reached through an S3 client and one through an HTTP
-# handler are different questions; keeping only the first hid the one that mattered.
 _MAX_PATHS = 4
 
 
@@ -44,7 +42,6 @@ class Verdict:
     reach: Reach
     trace: list[str] = field(default_factory=list)
     sites: list[tuple[str, int]] = field(default_factory=list)
-    # Every distinct call path, `trace` first, with where each enters the project.
     paths: list[list[str]] = field(default_factory=list)
     entries: list[str] = field(default_factory=list)
 
@@ -180,7 +177,6 @@ def load(path: Path | str) -> Report:
                   and len(previous.paths) < _MAX_PATHS):
                 previous.paths.append(frames)
                 previous.entries.append(entry)
-                # Entry points first, one per path: whoever reads a few sites reads every way in.
                 if positions and positions[0] not in previous.sites:
                     previous.sites.insert(len(previous.paths) - 1, positions[0])
                 previous.sites.extend(p for p in positions if p not in previous.sites)
@@ -229,8 +225,6 @@ def run(root: Path, out_file: Path, *, binary: str = "govulncheck",
         except OSError:
             match = None
         main = match.group(1) if match else ""
-        # The standard library as the project builds it; the image's Go when that
-        # release cannot be fetched — said, not silent.
         toolchain = gotoolchain.env_for(root, module)
         messages, problem = _one_module(binary, module, timeout_s, toolchain)
         if problem and toolchain:
@@ -244,8 +238,6 @@ def run(root: Path, out_file: Path, *, binary: str = "govulncheck",
             finding = message.get("finding")
             if finding:
                 findings += 1
-                # The module's own files, from the module root to the repository root;
-                # frames in dependencies keep their paths — they are not in the tree.
                 for frame in finding.get("trace") or []:
                     position = frame.get("position") or {}
                     name = position.get("filename")

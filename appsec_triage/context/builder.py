@@ -244,10 +244,6 @@ def _enrich_dependency(dep, index, roots, signals):
         imported = is_imported(dep.package, dep.ecosystem, list(roots))
 
     if dev_only:
-        # Declared for development — which is not the same as "does not ship": a bundler
-        # compiles imported devDependencies into the build, and an image built without
-        # `--production` carries all of them. The shipping check in the dependency chain
-        # replaces this signal with the answer; until then it only says what the manifest says.
         signals.append(
             HeuristicSignal(
                 name="declared_dev_dependency",

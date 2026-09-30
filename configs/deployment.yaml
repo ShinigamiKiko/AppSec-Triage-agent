@@ -1,58 +1,22 @@
-# Где это приложение работает. Влияет на приоритет и на несколько проверок,
-# которые платформа берёт на себя, — но НИКОГДА не даёт права закрыть находку
-# про поток данных. Инъекция остаётся инъекцией и за ингрессом.
-#
-# Заполняется по факту, а не по намерению: неверное «мы не смотрим в интернет»
-# тише и дороже, чем лишняя позиция в очереди. Пустой файл — нормальное
-# состояние, тогда секция просто не добавляется в промпт.
-
 enabled: true
 
-# Свободное описание — идёт в промпт как есть. Пишите то, что проверяемо.
 description: >-
   Приложение работает в Kubernetes. Внешний трафик приходит только через
   ingress-контроллер, TLS терминируется на нём. Между сервисами — internal
   cluster network.
 
-# Факты, на которые модели разрешено ссылаться. Каждый — либо true, либо
-# отсутствует; «не знаю» выражается отсутствием ключа, а не false.
 facts:
-  # TLS терминируется на ингрессе, приложение слушает plaintext внутри кластера.
   tls_terminated_at_ingress: true
-  # Наружу торчит только то, для чего заведён Ingress/Route.
   internet_exposure_via_ingress_only: true
-  # Проверки живости делает kubelet, а не Dockerfile.
   liveness_probes_by_platform: true
-  # Пользователь контейнера задан в podSecurityContext, а не в образе.
-  # Ставьте true, только если это действительно так во всех манифестах.
   run_as_non_root_by_platform: false
-  # Секреты подставляются из Secret/Vault на деплое и перекрывают значения из
-  # закоммиченных .env. ВНИМАНИЕ: это не делает закоммиченный ключ безопасным —
-  # он всё равно утёк, — но объясняет, почему значение в файле не боевое.
   secrets_injected_at_deploy: false
-  # SSH в подах не используется ни в какой роли — ни сервер, ни клиент: доступ к
-  # контейнеру только через kubectl exec. Решение владельца платформы: SSH внутри
-  # сервиса — антипаттерн, SSH-уязвимости к сервисам не относятся.
   no_ssh_in_workloads: true
-  # Host kernel, firmware, hypervisor and node/container runtime are owned by
-  # the platform. These components are attached to the machine, not the pod.
   host_platform_owned: true
-  # Workloads do not own desktop devices or host peripherals.
   no_gui_or_hardware_in_workloads: true
-  # Фреймворки, на которых не написан ни один сервис. Ставьте true только за те,
-  # в которых уверены: факт здесь закрывает находки. Соответствующая запись в
-  # out_of_scope_components несёт markers — если фреймворк всё-таки окажется в
-  # коде или образе, закрытие останется, но в отчёт уйдёт пометка с файлом и
-  # строкой, и станет видно, что факт устарел.
   no_laravel_in_projects: true
   no_react_in_projects: true
 
-# Компоненты, которых в сервисах платформы нет по решению её владельца. CVE,
-# эксплуатируемая ТОЛЬКО через такой компонент, закрывается сразу — до поиска в
-# коде и до CodeQL. Каждая запись называет факт выше; без факта запись не действует.
-#   keywords — дешёвый фильтр: модель спрашивается, только если слово есть в advisory.
-#   markers  — признаки, что компонент всё же есть в коде или образе: закрытие
-#              остаётся, но в отчёт уходит пометка об антипаттерне с файлом и строкой.
 out_of_scope_components:
   - id: ssh
     requires: no_ssh_in_workloads
@@ -99,11 +63,6 @@ out_of_scope_components:
     keywords: [react, "react-dom", "react-native", jsx, preact]
     markers: ["\"react\":", "from 'react'", "from \"react\"", "react-dom", "ReactDOM", ".jsx", ".tsx"]
     why: "ни один сервис не рендерит React; уязвимость только в React к этим сервисам не относится"
-  # Добавляя фреймворк сюда, добавьте и факт выше — без факта запись неактивна.
-  # Шаблон: id, requires, describe (что именно считается этим фреймворком и что
-  # НЕ считается), keywords (дешёвый префильтр по тексту advisory), markers
-  # (признаки, что он всё же есть), why. Кандидаты, если они у вас не в ходу:
-  # angular, vue, nuxt, next, django, flask, rails, wordpress, drupal, magento.
   - id: gui_or_hardware
     requires: no_gui_or_hardware_in_workloads
     owner: platform-security
@@ -115,10 +74,7 @@ out_of_scope_components:
     markers: [DISPLAY, WAYLAND_DISPLAY, /dev/video, /dev/snd, /dev/dri]
     why: "в pod нет desktop GUI и физических устройств; это не runtime приложения"
 
-# Правила сканеров, которые платформа закрывает по существу. Только те, где
-# проверка буквально не о приложении. Каждая запись обязана назвать факт выше,
-# на котором она держится, — иначе это просто список исключений.
 platform_handles:
-  - rule: "DS-0026"          # No HEALTHCHECK defined
+  - rule: "DS-0026"
     requires: liveness_probes_by_platform
     why: "живость контейнера проверяет kubelet через livenessProbe, HEALTHCHECK в образе не используется"

@@ -1,63 +1,21 @@
-# Dependency triage in GitLab CI — without the agent's Docker image.
-#
-# The agent installs nothing and downloads no package sources: it reads a
-# dependency's own code from the installed tree, so the job installs them first.
-# Psalm proves calls and input paths into a vulnerable PHP method only when
-# vendor/autoload.php exists; gopls and the TypeScript server resolve types
-# inside a dependency only when its directory is on disk. Without them the
-# analysis still runs, with a text search instead.
-#
-# Variables in Settings → CI/CD → Variables (masked):
-#   DEEPSEEK_API_KEY   provider key
-#   COMPOSER_AUTH      JSON for private Composer repositories, if any
-#
-# The runner needs the agent's tools on PATH: python3 with the agent installed,
-# php, composer, psalm, codeql, cdxgen, wolfee.
-
 appsec-triage:
   stage: test
-  # The agent reads a dependency's own code from the installed tree and never
-  # downloads it, so these directories must be there. Restoring them from the
-  # cache is what keeps the job short.
   cache:
     key:
       files: [composer.lock, package-lock.json, go.sum]
     paths: [vendor/, node_modules/, .go/pkg/mod/]
   variables:
-    # REQUIRED: which ecosystems this project has. Unset or unknown stops the
-    # run with exit 2. Dependency findings are triaged only for what
-    # scope.only_ecosystems in configs/pipeline.yaml allows.
     APPSEC_ECOSYSTEMS: "composer"
-    # GitLab caches only paths under the project directory.
     GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
-    # Composer's audit refuses advisories on purpose-installed vulnerable versions.
     COMPOSER_NO_AUDIT: "1"
-    # Go modules through the internal proxy; govulncheck, CodeQL and gopls inherit
-    # these from the job. Private modules also need a netrc for git.rabota.space.
-    # GOPROXY: "https://nexus.example/repository/go-proxy/"
-    # GOPRIVATE: "git.example"
-    # npm/yarn read the registry from the project's .npmrc/.yarnrc; a token for it
-    # goes into a masked variable the .npmrc references (e.g. NPM_TOKEN).
   before_script:
-    # The project's own build, whatever it needs before composer can resolve.
     - ./build.sh
-    # Vulnerable versions must install: they are what is being analysed.
-    # The job installs, through the registries it has access to (satis, Nexus, the
-    # project's own .npmrc/.yarnrc, GOPROXY): the agent installs nothing itself.
-    # Install only what the cache did not bring; the key is the lock files, so a
-    # restored tree always matches them. No `|| true` here on purpose: a failed
-    # install must stop the job, not leave the agent reading a half-built tree.
-    # Composer without dev: a project's own Psalm or phpstan in vendor/ replaces
-    # the agent's Psalm classes through the autoloader, and dev tools never ship.
-    # npm and Go keep dev dependencies — a package pruned from the tree cannot be
-    # read, and the chain stops at it.
     - if [ -f composer.lock ] && [ ! -d vendor ]; then composer install --no-dev --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist; fi
     - if [ -f package-lock.json ] && [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
     - if [ -f yarn.lock ] && [ ! -d node_modules ]; then yarn install --frozen-lockfile; fi
     - if [ -f go.sum ] && [ ! -d "$GOMODCACHE/cache/download" ]; then go mod download; fi
   script:
     - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o "$CI_PROJECT_DIR/appsec-out" --fail-on confirmed
-  # 0 — clean, 1 — --fail-on triggered, 2 — a required language server did not start.
   artifacts:
     when: always
     paths: [appsec-out/]

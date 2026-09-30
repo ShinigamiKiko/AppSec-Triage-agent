@@ -22,15 +22,10 @@ _SKIP_DIRS = {".git", "vendor", "node_modules", "venv", ".venv", "target",
               "build", "dist", "__pycache__"}
 _MAX_FILES = 8000
 _MAX_BYTES = 600_000
-# Inventories list every package and word a scanner met; they configure nothing, so a
-# condition "found" in one is found nowhere.
 _GENERATED_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
                     "composer.lock", "go.sum", "poetry.lock", "pipfile.lock", "cargo.lock",
                     "packages.lock.json", "bom.json", "sbom.json"}
 _GENERATED_SUFFIXES = (".cdx.json", ".spdx.json", ".slices.json", ".sbom.json")
-# A line that only comments on the code does not switch anything on. Docblock lines are
-# not skipped — annotations there (`@Route(requirements=...)`) are configuration — and
-# neither are PHP attributes, `#[...]`.
 _COMMENT_LINE = re.compile(r"^\s*(?:#(?!\[)|;|//|<!--|\{#)")
 _HITS_PER_PART = 3
 
@@ -80,7 +75,6 @@ class Condition:
                 f"    что искать: {', '.join(self.tokens[:6]) or 'не определено'}\n"
                 f"    где смотреть: {self.where or 'конфигурация окружения и деплой'}\n"
                 f"    почему нельзя решить здесь: {self.reason}")
-
 
 
 _DEPLOY_SCHEMA = {
@@ -135,8 +129,6 @@ def check_against_deployment(condition: Condition, deployment, client) -> Condit
     return condition
 
 
-# The files a condition is looked for in, listed once per root and file types: every
-# condition of every finding walked the whole tree, vendor/ with it, again.
 _FILE_LISTS: dict[tuple[str, frozenset], list[Path]] = {}
 _FILE_LISTS_LOCK = threading.Lock()
 
@@ -170,8 +162,6 @@ def _list_files(root: Path, suffixes: set[str]):
         if (_SKIP_DIRS.intersection(path.parts)
                 or any(part.lower().startswith("appsec-out") for part in path.parts)):
             continue
-        # A condition met only in tests or in a local compose file is not met in
-        # production: `--host` in docker-compose is a developer's `yarn dev`.
         if is_test(path.relative_to(root).as_posix()):
             continue
         name = path.name.lower()

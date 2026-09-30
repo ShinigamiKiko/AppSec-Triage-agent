@@ -35,23 +35,15 @@ class ChainResult:
     audit: str = ""
     closure_kind: str = ""
     audited: bool = False
-    # excluded | callgraph | codeql | text | package | condition | unknown
     route: str = ""
     codeql_calls: list[str] = field(default_factory=list)
     owner: str = ""
-    # What the advisory says the flaw is, in its own words. Without it a report
-    # can name the vulnerable function but not say what is wrong with it.
     flaw: str = ""
     flaw_ru: str = ""
-    # Public functions of the vulnerable package that reach the vulnerable one inside
-    # it. A call of one of them is a call of the flaw (`Yaml::parse` over `parseBlock`).
     entry_points: list[str] = field(default_factory=list)
-    # Whether the package reaches the running application at all (sca/shipping.py).
     shipping: object = None
-    # The merged advisory, for its severity and its text.
     advisory: object = None
     version_known: bool = True
-    # How a call was attributed: "import" (bound receiver), "name" (name only), "codeql", "lsp", "".
     call_evidence: str = ""
 
     @property

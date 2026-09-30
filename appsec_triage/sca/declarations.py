@@ -57,8 +57,6 @@ _JS_OWNER = re.compile(r"^[ \t]*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$]
 _JS_KEYWORD = {"if", "for", "while", "switch", "catch", "return", "do", "else", "function"}
 _JS_NAME = r"[A-Za-z_$][\w$]*"
 _JS_CJS_DEFAULT = re.compile(r"\bmodule\s*\.\s*exports\s*=\s*")
-# A module whose export is a function with no name of its own: `module.exports =
-# function (str, opts) {` in qs's parse.js, `export default function () {`.
 _JS_ANON_EXPORT = re.compile(
     r"(?:\bmodule\s*\.\s*exports\s*=|^[ \t]*export\s+default)\s*(?:async\s+)?"
     r"(?:function\s*\*?\s*\(|\([^)]*\)\s*=>)", re.MULTILINE)
@@ -106,8 +104,6 @@ def _js(text: str) -> list[Declaration]:
     for match in _JS_CJS_DEFAULT.finditer(text):
         rhs = text[match.end():]
         if rhs.startswith("{"):
-            # CommonJS shorthand and aliases: { a, publicName: b }.
-            # An incomplete or nested expression is left unclassified.
             body = rhs[1:rhs.find("}")] if "}" in rhs else ""
             for part in body.split(","):
                 item = re.fullmatch(rf"\s*(?:{_JS_NAME}\s*:\s*)?({_JS_NAME})\s*", part)

@@ -160,8 +160,6 @@ def qualify_npm_names(findings, document) -> int:
         if not name:
             continue
         known.add(name.lower())
-        # @types/* ships type declarations, never the code a CVE is about, so it is
-        # not a candidate for any bare name.
         if name.startswith("@") and "/" in name and not name.lower().startswith("@types/"):
             catalogue.append((name, (item.get("version") or "").strip()))
     if not catalogue:
@@ -175,8 +173,6 @@ def qualify_npm_names(findings, document) -> int:
         if (dep.ecosystem or "").strip().lower() not in ("npm", "node", "javascript"):
             continue
         short = dep.package.lower()
-        # The decisive test: a package the SBOM lists under this very name is not a
-        # stripped scope, it is that package. `express` is not `@types/express`.
         if short in known:
             continue
         matches = {name for name, _ in catalogue if name.lower().endswith("/" + short)}

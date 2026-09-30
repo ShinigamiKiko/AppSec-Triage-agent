@@ -27,65 +27,32 @@ SUPPORTED_ECOSYSTEMS = frozenset({"composer", "packagist", "php"})
 ENGINE = "Psalm"
 _TIMEOUT_S = 1800
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# `--find-references-to` analyses the whole project for one method, and the entry lists
-# of one package's advisories overlap almost entirely (73-85 methods each for Twig).
-# The project does not change during a scan, so one answer per method holds for the run.
 _REFERENCES: dict[tuple[str, str], list[tuple[str, int]]] = {}
 _REFERENCES_PENDING: dict[tuple[str, str], threading.Event] = {}
 _REFERENCES_LOCK = threading.Lock()
-# One Psalm on a large project holds several GB (3.3 GB for a reference search over 3400
-# files and their vendor tree, more for taint analysis), and three at once froze a 15 GB
-# machine. No guess per process: as many at once as the memory holds by the largest
-# Psalm this run has measured, one at a time until one has finished.
-# APPSEC_PSALM_PARALLEL sets the number by hand.
 _PSALM_RESERVE = 3 << 30
 _PSALM_FLOOR = 1 << 30
 _GATE = threading.Condition()
 _RUNNING = 0
-# The most one analysis held, its worker processes included: Psalm's `--threads` forks
-# workers, and the largest single process no longer says what a run costs.
 _PEAK_RUN = 0
 _SAMPLER: threading.Thread | None = None
-# Workers per analysis: the CPUs shared among the analyses running. Psalm merges the
-# workers' call locations and taint graphs into the main process, so the index and the
-# paths come out the same; a single thread left 23 of 24 cores idle on api-develop.
 _MAX_THREADS = 8
 _MEASURED = False
 _ANNOUNCED = 0
-# A crash exits 1, the code Psalm also uses for "issues found": told apart by its text,
-# or an analysis that died reads as "no calls, no path" — a closure nobody checked.
 _CRASHED = "crashed due to an uncaught Throwable"
 _CRASH_FILE = re.compile(r"in (/[^\s:()]+\.php):\d+")
-# Project files Psalm cannot read (a docblock it cannot parse kills the whole run): left
-# out of every later run over that project, by the scan and the dependency chain alike.
 _UNREADABLE: dict[str, set[str]] = {}
 _UNREADABLE_LOCK = threading.Lock()
 MAX_UNREADABLE = 5
-# Leaving such a file out is not enough: a class another file uses is read through the
-# autoloader all the same. Its code, without the docblocks, goes into an overlay the
-# analysis takes as a project file, so the class is known and the original never opened.
 _OVERLAY: dict[str, Path] = {}
 _OVERLAY_PREFIX = "sca-psalm-overlay-"
 _DOCBLOCK = re.compile(r"/\*\*.*?\*/", re.S)
 
-# The first path from input to each method, or None: a path into one method does not
-# depend on which other methods the stub marks as sinks, so it too holds for the run —
-# and one analysis answers for any number of methods. The methods asked for while an
-# analysis waits for room in `_slot` join it (`_TAINT_NEXT`): eight findings queued
-# behind one Psalm cost two or three analyses, not eight. A method already in an
-# analysis is waited for (`_TAINT_PENDING`), never computed twice.
 _TAINT: dict[tuple[str, str], Reached | None] = {}
 _TAINT_PENDING: dict[tuple[str, str], "_TaintRun"] = {}
 _TAINT_NEXT: dict[str, "_TaintRun"] = {}
 _TAINT_LOCK = threading.Lock()
 
-# Where every method is called, from one analysis per run. Psalm keeps the call sites of
-# all methods once `--find-references-to` switches location collection on;
-# `findReferencesToSymbol(m)` reads that table one method at a time, and this plugin
-# writes out the whole of it — the same answers as a search per method, for one
-# analysis instead of one per finding. The table is Psalm's internal one, read by
-# reflection: when a Psalm release renames it, the plugin says so and every method is
-# searched on its own, as before.
 _INDEX_PLUGIN = r"""<?php
 use Psalm\Plugin\EventHandler\AfterAnalysisInterface;
 use Psalm\Plugin\EventHandler\Event\AfterAnalysisEvent;
@@ -112,7 +79,6 @@ final class ScaCallIndex implements AfterAnalysisInterface
     }
 }
 """
-# Any method name switches the collection on; this one has no calls to print.
 _INDEX_PROBE = "ScaCallIndex\\Probe::probe"
 _INDEX_HOME: Path | None = None
 _INDEX_LOCK = threading.Lock()
@@ -238,8 +204,6 @@ def _overlay_copy(project: Path, relative: str) -> None:
             _OVERLAY[str(project)] = base
     copy = base / relative
     copy.parent.mkdir(parents=True, exist_ok=True)
-    # Each docblock becomes as many empty lines as it had: a finding in the copy keeps
-    # the line number it has in the original.
     copy.write_text(_DOCBLOCK.sub(lambda m: "\n" * m.group(0).count("\n"), text), encoding="utf-8")
 
 
@@ -619,7 +583,6 @@ def _call_index(project: Path, binary: str, timeout_s: float) -> _Index:
         if index.methods is None:
             log.info("psalm api: no call index (%s); methods are searched one by one", index.problem[:300])
             if crash_cause(index.problem):
-                # `run` leaves the file out and asks again: built again, without it.
                 with _INDEX_LOCK:
                     if _INDEXES.get(key) is index:
                         del _INDEXES[key]
@@ -724,7 +687,6 @@ def _join_taint(project: Path, signatures: list[Signature], keys: dict[str, tupl
                 taint_run = _TAINT_NEXT.get(str(project))
                 if taint_run is None:
                     taint_run = _TAINT_NEXT[str(project)] = _TaintRun(project)
-                # One label per method whichever finding asked: the method id itself.
                 taint_run.signatures[key] = replace(sig, label=key[1])
                 taint_run.references[key[1]] = references.get(sig.label, [])
                 _TAINT_PENDING[key] = taint_run
@@ -745,7 +707,7 @@ def _take_part(taint_run: _TaintRun, binary: str, timeout_s: float) -> None:
         with _slot():
             with _TAINT_LOCK:
                 if _TAINT_NEXT.get(project) is taint_run:
-                    del _TAINT_NEXT[project]          # sealed: later askers start the next one
+                    del _TAINT_NEXT[project]
                 signatures = list(taint_run.signatures.values())
                 references = dict(taint_run.references)
             if len(signatures) > 1:
@@ -774,8 +736,6 @@ def _taint_analysis(signatures: list[Signature], references: dict[str, list[tupl
     """Taint analysis with these methods as sinks: (first path per label, problem). The caller holds a slot."""
     with tempfile.TemporaryDirectory(prefix="sca-psalm-taint-") as tmp:
         work = Path(tmp)
-        # Without Psalm's cache: the stub marks different methods as sinks on every run,
-        # and a cached storage could carry the previous run's sinks.
         stub_path = work / "sca-sinks.php"
         stub_path.write_text(stub(signatures), encoding="utf-8")
         taint_config = _config(work / "psalm-taint.xml", project, stub_path)
@@ -979,8 +939,6 @@ def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm
             break
         skipped = exclude_crashed_file(project, answer.problem)
         if not skipped:
-            # The analyses are shared: another finding may have left the file out while
-            # this one waited for the answer. Then it is worth asking again, once more.
             newly = set(unreadable_files(project)) - before
             skipped = next((f for f in _crashed_files(project, answer.problem) if f in newly), "")
             if not skipped:
@@ -1061,7 +1019,6 @@ def _run_once(project: Path, targets: list[Target], *, binary: str, php: str,
         keys = {sig.label: (str(project), f"{_clean_class(sig.declaring)}::{sig.function}")
                 for sig in signatures}
         runs = _join_taint(project, signatures, keys, references)
-        # The ones nobody leads yet first: the others are under way without this finding.
         for taint_run in sorted(runs, key=lambda r: r.led):
             _take_part(taint_run, binary, timeout_s)
         if failure := next((r.problem for r in runs if r.problem), ""):

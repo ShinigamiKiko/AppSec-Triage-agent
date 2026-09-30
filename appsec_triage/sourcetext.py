@@ -12,7 +12,6 @@ import os
 import threading
 from pathlib import Path
 
-# Files larger than this are read from disk each time rather than kept.
 _KEPT_FILE = 1 << 20
 _BUDGET = int(os.environ.get("APPSEC_SOURCE_CACHE_MB", "512")) << 20
 

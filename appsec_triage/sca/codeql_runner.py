@@ -84,10 +84,6 @@ def write_external(directory: Path, name: str, rows) -> Path:
     return path
 
 
-# --------------------------------------------------------------------------- #
-# cli-server
-# --------------------------------------------------------------------------- #
-
 @dataclass(slots=True)
 class Completed:
     """The part of `subprocess.CompletedProcess` the callers read."""

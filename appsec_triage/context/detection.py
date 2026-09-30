@@ -22,9 +22,6 @@ ECOSYSTEM_SUFFIXES = {
 }
 
 CONFIG_SUFFIXES = {".yaml", ".yml", ".json", ".toml", ".ini", ".env", ".xml", ".neon"}
-# Templates call a language's code by name (`|spaceless`, `{{ format_args(...) }}`), but
-# no parser here reads them: they join the text searches that also read configuration,
-# never the language rules that parse imports.
 TEMPLATE_SUFFIXES = {
     "npm": {".hbs", ".handlebars", ".ejs", ".pug"},
     "composer": {".twig"},
@@ -47,7 +44,6 @@ def get_source_suffixes(
     include_configs: bool = False,
 ) -> set[str]:
     """Determine source file extensions for searching."""
-    # Specific ecosystem (searching for a specific package)
     if for_ecosystem:
         key = for_ecosystem.strip().lower()
         if key not in ECOSYSTEM_SUFFIXES:
@@ -57,7 +53,6 @@ def get_source_suffixes(
             )
         return ECOSYSTEM_SUFFIXES[key].copy()
     
-    # Global search - all ecosystems from ENV
     raw = os.getenv("APPSEC_ECOSYSTEMS")
     if not raw or not raw.strip():
         raise DetectionError(

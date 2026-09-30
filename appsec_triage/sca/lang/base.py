@@ -39,13 +39,9 @@ def builtin_names(language: str) -> frozenset[str]:
 class Bindings:
     """Local names tied to one package in one file."""
 
-    # Names that stand for the package or an object from it: `axios`, `_`, `$yaml`, `yaml`.
     receivers: set[str] = field(default_factory=set)
-    # Names that are one function of the package, and which one: {"tpl": "template"}.
     functions: dict[str, str] = field(default_factory=dict)
-    # Names that are one class of the package: {"Parser": "Parser"}.
     classes: dict[str, str] = field(default_factory=dict)
-    # Lines where the package is brought in.
     import_lines: list[int] = field(default_factory=list)
 
     @property
@@ -118,7 +114,6 @@ class LanguageRules:
 
     name = ""
     suffixes: frozenset[str] = frozenset()
-    # Method names so common that a match without a binding says nothing.
     ubiquitous: frozenset[str] = frozenset({
         "get", "set", "post", "put", "delete", "patch", "request", "load", "parse", "format",
         "merge", "assign", "create", "read", "write", "send", "open", "close", "run", "call",

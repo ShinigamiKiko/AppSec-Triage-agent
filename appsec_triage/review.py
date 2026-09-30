@@ -61,6 +61,10 @@ def _is_secret_family(cwe: str | None) -> bool:
     return bool(cwe) and cwe.upper() in SECRET_FAMILY_CWES
 
 
+def _at(record: TriageRecord) -> str:
+    return f"{record.file_path}" + (f":{record.start_line}" if record.start_line else "")
+
+
 def build(record: TriageRecord) -> ReviewBrief:
     """What the reviewer should be told, and asked."""
     brief = ReviewBrief()
@@ -70,19 +74,19 @@ def build(record: TriageRecord) -> ReviewBrief:
         grounded = [s for s in verdict.dataflow if s.grounded]
         if grounded:
             ends = f"{grounded[0].location or '?'} → {grounded[-1].location or '?'}"
-            brief.established.append(f"Traced path, {len(grounded)} step(s): {ends}")
+            brief.established.append(f"Путь данных прослежен, шагов: {len(grounded)}: {ends}")
     if verdict.vulnerable_symbol:
         sym = verdict.vulnerable_symbol
-        brief.established.append(f"At fault: `{sym.name}`" + (f" ({sym.location})" if sym.location else ""))
+        brief.established.append(f"Уязвимое место: `{sym.name}`" + (f" ({sym.location})" if sym.location else ""))
 
     route_lines: list[str] = []
     for line in record.symbol_context:
         if line.startswith("called from:"):
             route_lines.append(line[len("called from:") :].strip())
         elif line.startswith("definition of"):
-            brief.established.append(line)
+            brief.established.append("определение" + line[len("definition of"):])
     if record.reachability:
-        brief.established.append(f"Reachability: {record.reachability}")
+        brief.established.append(f"Достижимость: {record.reachability}")
 
     heavy = consequence_weight(record.cwe) >= 22
 
@@ -90,14 +94,14 @@ def build(record: TriageRecord) -> ReviewBrief:
         brief.questions.append(
             Question(
                 text=(
-                    "Can this be upgraded now? The remediation is named in the verdict — "
-                    "what is left is whether the bump breaks anything here."
+                    "Можно ли обновить пакет сейчас? Исправление названо в вердикте — осталось понять, "
+                    "не ломает ли обновление что-то в этом проекте."
                 ),
-                look_at=[record.file_path, "the changelog between the installed and fixed versions"],
-                if_yes="Upgrade and close.",
+                look_at=[record.file_path, "список изменений между установленной и исправленной версиями"],
+                if_yes="Обновить и закрыть.",
                 if_no=(
-                    "Record why, and what compensates in the meantime — this stays open as accepted "
-                    "risk, not as an untriaged finding."
+                    "Записать, почему нельзя и что компенсирует риск до обновления — находка остаётся "
+                    "открытой как принятый риск, а не как неразобранная."
                 ),
             )
         )
@@ -110,12 +114,12 @@ def build(record: TriageRecord) -> ReviewBrief:
         brief.questions.append(
             Question(
                 text=(
-                    f"Route `{route}` reaches this code. Is it exposed outside the perimeter, "
-                    "or is it internal-only / behind authentication?"
+                    f"Маршрут `{route}` доходит до этого кода. Он доступен снаружи периметра "
+                    "или только изнутри / за аутентификацией?"
                 ),
-                look_at=[caller, "the firewall or access-control rules covering this route"],
-                if_yes=f"Exposed → treat as {'confirmed' if heavy else 'a real finding'}.",
-                if_no="Internal-only → severity drops; still worth fixing, not urgent.",
+                look_at=[caller, "правила межсетевого экрана и доступа для этого маршрута"],
+                if_yes=f"Доступен снаружи → считать {'подтверждённой' if heavy else 'реальной'} находкой.",
+                if_no="Только изнутри → серьёзность ниже; исправить стоит, но не срочно.",
             )
         )
         break
@@ -124,18 +128,18 @@ def build(record: TriageRecord) -> ReviewBrief:
         brief.questions.append(
             Question(
                 text=(
-                    "Is this a live credential, and is this file published — committed to the "
-                    "repository, baked into an image, or shipped to a server?"
+                    "Это действующий секрет, и опубликован ли файл — лежит в репозитории, "
+                    "запечён в образ или выложен на сервер?"
                 ),
                 look_at=[
-                    f"{record.file_path}" + (f":{record.start_line}" if record.start_line else ""),
-                    "`git log` for this file, and .gitignore",
-                    "whether a real value overrides it at deploy time",
+                    _at(record),
+                    "`git log` по этому файлу и .gitignore",
+                    "подменяется ли значение настоящим при развёртывании",
                 ],
-                if_yes="Live and published → rotate the secret first, then remove it from the file.",
+                if_yes="Действующий и опубликован → сначала сменить секрет, потом убрать его из файла.",
                 if_no=(
-                    "A placeholder or a local-only default → false positive; record which of the two, "
-                    "because they age differently."
+                    "Заглушка или значение только для локального запуска → ложное срабатывание; "
+                    "записать, что именно из двух: они устаревают по-разному."
                 ),
             )
         )
@@ -146,16 +150,13 @@ def build(record: TriageRecord) -> ReviewBrief:
         and record.kind == "weakness"
         and record.verdict.verdict is not VerdictLabel.false_positive
     ):
-        target = verdict.vulnerable_symbol.name if verdict.vulnerable_symbol else "the flagged value"
+        target = verdict.vulnerable_symbol.name if verdict.vulnerable_symbol else "отмеченного значения"
         brief.questions.append(
             Question(
-                text=f"Does any request-controlled value reach `{target}`?",
-                look_at=[
-                    f"{record.file_path}" + (f":{record.start_line}" if record.start_line else ""),
-                    "the callers of the enclosing function",
-                ],
-                if_yes="Attacker-controlled → confirmed.",
-                if_no="Only internal or constant values → false positive; note why.",
+                text=f"Доходит ли до `{target}` хоть одно значение, которое контролирует запрос?",
+                look_at=[_at(record), "вызовы функции, в которой находится это место"],
+                if_yes="Контролирует атакующий → подтверждено.",
+                if_no="Только внутренние или постоянные значения → ложное срабатывание; записать почему.",
             )
         )
 
@@ -163,12 +164,12 @@ def build(record: TriageRecord) -> ReviewBrief:
         brief.questions.append(
             Question(
                 text=(
-                    "Callers were found, but none registers a route within one hop. "
-                    "Is this reached from a controller further up, or is it internal plumbing?"
+                    "Вызовы найдены, но ни один не регистрирует маршрут в пределах одного шага. "
+                    "Этот код вызывается из контроллера выше по цепочке или это внутренняя обвязка?"
                 ),
                 look_at=[c for c in route_lines[:3]],
-                if_yes="Reachable → the finding stands.",
-                if_no="Internal helper with trusted callers only → deprioritise.",
+                if_yes="Достижим → находка остаётся.",
+                if_no="Внутренний помощник только с доверенными вызовами → понизить приоритет.",
             )
         )
 
@@ -176,43 +177,38 @@ def build(record: TriageRecord) -> ReviewBrief:
         brief.questions.append(
             Question(
                 text=(
-                    "Every caller found is a test or fixture. Is there a production caller the "
-                    "indexer missed — dynamic dispatch, DI wiring, annotation routing?"
+                    "Все найденные вызовы — из тестов или фикстур. Нет ли рабочего вызова, который "
+                    "индексатор пропустил: динамический вызов, внедрение зависимостей, маршрут из аннотации?"
                 ),
-                look_at=[record.file_path, "DI configuration and route annotations"],
-                if_yes="Production caller exists → the finding stands.",
-                if_no="Test-only code → close it, and say so in the ticket.",
+                look_at=[record.file_path, "конфигурация внедрения зависимостей и аннотации маршрутов"],
+                if_yes="Рабочий вызов есть → находка остаётся.",
+                if_no="Код только для тестов → закрыть и написать об этом в задаче.",
             )
         )
 
     if record.challenge_note:
         brief.questions.append(
             Question(
-                text=f"A second pass argued against this verdict: {record.challenge_note[:220]}. Is that right?",
-                look_at=[f"{record.file_path}" + (f":{record.start_line}" if record.start_line else "")],
-                if_yes="The objection holds → change the verdict and say why.",
-                if_no="The objection fails → the original verdict stands; note the reasoning for next time.",
+                text=f"Второй проход возразил против вердикта: {record.challenge_note[:220]}. Он прав?",
+                look_at=[_at(record)],
+                if_yes="Возражение верно → изменить вердикт и написать почему.",
+                if_no="Возражение неверно → вердикт остаётся; записать довод на будущее.",
             )
         )
 
     if verdict.blocking_question and verdict.verdict is VerdictLabel.unknown:
         already = {q.text[:40] for q in brief.questions}
         if verdict.blocking_question[:40] not in already:
-            brief.questions.append(
-                Question(
-                    text=verdict.blocking_question,
-                    look_at=[f"{record.file_path}" + (f":{record.start_line}" if record.start_line else "")],
-                )
-            )
+            brief.questions.append(Question(text=verdict.blocking_question, look_at=[_at(record)]))
 
     for gap in verdict.missing_information[:2]:
         if len(brief.questions) >= 4:
             break
-        brief.questions.append(Question(text=f"Missing: {gap}", look_at=[record.file_path]))
+        brief.questions.append(Question(text=f"Не хватает: {gap}", look_at=[record.file_path]))
 
     if brief.established and brief.questions:
         brief.minutes_saved_note = (
-            "The trace and the call sites above were resolved automatically — "
-            "answer the question rather than re-deriving them."
+            "Трасса и места вызова выше найдены автоматически — ответь на вопрос, "
+            "не восстанавливая их заново."
         )
     return brief

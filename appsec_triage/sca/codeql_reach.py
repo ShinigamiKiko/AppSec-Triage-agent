@@ -19,8 +19,6 @@ _THREADS = os.environ.get("APPSEC_CODEQL_THREADS", "0")
 _RAM_MB = os.environ.get("APPSEC_CODEQL_RAM_MB", "6000")
 
 
-# The agent's own library models, per language: request sources CodeQL does not ship
-# (configs/codeql/models/<language>/).
 _MODEL_PACKS = {"go": "appsec-triage/go-models"}
 
 
@@ -291,8 +289,6 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
             log.info("%s%s completed in %.2fs", prefix, query_name, time.monotonic() - start)
             return None
 
-        # Both queries open the same database and would wait for its lock anyway:
-        # running them one after the other is the same wall time without the threads.
         for query_path, output_path, name in ((query, results, "запрос достижимости"),
                                               (evaluated_query, evaluated_results, "проверка позиций")):
             if error := run_query(query_path, output_path, name):

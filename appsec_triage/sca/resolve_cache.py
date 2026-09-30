@@ -23,7 +23,6 @@ from .resolve import VulnerableSymbol
 log = logging.getLogger(__name__)
 
 _SCHEMA = 1
-# The code that turns an advisory into a symbol: a change to it is a change of answer.
 _CODE = ("resolve.py", "declarations.py", "resolve_cache.py")
 
 

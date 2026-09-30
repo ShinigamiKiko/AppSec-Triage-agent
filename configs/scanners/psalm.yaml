@@ -1,26 +1,4 @@
-# Psalm taint-анализ — основной SAST для PHP.
-#
-# CodeQL PHP не поддерживает, поэтому для PHP это выбранный инструмент,
-# отвечающий «доходит ли недоверенный ввод до стока», а не «похоже ли на
-# опасный паттерн». В SARIF Psalm кладёт codeFlows — ingest предпочтёт эту
-# запись любому менее информативному совпадению на том же месте (см. _richness).
-#
-# Сканер всегда запускает Psalm со своим временным конфигом вне проекта, а
-# psalm.xml проекта не использует: тот написан под версию Psalm проекта, его
-# плагинам нужен vimeo/psalm, которого нет в PHAR, а baseline может заглушить
-# taint-находки. vendor/ читается только через автозагрузчик — ради типов.
-#
-# Источники ввода Symfony (Request и его ParameterBag) и стоки
-# (PDO, Doctrine DBAL/ORM, Symfony Process и Response) задаёт
-# configs/psalm/framework-taint.phpstub — плагины фреймворков не нужны.
-# Ввод, который проходит через рефлексию (Serializer/ParamConverter → DTO),
-# статический анализ не прослеживает: ноль находок не доказывает, что таких
-# путей нет, — их проверяет модель при обходе кода.
-
-mode: native                 # docker не предлагается: контейнер не видит vendor таргета
-# Первым — Psalm 6 из образа: заглушка Symfony и плагин поиска вызовов рассчитаны на
-# него. `psalm` из PATH — только запасной: на раннере или в vendor/bin проекта бывает
-# свой Psalm, старый или без dev-зависимостей. Берётся первый, кто ответил на --version.
+mode: native
 binary:
   - /opt/composer/vendor/bin/psalm.phar
   - /usr/local/bin/psalm
@@ -29,6 +7,6 @@ binary:
   - ~/.config/composer/vendor/bin/psalm
 image: null
 language: php
-run_in_target: true          # cwd = таргет: нужен для psalm.xml и автозагрузчика
+run_in_target: true
 timeout_s: 1800
 docker_network: false

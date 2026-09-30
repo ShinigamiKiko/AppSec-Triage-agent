@@ -16,9 +16,6 @@ log = logging.getLogger(__name__)
 SECTION = "Test And Non-Production Paths"
 _BULLET = re.compile(r"^\s*[-*]\s+`([^`]+)`")
 
-# Compose files describe a developer's machine (`yarn dev --host`, local databases,
-# debug ports), never the production deployment: a finding in one is a false
-# positive, and a fact read from one proves nothing about production.
 LOCAL_ENVIRONMENT_FILES = ("docker-compose*.yml", "docker-compose*.yaml",
                            "compose.yml", "compose.yaml", "compose.*.yml", "compose.*.yaml")
 
@@ -67,8 +64,6 @@ def parse(text: str) -> TestPaths:
 
 @lru_cache(maxsize=1)
 def load() -> TestPaths:
-    # All parts, not only this run's ecosystems: which files are tests is a fact
-    # about the files, whatever the prompts carry.
     paths = parse(registry.all_training_context())
     if not paths.directories and not paths.files:
         log.warning("no test paths listed in %s under %r — nothing is treated as test code",

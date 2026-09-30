@@ -11,7 +11,6 @@ UNKNOWN = "unknown"
 
 _SEMVER = re.compile(
     r"^v?(?P<main>\d+(?:\.\d+)*)(?:-(?P<pre>[0-9A-Za-z.-]+))?(?:\+(?P<build>[0-9A-Za-z.-]+))?$")
-# Composer writes pre-releases without a dash (1.0.0beta2, 1.0.0-RC1, 1.0.0-p1).
 _COMPOSER_PRE = re.compile(r"^(?P<main>v?\d+(?:\.\d+)*)[-.]?(?P<tag>alpha|beta|rc|a|b|p|patch|pl)\.?(?P<n>\d*)$",
                            re.IGNORECASE)
 
@@ -30,14 +29,14 @@ def _semver_key(version: str, ecosystem: str):
     text = version.strip()
     if ecosystem in ("go", "golang"):
         text = text.removesuffix("+incompatible")
-        if text.startswith("go"):  # stdlib versions arrive as go1.22.3
+        if text.startswith("go"):
             text = text[2:]
     if ecosystem in ("composer", "packagist", "php"):
         m = _COMPOSER_PRE.match(text)
         if m:
             tag = m.group("tag").lower()
             tag = {"a": "alpha", "b": "beta", "pl": "patch", "p": "patch"}.get(tag, tag)
-            if tag == "patch":  # a patch release sorts after its base
+            if tag == "patch":
                 text = f"{m.group('main')}+patch{m.group('n') or 0}"
                 main = _SEMVER.match(text)
                 if not main:

@@ -64,7 +64,6 @@ def _prepare_sbom(target: Path, scan_dir: Path, given: str | None) -> Path | Non
     if document is None:
         print(f"  ! SBOM не снят: {problem}", file=sys.stderr)
         return None
-    # A dot-prefixed name keeps ingest from parsing the SBOM as a findings file.
     path = scan_dir / ".sbom.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
@@ -85,7 +84,6 @@ def _install_dependencies(target: Path) -> Path:
         return target
     workspace = Path(os.environ.get("APPSEC_WORKSPACE")
                      or Path(tempfile.gettempdir()) / "appsec-workspace")
-    # Only what this project has: the installer skips an ecosystem without a manifest.
     sources = ([f"npm с {install_mod.PUBLIC_REGISTRY}"] if install_mod._needs_npm(target) else []) \
         + (["composer с GitHub по коммитам из composer.lock"] if install_mod._needs_composer(target) else [])
     print(f"→ зависимости: ставлю {', '.join(sources)} в копию проекта {workspace}", file=sys.stderr)
@@ -111,7 +109,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     target = Path(args.target).resolve()
     out = Path(args.out).resolve()
     if not getattr(args, "no_preflight", False):
-        # Before the scanners: they take minutes, a rejected key takes one call.
         from ...config import load_pipeline_config, load_provider_config
         from ..common import node_modules_problem, preflight_provider
         cfg = load_pipeline_config(getattr(args, "config", None))
@@ -140,9 +137,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     wolfee_report = scan_dir / "wolfee.sarif.json"
     _drop_stale_dependencies(scan_dir)
     if not getattr(args, "no_deps", False):
-        # One cdxgen pass per run, whoever found the vulnerabilities. wolfee reports
-        # npm names without their scope and without edges; the SBOM has both, so the
-        # same document repairs the names and builds the dependency graph.
         sbom_file = _prepare_sbom(target, scan_dir, getattr(args, "sbom", None))
         if sbom_file:
             args.sbom = str(sbom_file)

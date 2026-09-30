@@ -9,11 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..prompts import registry
-from .exploitable import _grep  # one literal, bounded, read-only search for both steps
+from .exploitable import _grep
 from ..llm.tools import TOOL_MODE_NOTE, function_tool, run_tool_loop, supports_tools
 
 log = logging.getLogger(__name__)
-
 
 
 _BLIND_SPOTS = {
@@ -96,13 +95,9 @@ def _callback_patterns(name: str) -> list[re.Pattern[str]]:
     """Ways a package hands one of its own methods to the framework by name."""
     quoted = rf"""['"]{re.escape(name)}['"]"""
     return [
-        # [$this, 'formatArgs'], [self::class, 'handle'], [Foo::class, 'handle']
         re.compile(rf"\[\s*(?:\$this|self::class|static::class|__CLASS__|[\w\\]+::class)\s*,\s*{quoted}\s*\]"),
-        # getSubscribedEvents(): 'event' => 'onLogin' or 'event' => ['onLogin', 10]
         re.compile(rf"=>\s*\[?\s*{quoted}"),
-        # 'Some\\Class::onLogin' as a string callable
         re.compile(rf"""['"][\w\\]+::{re.escape(name)}['"]"""),
-        # getattr(obj, 'handle') / setattr-style dispatch
         re.compile(rf"getattr\([^)]*{quoted}"),
     ]
 

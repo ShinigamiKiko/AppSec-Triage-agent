@@ -1,12 +1,3 @@
-# Dependency triage in GitLab CI, using the agent's Docker image.
-# For a runner without the image, see ci/gitlab-ci.example.yml.
-#
-# Variables in Settings → CI/CD → Variables (masked):
-#   DEEPSEEK_API_KEY   provider key
-#
-# The image sets ENTRYPOINT ["appsec-triage"], so `entrypoint: [""]` is needed
-# for GitLab to run its own shell and the lines under `script`.
-
 stages:
   - security
 
@@ -16,48 +7,20 @@ stages:
     name: your-registry/appsec-triage:latest
     entrypoint: [""]
   variables:
-    # REQUIRED: which ecosystems this project has. It decides which source files
-    # are read and which language servers must come up; an unknown name or an
-    # unset variable stops the run with exit 2.
-    # Accepted: npm, composer, pypi, go, maven, rubygems, cargo, nuget.
-    # Dependency findings are triaged only for the ecosystems listed under
-    # scope.only_ecosystems in configs/pipeline.yaml — go, npm and composer by
-    # default; findings from the rest are filtered out before the model sees them.
     APPSEC_ECOSYSTEMS: "npm"
-    # GitLab caches only paths under the project directory.
     GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
-    # Composer's audit refuses advisories on purpose-installed vulnerable versions.
     COMPOSER_NO_AUDIT: "1"
-    # Go modules through the internal proxy; govulncheck, CodeQL and gopls inherit
-    # these from the job. Private modules also need a netrc for git.rabota.space.
-    # GOPROXY: "https://nexus.example/repository/go-proxy/"
-    # GOPRIVATE: "git.example"
-    # npm/yarn read the registry from the project's .npmrc/.yarnrc; a token for it
-    # goes into a masked variable the .npmrc references (e.g. NPM_TOKEN).
-  # The agent reads a dependency's own code from the installed tree and never
-  # downloads it. Another job may have filled these directories already — the
-  # key is the lock files, so a restored tree always matches them.
   cache:
     key:
       files: [composer.lock, package-lock.json, go.sum]
     paths: [vendor/, node_modules/, .go/pkg/mod/]
   before_script:
-    # The job installs, through the registries it has access to (satis, Nexus, the
-    # project's own .npmrc/.yarnrc, GOPROXY): the agent installs nothing itself.
-    # Install only what the cache did not bring; the key is the lock files, so a
-    # restored tree always matches them. No `|| true` here on purpose: a failed
-    # install must stop the job, not leave the agent reading a half-built tree.
-    # Composer without dev: a project's own Psalm or phpstan in vendor/ replaces
-    # the agent's Psalm classes through the autoloader, and dev tools never ship.
-    # npm and Go keep dev dependencies — a package pruned from the tree cannot be
-    # read, and the chain stops at it.
     - if [ -f composer.lock ] && [ ! -d vendor ]; then composer install --no-dev --no-interaction --no-progress --no-scripts --no-plugins --ignore-platform-reqs --prefer-dist; fi
     - if [ -f package-lock.json ] && [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
     - if [ -f yarn.lock ] && [ ! -d node_modules ]; then yarn install --frozen-lockfile; fi
     - if [ -f go.sum ] && [ ! -d "$GOMODCACHE/cache/download" ]; then go mod download; fi
   script:
     - appsec-triage run "$CI_PROJECT_DIR" -p deepseek -o appsec-report --fail-on confirmed
-  # 0 — clean, 1 — --fail-on triggered, 2 — a required language server did not start.
   artifacts:
     when: always
     paths:
@@ -70,13 +33,11 @@ appsec-triage:
     - merge_requests
     - main
 
-# Example: a project with several ecosystems at once.
 appsec-triage-fullstack:
   extends: .appsec-triage
   variables:
     APPSEC_ECOSYSTEMS: "npm,go,composer"
 
-# Example: PHP project
 appsec-triage-php:
   extends: .appsec-triage
   variables:

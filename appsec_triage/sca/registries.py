@@ -30,7 +30,6 @@ _LAYOUTS: dict[str, tuple] = {
              "venv/lib/python*/site-packages/{flat}"),
     "python": ("{venv}/lib/python*/site-packages/{flat}",
                ".venv/lib/python*/site-packages/{flat}"),
-    # Vendor first: a project that vendors its modules is the stronger answer.
     "go": ("vendor/{name}", lambda name, version: _go_module_cache_dir(name, version)),
     "golang": ("vendor/{name}", lambda name, version: _go_module_cache_dir(name, version)),
 }
@@ -233,8 +232,6 @@ def _go_modules(roots: tuple[str, ...], cache_dir: str) -> tuple[tuple[GoModule,
             for line in _go_directive(text, "require"):
                 if match := _GO_REQUIRE.match(line):
                     required[match.group(1)] = (match.group(2), "")
-            # A go.mod older than go 1.17 leaves out what its dependencies need; go.sum
-            # still names those modules.
             for module, version in _go_sum_versions(gomod.with_name("go.sum")).items():
                 required.setdefault(module, (version, "(from go.sum)"))
             for module, (version, note) in required.items():
@@ -284,8 +281,6 @@ def go_lookup(roots, requested: str) -> GoLookup:
             elif len(tail) == best and all(m is not module for m, _ in matches):
                 matches.append((module, sub))
     if not matches and "/" not in name:
-        # `amqp091` for github.com/rabbitmq/amqp091-go: a word of one module's last
-        # segment, and of no other.
         worded = [(m, "") for m in modules
                   if lowered in re.split(r"[-_.]", re.sub(r"/v\d+$", "", m.path.lower()).rsplit("/", 1)[-1])]
         if len(worded) == 1:

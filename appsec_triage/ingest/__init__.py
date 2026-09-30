@@ -102,8 +102,6 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
         others = sorted({m.scanner for m in members} - {primary.scanner})
         merged.append(primary.model_copy(update={"corroborated_by": others}) if others else primary)
 
-        # One scanner running several query packs reports the same query twice under
-        # two ids (`go/log-injection`, `githubsecuritylab/log-injection`): one finding.
         seen = {_rule_name(primary.rule_id)}
         for m in sorted(members, key=_richness, reverse=True):
             if (

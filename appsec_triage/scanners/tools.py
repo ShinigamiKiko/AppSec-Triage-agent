@@ -53,8 +53,6 @@ class WolfeeScanner(Scanner):
     _toolchain: dict[str, str] = {}
 
     def _scan_env(self, target: Path) -> dict[str, str]:
-        # govulncheck inside wolfee judges the standard library by the `go` it runs:
-        # the project's release, not the image's (sca/gotoolchain.py).
         return {**super()._scan_env(target), **self._toolchain}
 
     def scan(self, target: Path, out_dir: Path) -> ScanResult:
@@ -76,7 +74,6 @@ class WolfeeScanner(Scanner):
         target = Path(target).resolve()
         if not composer_vendor(target):
             return super().scan(target, out_dir)
-        # wolfee has no exclude option: it scans a copy without the Composer tree.
         with tempfile.TemporaryDirectory(prefix="wolfee-") as work:
             view = Path(work) / target.name
 
@@ -88,10 +85,6 @@ class WolfeeScanner(Scanner):
             return super().scan(view, out_dir)
 
     def _native_scan_argv(self, target: Path, out_file: Path) -> list[str]:
-        # cdxgen as the agent's own call runs it: no package installs, and only the
-        # project types the agent triages (PHP, JS/TS, Go). Left to itself, cdxgen built a
-        # C# bill on a Go project, api.nuget.org did not answer, and it crashed — taking
-        # the whole wolfee scan with it.
         from ..sca.sbom import type_args
 
         return [
@@ -142,17 +135,11 @@ class PsalmScanner(Scanner):
 
     def scan(self, target: Path, out_dir: Path) -> ScanResult:
         target = Path(target).resolve()
-        # Psalm writes a file itself: a failed invocation must not reuse an old report.
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             (Path(out_dir) / f"{self.name}{self.output_suffix}").unlink(missing_ok=True)
         except OSError as exc:
             return ScanResult(scanner=self.name, ok=False, error=f"cannot clear previous Psalm report: {exc}")
-        # Always the scanner's own config, never the project's psalm.xml. That file is
-        # written for the project's Psalm version (an issue type the PHAR no longer
-        # knows is enough to reject it), its plugins need a vimeo/psalm the PHAR does
-        # not load, and its baseline can silence the very taint issues wanted here.
-        # What the taint scan needs is the project's code and where input enters it.
         from ..sca import psalm_api
 
         result = self._scan_autonomous(target, out_dir)
@@ -173,25 +160,16 @@ class PsalmScanner(Scanner):
             mode="w", suffix=".xml", prefix="psalm-autonomous-", dir=out_dir,
             encoding="utf-8", delete=False,
         ) as handle:
-            # vendor/ is read for types through the autoloader, never
-            # analysed: the taint paths wanted are the project's own, and
-            # analysing an old dependency tree is what makes Psalm crash.
             autoload = target / "vendor" / "autoload.php"
-            # Psalm refuses a config naming a directory that is not there,
-            # so only the ones this project actually has are listed.
-            # var/cache is Symfony's generated container, not the project's code.
             skip = [target / name for name in ("vendor", "node_modules", "var/cache")
                     if (target / name).is_dir()]
             ignored = "".join(
                 f'      <directory name={quoteattr(str(path))} />\n' for path in skip)
-            # Files an earlier attempt crashed on (psalm_api.exclude_crashed_file); their
-            # code without docblocks is read from the overlay instead.
             from ..sca.psalm_api import overlay_dir, unreadable_files
             ignored += "".join(
                 f'      <file name={quoteattr(str(target / name))} />\n'
                 for name in unreadable_files(target) if (target / name).is_file())
             overlay = overlay_dir(target)
-            # Framework input as taint sources and database, shell and response calls as sinks.
             stubs = CONFIG_DIR / "psalm" / "framework-taint.phpstub"
             handle.write(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -209,8 +187,6 @@ class PsalmScanner(Scanner):
             )
             temporary = Path(handle.name)
         self._runtime_config = temporary
-        # The project, not the directory the report is written to: --root is
-        # what Psalm resolves the analysed tree against.
         self._runtime_root = target
         try:
             return super().scan(target, out_dir)
@@ -349,8 +325,6 @@ class CodeQLScanner(Scanner):
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
         if packs:
-            # `resolve qlpacks` leaves out packs in the download cache (`pack download`
-            # without --dir): they resolve all the same, laid out as <scope>/<name>/<version>.
             for root in [*pack_dirs(), str(Path.home() / ".codeql" / "packages")]:
                 for manifest in Path(root).glob("*/*/*/qlpack.yml"):
                     packs.add(f"{manifest.parent.parent.parent.name}/{manifest.parent.parent.name}")
@@ -412,8 +386,6 @@ class CodeQLScanner(Scanner):
             notes.append(f"{language}: " + "; ".join(skipped))
 
         def analyze(queries: list[str], extra_models: list[str], ours: bool) -> list[str]:
-            # The agent's own request sources come first: without them a Fiber handler has
-            # none, and every query that starts from user input stays silent on it.
             models = model_flags(language, extra_models, ours)
             return [
                 exe, "database", "analyze", str(db_dir), *queries,
@@ -422,8 +394,6 @@ class CodeQLScanner(Scanner):
             ]
 
         standard = self.STANDARD_SUITE.format(language=language)
-        # A pack that does not compile on this CodeQL must not cost the standard queries:
-        # each step drops what may have failed, and the note says what was lost.
         attempts = [(suites, models, True), ([standard], [], True), ([standard], [], False)]
         err = None
         for number, (queries, extra, ours) in enumerate(dict.fromkeys(

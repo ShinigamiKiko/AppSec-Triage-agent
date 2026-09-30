@@ -28,8 +28,6 @@ class ChainSupport:
                  callsite_dataflow_requests: int = 4, skip_closure_audits=()) -> None:
         self._client = client
         self._max_tool_calls = max_tool_calls
-        # The lighter profile of a local model (configs/pipeline-ollama.yaml); the
-        # defaults are every other provider's.
         self._callsite_rounds = max(1, callsite_search_rounds)
         self._callsite_dataflow = max(0, callsite_dataflow_requests)
         self._skip_audits = frozenset(skip_closure_audits or ())
@@ -44,7 +42,6 @@ class ChainSupport:
                            for k, v in (codeql_databases or {}).items()}
         self._codeql_binary = codeql_binary
         self._psalm_binary = psalm_binary
-        # Independent questions of one finding, asked side by side.
         self._parallel_llm = max(1, parallel_llm)
         self._dataflow: dict[tuple[str, tuple], codeql_reach.Answer] = {}
         self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
@@ -152,8 +149,6 @@ class ChainSupport:
             if walk.targets and not walk.unknown:
                 return _walk_as_bridge(walk), _pairs(walk.targets), through
             unknown = unknown or (walk, through)
-        # placement() stores at most four paths. At that limit, more paths may
-        # exist, so even four closed walks cannot establish a global absence.
         if closed is not None and unknown is None and len(placement.introductions) < 4:
             walk, through = closed
             return _walk_as_bridge(walk), [], through
@@ -177,7 +172,6 @@ class ChainSupport:
                 if pending is None:
                     pending = self._pending[token] = threading.Event()
                     break
-            # Another finding is computing the same answer: its time is counted there.
             with timing.measure("shared-wait"):
                 pending.wait()
         try:

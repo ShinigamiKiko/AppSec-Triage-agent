@@ -1,5 +1,3 @@
-# Keep the build context (and the image) small. `out/` alone is tens of MB of
-# scan artifacts and reports that must never end up baked into the image.
 .git
 .gitignore
 out/
@@ -14,9 +12,6 @@ tools/semgrep-venv/
 .agents/
 .codex/
 
-# Development only: the job runs the agent, it never runs its tests, scripts or docs.
-# Kept: appsec_triage/, configs/, prompts/, pyproject.toml and LICENSE (pyproject's
-# license-files needs it for `pip install -e .`).
 tests/
 tools/
 docs/

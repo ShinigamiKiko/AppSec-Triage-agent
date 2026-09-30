@@ -183,9 +183,7 @@ def _taint_into(
         if (sink_file, sink.line) in targets:
             return (f"{scanner}: {source_file}:{source.line} -> {sink_file}:{sink.line} "
                     f"({finding.rule_id or finding.title})"), "", scanner
-    # Findings alone cannot establish whether a scanner ran or covered this sink.
     return "", "no matching CodeQL/Psalm source-to-sink trace supplied; coverage unknown", ""
-
 
 
 _TAINT_SCHEMA = {

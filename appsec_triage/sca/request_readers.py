@@ -11,8 +11,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-# The call as the project writes it. Framework binders and parsers, and the standard
-# ways of reading a request body, a form or a query.
 _CALL = re.compile(
     r"\.(?:BodyParser|QueryParser|ParamsParser|ReqHeaderParser|CookieParser"
     r"|ShouldBind\w*|MustBindWith|Bind(?:JSON|XML|YAML|TOML|Query|Header|Uri|With)?"
@@ -21,8 +19,6 @@ _CALL = re.compile(
     r"|ReadAll\s*\([^)]*\.Body\b"
 )
 
-# The same calls as a call graph names them: `v2.*Ctx.BodyParser`, `v3.*Bind.Body`,
-# `http.*Request.ParseForm`.
 _FRAME = re.compile(
     r"\*?(?i:ctx|context|defaultctx|bind|binder|defaultbinder|request|requestctx|defaultreq)"
     r"\.(?:BodyParser|QueryParser|ParamsParser|ReqHeaderParser|CookieParser|ShouldBind\w*|MustBindWith"

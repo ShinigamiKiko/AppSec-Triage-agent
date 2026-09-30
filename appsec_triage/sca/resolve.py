@@ -23,8 +23,6 @@ _MAX_DIFF = 60_000
 _SKIP_IN_DIFF = re.compile(
     r"(^|/)(tests?|spec|fixtures?|samples?|docs?)/|CHANGELOG|\.md$", re.IGNORECASE)
 _NOT_SHIPPED = re.compile(r"(^|/)(samples?|tests?|docs?|examples?)/", re.IGNORECASE)
-# The advisory steps answer with lists of quoted symbols, conditions and search terms, and
-# a Russian retelling: more than a verdict, whose size the profile's max_tokens is set for.
 _ADVISORY_BUDGET = 4096
 
 
@@ -68,7 +66,6 @@ class VulnerableSymbol:
     candidates: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     package_paths: tuple[str, ...] = field(default_factory=tuple)
     what_changed: str = ""
-    # The advisory retold in Russian, for the report that is read in Russian.
     flaw_ru: str = ""
     quotes_a_changed_line: bool = False
     declared_in_installed: bool | None = None
@@ -124,8 +121,6 @@ class VulnerableSymbol:
         return self.file or "(нет символа)"
 
 
-# Failures met while resolving on this thread: a model or network error degrades the
-# answer, and a degraded answer must not be kept for the next run.
 _TROUBLE = threading.local()
 
 
@@ -141,7 +136,7 @@ def _fetch(url: str) -> str | None:
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.debug("could not fetch %s: %s", url, exc)
         if not (isinstance(exc, urllib.error.HTTPError) and exc.code in (404, 410, 451)):
-            _trouble()      # a missing page is an answer; a dropped connection is not
+            _trouble()
         return None
 
 
@@ -273,12 +268,9 @@ def _declaration_state(name: str, files: dict[str, str]) -> bool | None:
 _MAX_LISTED = 40
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
 
-# Words a model puts where a class name belongs. None of them is a class, and the
-# search would otherwise look for a call of `ServeResult` on a class called `type`.
 _KIND_WORDS = {"function", "method", "class", "unknown", "none", "type", "interface", "enum",
                "constant", "const", "object", "variable", "var", "property", "field", "module",
                "namespace", "keyword", "definition", "typedef", "struct", "export", "default"}
-# Kinds nothing can call: the flaw runs in whichever function uses them.
 _NOT_CALLABLE = {"type", "interface", "enum", "constant", "const", "object", "variable", "var",
                  "property", "field", "keyword", "definition", "typedef", "struct"}
 

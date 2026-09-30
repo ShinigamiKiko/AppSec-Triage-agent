@@ -159,14 +159,12 @@ def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage,
             "deployment. The vulnerability does not apply to this application."
         )
 
-    # Windows is never part of the supported application deployment.
     if re.search(r"\bWindows\b", subject) and not re.search(r"\bcross[- ]platform\b", details, re.IGNORECASE):
         return (
             "Advisory describes Windows behavior; Windows is not a supported deployment platform. "
             "The vulnerability does not apply to this application."
         )
 
-    # CGO-specific vulnerability with CGO disabled in the build.
     evidence_text = "\n".join(pkg.evidence_blocks + pkg.context_notes)
     if "CGO_ENABLED=0" in evidence_text and re.search(
         r"\bcgo\b.{0,40}\b(?:resolver|build|enabled|compiled)\b",
@@ -178,7 +176,6 @@ def check_deployment_mismatch(finding: Finding, pkg: EvidencePackage,
             "The vulnerability does not apply to this build configuration."
         )
 
-    # Incoming TLS is terminated before reaching the application.
     if (
         re.search(r"\bTLS.*(?:server|handshake)\b|\bserver.*TLS\b", details, re.IGNORECASE)
         and not re.search(r"\bclient\b", details, re.IGNORECASE)
@@ -302,9 +299,6 @@ def apply_confidence_policy(result: Verdict, overrides: list[str]) -> Verdict:
     return result
 
 
-# Chain outcomes whose only evidence of a call is a name match in the text.
-# They cannot carry a confirmation on their own: the object being called was
-# never resolved, so the match may belong to a builtin or to another library.
 _UNPROVEN_CALL = {"call_unconfirmed", "mentioned"}
 
 
@@ -323,7 +317,6 @@ def _project_site(site: str) -> bool:
         return False
     from ..sca import registries
 
-    # A Go module's file, read from the module cache.
     return registries.go_module_of(path) is None
 
 
@@ -394,8 +387,6 @@ def cap_unproven_call(result: Verdict, sca, overrides: list[str]) -> Verdict:
             "and the receiver was never resolved, so it cannot confirm the CVE"
         )
     elif (getattr(sca, "route", "") or "") == "text" and not _call_resolved(sca):
-        # Measured on a real project: a transitive package confirmed three times by
-        # the model with no call site at all and no language server behind it.
         overrides.append(
             "unproven_call: text route with no call site in project code, no language-server "
             "resolution and no analyser path — nothing shows the project calls this package"
@@ -564,10 +555,6 @@ def validate(
             )
             result = _to_unknown(result, EvidenceClass.insufficient_context)
 
-    # A decisive verdict must rest on evidence of its own kind. `false_positive` with
-    # INSUFFICIENT_CONTEXT is "I could not see enough, so it's fine" — the one closure a
-    # triage must never make. `confirmed` with it is allowed only for a dependency, where
-    # the installed version itself is the evidence.
     if result.evidence_class is EvidenceClass.insufficient_context:
         if result.verdict is VerdictLabel.false_positive:
             overrides.append(
@@ -603,8 +590,6 @@ def validate(
 
     result = apply_confidence_policy(result, overrides)
 
-    # After the threshold, not before it: a confident model must not lift the rule that a
-    # confirmed high-severity finding is seen by a person.
     if (
         cfg.escalate_severities
         and finding.severity.value in cfg.escalate_severities
@@ -616,10 +601,6 @@ def validate(
         )
         result = result.model_copy(update={"requires_human_review": True})
 
-    # After the confidence policy, not before it: a confirmed dependency with a published
-    # fix is a patch task whatever the calibrated number says. In the other order the
-    # policy put every such finding straight back on a person's desk (both overrides were
-    # logged on the same record).
     dep = pkg.dependency
     if (
         result.verdict is VerdictLabel.confirmed
@@ -709,8 +690,6 @@ def _question_from_override(overrides: list[str], original: Verdict) -> str:
     return templates.get(kind, f"Automated checks overrode a `{said}` verdict ({kind}). Review by hand.")
 
 
-# Chain outcomes that found a call bound to the package: the model may not close these
-# without naming why the flaw cannot fire here.
 _BOUND_CALL = {"present", "actual"}
 
 
@@ -759,15 +738,9 @@ def cap_unproven_dependency_confirmation(
     expected = getattr(symbol, "function", "") or ""
     matched = (getattr(chain, "matched_symbol", "") or "").rsplit("::", 1)[-1]
     entries = set(getattr(chain, "entry_points", None) or ())
-    # Through the parent, the function reached is the one the quoted line calls:
-    # `qs.parse(` reaches `combine` only if `parse` is one of its entries.
     parent_reaches = parent is not None and any(
         re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", parent[1].code)
         for name in {expected, *entries} if name)
-    # A Go call graph (govulncheck, run by the agent or inside wolfee) traces the program
-    # to the symbol the vulnerability database lists: the step from the public API to the
-    # vulnerable function is exactly what it proves. The name the model resolved can
-    # differ (DecodeElement behind xml.Unmarshal) without the path being any less real.
     graph = getattr(chain, "reachability", None)
     graph_called = bool(
         (getattr(finding.dependency, "ecosystem", "") or "").lower() in ("go", "golang")
@@ -810,9 +783,6 @@ def settle_dependency_review(result: Verdict, finding: Finding, sca, overrides: 
     has_fix = bool(finding.dependency and finding.dependency.upgrade_target)
     if result.verdict is VerdictLabel.confirmed and not has_fix:
         wants_person = wants_person or priority in ("critical", "high", "medium")
-    # The model's own number, not the measured one: the measured score is built for
-    # every weakness class and marks down a dependency closure for the very signal
-    # ("the application loads the package") that the model refuted with quotes.
     stated = stated_confidence(result)
     unsure_closure = result.verdict is VerdictLabel.false_positive and stated <= AUTO_APPLY_CONFIDENCE
     wants_person = wants_person or unsure_closure

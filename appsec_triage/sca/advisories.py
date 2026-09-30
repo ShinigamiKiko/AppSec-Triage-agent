@@ -58,7 +58,6 @@ class Advisory:
     cwe_ids: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     severity: str = ""
-    # critical / high / medium / low, from the database's own label or the CVSS score.
     severity_level: str = ""
     problem: str = ""
     affected: list[dict] = field(default_factory=list)
@@ -444,7 +443,6 @@ def from_ghsa(advisory_id: str) -> Advisory | None:
     """The maintainer's write-up, which usually names the symbol."""
     if not advisory_id.upper().startswith("GHSA-"):
         return None
-    # OSV ids are case-sensitive: GHSA-4qpc-3hr4-r2p4 resolves, GHSA-4QPC-3HR4-R2P4 is a 404.
     advisory_id = "GHSA-" + advisory_id[5:].lower()
     data = _get_json(f"https://api.osv.dev/v1/vulns/{advisory_id}")
     if not data:
@@ -506,15 +504,10 @@ def collect(
             failures.append(f"osv: {exc}")
         tried.append("osv")
         if wanted:
-            # Two advisories can list each other as aliases — an "incomplete fix"
-            # follow-up and the original do. The record whose own id was asked for
-            # is the one to read; an alias match is only the fallback.
             exact = [a for a in found if a.advisory_id.upper() == wanted]
             found = exact or [a for a in found if wanted in {x.upper() for x in a.aliases}]
         candidates.extend(found[:1] if wanted else found)
 
-    # Look further only under this advisory's own ids. A GHSA alias may be a
-    # different advisory, and its text would win the "longest text" merge below.
     own = [wanted] if wanted else []
     own += [a.advisory_id.upper() for a in candidates if a.advisory_id.upper() not in own]
     cves = [i for i in own if i.startswith("CVE-")]
@@ -573,7 +566,6 @@ def collect(
         merged.sources.extend(s for s in entry.sources if s not in merged.sources)
 
     if ecosystem.lower() in {"npm", "node", "javascript", "yarn"} and not merged.fix_refs:
-        # the fix of an aliased GHSA may be the fix of a different flaw
         for ident in [merged.advisory_id, *(a for a in merged.aliases if not a.upper().startswith("GHSA-"))]:
             for ref in _github_fix_refs(ident):
                 if ref not in merged.fix_refs:

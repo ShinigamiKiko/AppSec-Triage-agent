@@ -21,8 +21,6 @@ _KINDS = {1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "
           23: "struct", 24: "event", 25: "operator", 26: "type parameter"}
 _SKIP = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv", "target"}
 _MAX_LISTED = 20
-# One lsp_find_usages through the server: a definition request per line naming the
-# symbol, each up to the request timeout — twenty lines of a slow server were minutes.
 _USAGES_BUDGET_S = 60.0
 _MAX_SCANNED = 2 * 1024 * 1024
 _MAX_SCAN = 20000
@@ -30,7 +28,6 @@ _READ_LINES = 80
 _SYMBOL_LINES = 160
 _LINE_CHARS = 300
 _MAX_FILE_BYTES = 1_000_000
-# Never shown to the model, whatever it asks for.
 _SECRET_NAMES = re.compile(r"^(?:\.env(?:\..*)?|id_rsa.*|id_ed25519.*|credentials.*|.*\.(?:pem|key|p12|pfx|keystore))$",
                            re.IGNORECASE)
 _SEARCHABLE = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".php", ".py", ".go",
@@ -66,7 +63,6 @@ class CodeTools:
         self._languages: list[str] | None = None
         self._files: list[tuple[Path, str, bool, str]] | None = None
 
-    # ---- which servers this project needs ---------------------------------
 
     def languages(self) -> list[str]:
         """Configured languages that have files in this project, most files first."""
@@ -98,8 +94,6 @@ class CodeTools:
         return self.lsp._path_map_for(language)
 
     def _open(self, client, language: str, path: Path) -> None:
-        # The client knows what its server has open: a file not sent during a pause, or
-        # opened before a restart, goes out again here.
         client.open_document(path, self._language_id(language))
 
     def _first_file(self, language: str) -> Path | None:
@@ -110,13 +104,10 @@ class CodeTools:
                     return Path(parent) / name
         return None
 
-    # ---- paths --------------------------------------------------------------
 
     def resolve(self, file: str) -> Path | None:
         """A repository-relative path inside the root, or None."""
         text = str(file or "").replace("\\", "/")
-        # The material shows paths as the container mounts them (`/src/server.ts`) or
-        # as absolute paths under the root; both name a file of this tree.
         root = self.root.as_posix().rstrip("/")
         if root and text.startswith(root + "/"):
             text = text[len(root) + 1:]
@@ -293,7 +284,6 @@ class CodeTools:
         self._open(client, language, path)
         return path, language, client, ""
 
-    # ---- the questions ------------------------------------------------------
 
     def find_symbol(self, query: str) -> str:
         """Declared entities whose name matches, across every language of the project."""
@@ -409,8 +399,6 @@ class CodeTools:
                 if not match or text.lstrip().startswith(("//", "#", "*", "/*")):
                     continue
                 if not usable[language] or len(text_all) > MAX_OPEN_BYTES:
-                    # No server to ask, or a file too big to hand it: the place is listed as found
-                    # by text, which says nothing about what it resolves to.
                     silent += 1
                     rows.append(f"- {rel}:{number}: {text.strip()[:90]} → не разрешено: "
                                 + ("сервер недоступен" if not usable[language] else "файл слишком большой для сервера"))
@@ -479,7 +467,7 @@ class CodeTools:
 
         found = psalm_api.usages(self.root, name)
         if not found:
-            return None                      # no index, or a plain function: the server looks
+            return None
         rows: list[str] = []
         tests = 0
         lines: dict[str, list[str]] = {}

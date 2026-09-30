@@ -13,9 +13,6 @@ log = logging.getLogger(__name__)
 
 _JS_NAME = r"[A-Za-z_$][\w$]*"
 
-# Called by the language, never by name: an object used as a function (a middleware, a
-# runtime), `new`, a property read, a cast, array access, iteration. No search finds a
-# call of them, so their absence from a parent's code says nothing about a path.
 _IMPLICIT = frozenset({
     "__invoke", "__call", "__callStatic", "__get", "__set", "__isset", "__unset", "__toString",
     "__construct", "__destruct", "__clone", "__serialize", "__unserialize", "__sleep", "__wakeup",
@@ -131,9 +128,6 @@ def _callers(
                 if enclosing is None:
                     continue
                 if enclosing.name in scan_targets:
-                    # A function calling its own name is recursion. A method of another
-                    # class with the same name is a different function: Yaml::parse
-                    # calling $parser->parse() is the entry point, not a loop.
                     before = text[max(0, match.start() - 10):match.start() + 1]
                     if not enclosing.owner or re.search(r"(?:\$this->|self::|static::|\bthis\.)\s*$",
                                                         before[:-1] if before else ""):
@@ -149,8 +143,6 @@ def _callers(
         if len(found) >= max_symbols:
             break
 
-    # Passing an API through is a path too: Express, for example, exposes
-    # bodyParser.urlencoded as exports.urlencoded without calling it here.
     for path, text in parent_source.items():
         if decl.language_of(path) != decl.JS:
             continue
@@ -181,8 +173,6 @@ def _callers(
     found = list({(s.file, str(s)): s for s in found}.values())
 
     if not sites and not found:
-        # A reference may be a forwarded export or alias that the simple call
-        # parser cannot follow. It must remain unknown, not a negative fact.
         referenced = any(
             re.search(rf"(?<![\w$]){re.escape(target)}(?![\w$])", text)
             for target in targets for text in parent_source.values())
@@ -257,8 +247,6 @@ def entry_points(function: str, source: dict[str, str], *, package: str = "",
         for symbol in result.public_symbols:
             if not any(str(s) == str(symbol) for s in found):
                 found.append(symbol)
-        # Public callers keep being followed: an application may call either
-        # `Yaml::parse` or the `Parser::parse` it delegates to.
         frontier = {s.function for s in result.symbols} - seen
         seen |= frontier
     return found
@@ -326,8 +314,6 @@ def walk_bridge(
         imported_default = (packages[depth - 2] if depth > 1
                             and any(s.default_export and s.function in targets for s in carried)
                             else "")
-        # The package that declares the classes names them too: only a parent's
-        # reference to them is a registration.
         owners = ({s.klass for s in carried if s.klass}
                   if not (origin_package and depth == 1) else set())
         while frontier and steps < max_internal_steps:

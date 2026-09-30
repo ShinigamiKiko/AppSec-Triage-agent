@@ -87,7 +87,6 @@ class RouteIndex:
         return hop, self._perimeter_via.get(key, [])
 
 
-
 def _method_spans(lines: list[str]) -> list[tuple[int, int, str]]:
     """(start, end, name) for each method, 1-indexed and inclusive."""
     starts = [(n, m.group(1)) for n, line in enumerate(lines, 1) if (m := _METHOD_DEF.match(line))]

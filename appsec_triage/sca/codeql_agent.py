@@ -90,8 +90,6 @@ def _material(advisory, symbol, package: str, engine: str = "CodeQL",
         lines.append(f"Vulnerable function named by the fix analysis: {symbol}")
     if symbol is not None and getattr(symbol, "what_changed", ""):
         lines.append(f"What the fix changed: {symbol.what_changed}")
-    # Direct or transitive decides what the question is: for a transitive package
-    # "this project never calls it" is the expected state, not an answer.
     if placement is not None:
         if getattr(placement, "direct", False):
             lines.append(f"Placement: {package} is a direct dependency — the project's own "
@@ -181,7 +179,6 @@ class _Session:
     asked_sites: set[tuple[str, int]] = field(default_factory=set)
     package: str = ""
     package_checked: bool = False
-    # The packages that install a transitive dependency; empty for a direct one.
     parents: tuple[str, ...] = ()
     guard: threading.Lock = field(default_factory=threading.Lock)
     lsp: object = None
@@ -199,8 +196,6 @@ class _Session:
             return "проверка использования пакета недоступна"
         used, detail, test_only = self.ask_package()
         if used is False and self.parents and not test_only:
-            # A transitive package is not imported by the project; that is its normal state.
-            # Whether it runs is a question about the parent, so the investigation goes on.
             parents = ", ".join(self.parents)
             return (f"Проект сам не импортирует {self.package} — для транзитивного пакета это ожидаемо: "
                     f"его загружает {parents}. Это не ответ: проверьте, как проект использует {parents} "
@@ -356,7 +351,6 @@ class _Session:
             else:
                 answer = code.references(file, line, name)
             asked = f"{name} @ {file}:{line}" if name else f"{file}:{line}"
-        # The log keeps the question and a bounded answer; code bodies stay out of it.
         shown = (answer if method not in ("read_symbol", "read_file")
                  else f"прочитано {len(answer.splitlines())} строк")
         self.result.lsp_log.append(f"LSP lsp_{method} {asked}: {shown[:300]}")
@@ -439,7 +433,6 @@ def _function_tool(name, description, properties, required):
         "parameters": {"type": "object", "required": required, "properties": properties}}}
 
 
-
 def _flag(value: object) -> bool:
     """`vulnerable` as the model meant it: a local model sometimes sends "true"."""
     return value is True or (isinstance(value, str) and value.strip().lower() == "true")
@@ -489,7 +482,6 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
                             parallel: int = 1, max_calls: int = 20) -> None:
     """The model calls the analyser itself and reacts to each answer."""
     result = session.result
-    # Psalm answers by type, not by position, so it is offered no position tool.
     tools = [TOOLS[0]]
     if session.engine_available:
         tools += TOOLS[1:] if session.engine == "CodeQL" else [TOOLS[1]]
@@ -501,9 +493,6 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
         tools += reading_tools(_function_tool) + function_tools(_function_tool)
     offered = {tool["function"]["name"] for tool in tools}
     messages = [{"role": "system", "content": registry.step("codeql-agent-tools")}, {"role": "user", "content": material}]
-    # Ходов должно хватать на весь бюджет вопросов. При одном вызове за ход
-    # девять ходов обрывали разговор на девятом вопросе, сколько бы вызовов
-    # ни было разрешено — второй, невидимый потолок.
     for turn_no in range(1, max(max(1, rounds) * 3, max_calls + 2) + 1):
         left = getattr(client, "budget_left_usd", None)
         if isinstance(left, (int, float)) and not isinstance(left, bool) and left <= 0:
@@ -512,7 +501,6 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
         try:
             turn = client.chat_tools(messages, tools)
         except Exception as exc:  # noqa: BLE001 - the chain's own search still runs
-            # If the endpoint rejects native tools, fall back to JSON protocol
             if "tool" in str(exc).lower() or "function" in str(exc).lower():
                 log.info("codeql investigation: native tools rejected, falling back to JSON protocol")
                 _investigate_with_json(client, session, material, rounds)
@@ -522,7 +510,7 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
             result.detail = f"ход {turn_no} не выполнен: {exc}"
             break
         if not turn.tool_calls:
-            break  # the model has what it needs; the verdict is made later
+            break
         messages.append(turn.message)
         answers: list[str | None] = [None] * len(turn.tool_calls)
         allowed: list[int] = []
@@ -539,7 +527,6 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
                      call.name, json.dumps(call.arguments, ensure_ascii=False)[:300])
             return _run_tool(session, call.name, call.arguments, offered)
 
-        # Usage decides whether the rest is worth asking, so it goes first and alone.
         package = [i for i in allowed if turn.tool_calls[i].name == "check_package"]
         rest = [i for i in allowed if i not in package]
         for index in package:
@@ -587,7 +574,6 @@ def _investigate_with_json(client, session: _Session, material: str, rounds: int
                 break
         functions = session.functions(reply)
         sites = session.sites(reply)
-        # If package check was the only thing requested, continue to next round
         if (functions is None and sites is None
                 and (reply.get("package") is None or package_was_checked)):
             break

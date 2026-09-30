@@ -88,14 +88,12 @@ _CLOSURE_STRENGTH = {
     "version_unaffected": 0.95,
     "not_applicable": 0.90,
     "wrong_receiver": 0.85,
-    # A tool compiled the program, or a query traced the data.
     "not_reached": 0.80,
     "condition_absent": 0.75,
     "not_shipped": 0.70,
     "test_only_import": 0.70,
     "unused": 0.60,
     "not_called": 0.60,
-    # An operator's statement about the platform, not a property of this code.
     "infrastructure": 0.60,
 }
 

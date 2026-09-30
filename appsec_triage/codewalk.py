@@ -116,7 +116,6 @@ def _installed_package(path: str) -> str:
         rest = parts[parts.index(anchor) + 1:]
         if not rest:
             return ""
-        # Composer is always vendor/name; npm is scope/name only for a @scope.
         two = anchor == "vendor" or rest[0].startswith("@")
         return f"{rest[0]}/{rest[1]}" if two and len(rest) > 1 else rest[0]
     return ""
@@ -171,8 +170,6 @@ class CodeWalk:
         """Let the model read and search the repository itself; True when evidence was added."""
         evidence = self.repository_evidence
         added = False
-        # Parallel tool calls share one evidence package: reading a file and
-        # appending its block is quick, and it must not interleave.
         writing = threading.Lock()
 
         def run(request: dict) -> str:
@@ -181,7 +178,6 @@ class CodeWalk:
                 blocks, notes = len(pkg.evidence_blocks), len(pkg.context_notes)
                 facts = len(getattr(pkg, "code_facts", None) or [])
                 added = evidence.retrieve(pkg, [request]) or added
-                # "No match" adds no block, but it is an answer the verdict must see.
                 added = added or len(getattr(pkg, "code_facts", None) or []) > facts
                 new_blocks = pkg.evidence_blocks[blocks:]
                 if new_blocks:
@@ -220,19 +216,15 @@ class CodeWalk:
         if self.symbols is not None and getattr(self.symbols, "roots", None):
             from .lsp.code_tools import CodeTools
 
-            # One instance per run: it caches the project's languages and open files.
             if getattr(self, "_code_tools", None) is None:
                 self._code_tools = CodeTools(self.symbols, self.symbols.roots[0])
             code = self._code_tools if self._code_tools.available() else None
         def search(arguments: dict) -> str:
-            # Code is text-searched too: a setting written as a string (`'query parser'`) or a
-            # call the server cannot name is found only this way.
             pattern = str(arguments.get("pattern") or "")
             package = str(arguments.get("package") or "").strip()
             before = len(getattr(pkg, "code_facts", []) or [])
             text = run({"action": "search", "pattern": pattern, **({"package": package} if package else {})})
             if package:
-                # A dependency's own code: no language-server lookup of the project follows.
                 fact = "\n".join((getattr(pkg, "code_facts", []) or [])[before:])
                 return f"{text}\n{fact}" if fact and text != "Nothing found." else (fact or text)
             fact = "\n".join((getattr(pkg, "code_facts", []) or [])[before:])
@@ -304,8 +296,6 @@ class CodeWalk:
                            "references", "callers"):
                 handlers[f"lsp_{method}"] = lsp(method)
 
-        # Lookups whose answer is a checked fact about the whole project — a list of
-        # uses or "not used anywhere". The verdict sees them verbatim and may quote them.
         facts_from = {"lsp_find_usages", "lsp_find_symbol", "lsp_references", "lsp_callers"}
 
         def logged(name, handler):

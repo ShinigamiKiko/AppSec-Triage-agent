@@ -1,6 +1,3 @@
-# Прогон только по critical + high. Отдельный файл, чтобы дефолтный pipeline.yaml
-# оставался полным: сужение скоупа — решение конкретного прогона, а не настройка
-# инструмента.
 provider: ollama
 prompt_pack: default
 max_workers: 4
@@ -15,8 +12,6 @@ scope:
   exclude_rules: ["B101 assert_used"]
   exclude_paths: []
   only_cwes: []
-  # Отсечённые medium/low не исчезают: они попадают в аудит с decided_by=scope
-  # и посчитаны в summary. Это отложенная работа, а не закрытая.
   min_severity: high
 
 heuristics:

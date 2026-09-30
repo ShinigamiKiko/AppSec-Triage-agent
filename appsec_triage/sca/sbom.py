@@ -13,11 +13,6 @@ from urllib.parse import unquote
 
 log = logging.getLogger(__name__)
 
-# Сколько ждать cdxgen. Шестисот секунд хватает, пока он читает только
-# манифесты и лок-файлы. С установленным деревом (на landing-develop это 892
-# пакета) рекурсивный обход по смонтированному диску Windows в них не уложился,
-# и SBOM вышел пустым — то есть SCA-часть прогона потерялась целиком. Значение
-# настраивается, потому что зависит не от проекта, а от того, где он лежит.
 _TIMEOUT_S = int(os.environ.get("APPSEC_SBOM_TIMEOUT_S", "600"))
 
 _PURL_ECOSYSTEM = {
@@ -26,10 +21,6 @@ _PURL_ECOSYSTEM = {
 }
 
 
-# The languages the agent triages: PHP, JS/TS, Go — and no others. cdxgen catalogues
-# every type it recognises unless told which, and for some it asks the type's registry:
-# on a Go project it built a C# bill, api.nuget.org did not answer in 10 s, and cdxgen
-# exited 1 — taking the whole wolfee scan with it.
 _CDXGEN_TYPES = {"go": "go", "golang": "go", "npm": "js", "yarn": "js", "js": "js", "javascript": "js",
                  "typescript": "js", "ts": "js", "composer": "php", "packagist": "php", "php": "php"}
 _ALL_TYPES = ("go", "js", "php")

@@ -1,17 +1,4 @@
 #!/usr/bin/env bash
-#
-# Unattended run over a list of repositories: scan, triage, review queue.
-#
-# Written to survive being left alone. Each project is independent — one failing
-# does not stop the rest — and an interrupted triage is resumed from its journal
-# on the next invocation rather than paid for twice. Safe to re-run at any time;
-# safe to kill at any time.
-#
-#   tools/nightly.sh /path/to/repo-a /path/to/repo-b
-#   PROVIDER=ollama tools/nightly.sh /path/to/repo    # keep it in the perimeter
-#
-# Exit code is the number of projects that failed, so a scheduler can alert on
-# it without parsing the log.
 
 set -u -o pipefail
 
@@ -20,7 +7,6 @@ cd "$(dirname "$0")/.." || exit 1
 PROVIDER="${PROVIDER:-deepseek}"
 OUT_ROOT="${OUT_ROOT:-out/nightly}"
 WORKERS="${WORKERS:-4}"
-# Only set when it is not already on PATH; the launcher is read from lsp.yaml.
 export PHPACTOR_PHAR="${PHPACTOR_PHAR:-$HOME/phpactor.phar}"
 
 targets=("$@")
@@ -31,10 +17,6 @@ fi
 
 mkdir -p "$OUT_ROOT"
 
-# Fail before spending anything. A missing API key is worth learning in the
-# first second, not on finding 300 of an overnight run. `doctor` reports on
-# every configured provider, including ones this run will not touch, so the
-# gate is on the chosen provider alone.
 python3 -m appsec_triage.cli doctor >"$OUT_ROOT/doctor.log" 2>&1
 if ! python3 -m appsec_triage.cli providers | grep -q "^$PROVIDER .*\(key set\|no key needed\)"; then
   echo "error: provider '$PROVIDER' is not usable — see $OUT_ROOT/doctor.log" >&2
@@ -50,8 +32,6 @@ for target in "${targets[@]}"; do
   mkdir -p "$out"
 
   echo "=== $name  $(date '+%F %T')"
-  # Logged to a file rather than piped: a pipe loses whatever it is still
-  # buffering when the process dies, which is exactly when the log matters.
   if python3 -m appsec_triage.cli run "$target" \
       -p "$PROVIDER" -o "$out" --workers "$WORKERS" >"$log" 2>&1; then
     verdicts="$out/verdicts-$PROVIDER.jsonl"

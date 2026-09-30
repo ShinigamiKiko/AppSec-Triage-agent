@@ -48,7 +48,6 @@ class CVEDecision:
                                 CVEVerdict.VERSION_UNAFFECTED)
 
 
-
 def _audited(audit, kind: str) -> bool:
     """Did the check aimed at this closure's blind spot actually run?"""
     return audit is not None and getattr(audit, "checked", False) and audit.kind == kind

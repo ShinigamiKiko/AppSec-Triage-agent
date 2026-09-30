@@ -74,9 +74,6 @@ class ProviderConfig:
     budget_usd: float = 5.0
     keep_raw_response: bool = False
     tool_calling: bool = True
-    # Ollama's top-level `think` for hybrid-reasoning models: "false" skips the thinking
-    # block, whose tokens count against max_tokens and every one of which the GPU
-    # generates before the answer; "" leaves the model's default.
     think: str = ""
 
     options: dict[str, Any] = field(default_factory=dict)
@@ -129,7 +126,6 @@ class ScannerConfig:
     docker_network: bool = False
     docker_args: list[str] = field(default_factory=list)
     run_in_target: bool = False
-    # CodeQL only: query suites and extra model packs per language (`go`, `javascript`).
     suites: dict[str, list[str]] = field(default_factory=dict)
     model_packs: dict[str, list[str]] = field(default_factory=dict)
 
@@ -188,12 +184,7 @@ class VerificationConfig:
     challenge_on_override: bool = False
     challenge_cwes: list[str] = field(default_factory=list)
     challenge_closures_above_consequence: int = 0
-    # Which kinds of finding get a second pass. A dependency verdict now rests on the
-    # installed version and the chain's facts, not on the model's reading of code, so a
-    # second model reading of it costs as much as the first and changes nothing.
     challenge_kinds: list[str] = field(default_factory=lambda: ["weakness"])
-    # In advisory mode a refuted `confirmed` on a code weakness becomes `unknown` when the
-    # objection cites a verbatim line — the measured weak spot is exactly that verdict.
     downgrade_confirmed: bool = True
 
 
@@ -205,8 +196,6 @@ class TriageQueueConfig:
     review_budget_pct: float = 30.0
     cluster: bool = True
     min_score: int = 50
-    # Share of findings the run is expected to settle without a person. Below it the run
-    # says so at the end — a signal that the configuration or the project needs a look.
     auto_decide_target_pct: float = 70.0
 
 
@@ -230,42 +219,17 @@ class PipelineConfig:
     max_evidence_chars: int = 32000
     context_retrieval_rounds: int = 2
     code_walk_first: bool = True
-    # A finding that has been running this long is reported while it runs, with
-    # its id: a silent progress bar cannot say which one is stuck. Measured on a
-    # chain run, a finding takes 300-800 s, so a lower threshold would fire on
-    # every one of them and the warning would come to mean "normal".
     slow_finding_seconds: int = 900
-    # Independent questions one finding may put to the analysers at the same
-    # time: CodeQL, Psalm and the language servers answer on their own threads.
-    # 1 keeps a finding strictly sequential; `max_workers` is the separate knob
-    # for how many findings run at once.
-    # Сколько вопросов модель может задать по одной находке: проверить пакет,
-    # спросить про функцию, про публичные входы, про места вызова. Восьми не
-    # хватало — на PHP-проекте лимит упирался у 76 находок из 90, и вердикт
-    # выносился по недоисследованному. Число в конфиге, а не в коде: вопросы
-    # стоят времени и денег, и общий раннер может позволить себе меньше.
     max_tool_calls: int = 20
-    # Только для Ollama (configs/pipeline-ollama.yaml); у других провайдеров
-    # сбрасываются к этим значениям при запуске, что бы ни стояло в файле.
-    # Раунды поиска на шаге «проверка места вызова» и вопросов к CodeQL в них.
     callsite_search_rounds: int = 3
     callsite_dataflow_requests: int = 4
-    # Виды механических закрытий, которые модель не перепроверяет: закрытие
-    # принимается как есть, с пометкой в отчёте. Пусто — перепроверяются все.
     skip_closure_audits: list[str] = field(default_factory=list)
-    # SBOM, снятый один раз за прогон: тот же документ идёт в граф и на починку имён.
     sbom_path: str = ""
-    # Does the build process input nobody on the team wrote — pull requests from
-    # forks, uploaded sources? Only then can a code-execution flaw in a build tool
-    # be triggered through the build. A hostile package is a build risk either way.
     build_untrusted_input: bool = False
     parallel_llm: int = 2
     redact_secrets: bool = False
     secrets_without_model: bool = True
     deployment_config: str | None = None
-    # The dependency chain is the work itself: resolve the advisory's symbol,
-    # look for its calls, walk the chain, check the closure. It needs the
-    # network for advisories, so `--no-resolve-symbols` turns it off.
     resolve_vulnerable_symbols: bool = True
     nvd_api_key: str | None = None
     govulncheck_report: str | None = None
@@ -291,7 +255,6 @@ def provider_kind(name: str, *, config_dir: Path | None = None) -> str:
     return str((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("kind", ""))
 
 
-# A local model gets its own pipeline: fewer questions per finding, fewer rechecks.
 OLLAMA_PIPELINE = CONFIG_DIR / "pipeline-ollama.yaml"
 _OLLAMA_ONLY = ("callsite_search_rounds", "callsite_dataflow_requests", "skip_closure_audits")
 

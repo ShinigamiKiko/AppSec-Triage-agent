@@ -62,7 +62,6 @@ class PhpRules(LanguageRules):
                     found.functions[local] = _short(qname)
                 elif kind != "const":
                     found.classes[local] = _short(qname)
-        # Fully qualified use without a `use` statement.
         for ns in namespaces:
             for match in re.finditer(rf"\\?{re.escape(ns.strip(chr(92)))}\\(?P<cls>[A-Za-z_]\w*)\b", text):
                 found.classes.setdefault(match.group(0).lstrip("\\"), match.group("cls"))

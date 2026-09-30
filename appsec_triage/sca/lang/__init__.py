@@ -49,9 +49,6 @@ class FileScan:
 _JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", "/index.ts", "/index.js")
 
 
-# When a project declares no aliases, the two conventions in use: `@/` for the project
-# root (some Vue/Nuxt setups) and for `src/` (Vue CLI, most Vite templates). Both are
-# tried; a file that exists under neither is left unresolved.
 _FALLBACK_ALIASES: dict[str, list[str]] = {"@/": ["", "src"], "~/": ["", "src"]}
 
 

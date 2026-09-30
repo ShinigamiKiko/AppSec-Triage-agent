@@ -56,7 +56,6 @@ class ScanResult:
     mode: str | None = None
     error: str | None = None
     stderr_tail: str = ""
-    # Something a successful scan left out, worth a line next to its result.
     note: str = ""
 
     def as_dict(self) -> dict:
@@ -82,8 +81,6 @@ class Scanner(ABC):
 
     def __init__(self, cfg: ScannerConfig) -> None:
         self.cfg = cfg
-        # The candidate that answered the version probe: a broken binary of the same
-        # name earlier on PATH (a project's own Psalm) must not hide a working one.
         self._binary: str | None = None
 
 
@@ -133,9 +130,6 @@ class Scanner(ABC):
                 problems.append(f"{exe!r} not found")
                 continue
             try:
-                # From a neutral directory: the job starts in the project, and a tool that
-                # reads the working directory first (Psalm looks for vendor/autoload.php
-                # next to composer.json before it answers --version) fails there.
                 proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=60,
                                       env=_native_scanner_env(), check=False, cwd=tempfile.gettempdir())
             except (OSError, subprocess.TimeoutExpired) as exc:

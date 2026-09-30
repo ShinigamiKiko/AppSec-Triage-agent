@@ -16,8 +16,6 @@ _REGISTRY = {
 
 def build_client(cfg: ProviderConfig) -> LLMClient:
     if cfg.kind == "mailbox":
-        # A local testing provider (the evaluator answers as the model, through files).
-        # It is not part of the repository: imported only when asked for.
         try:
             from .mailbox import MailboxClient
         except ImportError:

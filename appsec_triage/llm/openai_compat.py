@@ -41,8 +41,6 @@ class _ChatCompletionsClient(BaseHTTPClient):
         message = choices[0].get("message") or {}
         text = message.get("content") or ""
         if choices[0].get("finish_reason") == "length":
-            # A cut-off reply is not an answer: half a JSON object only buys three
-            # "not valid JSON" retries at the same limit.
             raise LLMTruncated(f"{self.cfg.name}: response truncated at max_tokens={self._max_tokens()}")
         usage = body.get("usage") or {}
         return text, usage.get("prompt_tokens"), usage.get("completion_tokens")
@@ -51,7 +49,6 @@ class _ChatCompletionsClient(BaseHTTPClient):
     _NATIVE_TOOLS = True
 
     def _tool_payload(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
-        # No `response_format`: a JSON-mode reply cannot also be a tool call.
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,

@@ -48,22 +48,16 @@ _COMPOSER_ATTEMPTS = max(1, min(_ATTEMPTS, 3))
 _YARN = os.environ.get("APPSEC_YARN", "yarn@1.22.22")
 
 _COPY_SKIP = {".git", "node_modules", ".codeql", "coverage", ".nuxt", ".next"}
-# Registry configuration of the developer's machine points at the private proxy.
 _REGISTRY_CONFIG = (".npmrc", ".yarnrc", ".yarnrc.yml", "auth.json")
-# Hosts a locked Composer package may be fetched from without the company network.
 _PUBLIC_HOSTS = {"github.com", "api.github.com", "codeload.github.com", "gitlab.com",
                  "bitbucket.org", "repo.packagist.org", "packagist.org"}
 _GITHUB_REPO = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _COMPOSER_SECTIONS = ("require", "require-dev")
 _SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
-# A spec that is not a version range: git, a URL, a local path, a workspace link.
 _NOT_REGISTRY = re.compile(r"^(?:git\+|git:|https?:|file:|link:|workspace:|github:|[\w.-]+/[\w.-]+(?:#|$))")
-# `<registry prefix>/<name>/-/<file>.tgz` — the tail is the same on any npm registry.
 _TARBALL = re.compile(r"(https?://[^\s\"']+?/)((?:@[^/\s\"'@]+/)?[^/\s\"'@]+/-/[^\s\"'#]+\.tgz)")
 _MISSING = (
     re.compile(r"404[^\n]*?GET\s+\S+?/((?:@[^/\s]+(?:/|%2[fF]))?[^/\s@]+)(?:\s|$|/-/)"),
-    # yarn: `error Error: https://…/@scope/name/-/name-1.0.0.tgz: Request failed "404 Not Found"`,
-    # with or without a quote before the URL.
     re.compile(r"https?://[^\s\"]+?/((?:@[^/\s\"]+/)?[^/\s\"@]+)/-/[^\s\"]+\.tgz: Request failed \\?\"404"),
     re.compile(r"\"https?://[^\"]+?/((?:@[^/\"]+(?:/|%2[fF]))?[^/\"@:]+): Not found"),
     re.compile(r"No matching version found for ((?:@[^/\s]+/)?[^@\s]+)@"),
@@ -76,9 +70,9 @@ class InstallResult:
     workspace: Path | None = None
     tool: str = ""
     installed: int = 0
-    faithful: bool = False          # versions taken from the project's lock file
+    faithful: bool = False
     dropped: list[str] = field(default_factory=list)
-    rewritten: int = 0              # lock entries moved from a private host to the public one
+    rewritten: int = 0
     problem: str = ""
 
     @property
@@ -133,7 +127,7 @@ def rewrite_composer_lock(lock: Path) -> tuple[int, list[str]]:
             source = package.get("source") or {}
             reference = source.get("reference") or dist.get("reference")
             if dist.get("type") == "path" or (not dist and not source):
-                kept.append(package)           # a local path or a metapackage: nothing to fetch
+                kept.append(package)
                 continue
             if _host(dist.get("url", "")) in _PUBLIC_HOSTS:
                 kept.append(package)
@@ -146,7 +140,7 @@ def rewrite_composer_lock(lock: Path) -> tuple[int, list[str]]:
                 rewritten += 1
                 kept.append(package)
             elif _host(source.get("url", "")) in _PUBLIC_HOSTS and reference:
-                package.pop("dist", None)      # Composer clones the public source instead
+                package.pop("dist", None)
                 rewritten += 1
                 kept.append(package)
             else:
@@ -162,7 +156,7 @@ def public_composer_manifest(manifest: Path, dropped: list[str]) -> None:
     for section in _COMPOSER_SECTIONS:
         for name in dropped:
             (data.get(section) or {}).pop(name, None)
-    data.pop("repositories", None)             # back to Packagist, the public default
+    data.pop("repositories", None)
     manifest.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
 
 
@@ -253,8 +247,6 @@ def _command(workspace: Path, registry: str) -> tuple[str, list[str]]:
     common_npm = [f"--registry={registry}", "--userconfig", os.devnull,
                   "--ignore-scripts", "--no-audit", "--no-fund", "--legacy-peer-deps"]
     if (workspace / "yarn.lock").is_file():
-        # yarn keeps the locked versions; --pure-lockfile tolerates the entries of
-        # dropped packages instead of failing like --frozen-lockfile would.
         return "yarn", ["npx", "--yes", f"--registry={registry}", _YARN, "install",
                         "--pure-lockfile", "--ignore-scripts", "--non-interactive",
                         "--ignore-engines", "--network-timeout", "120000",
@@ -294,9 +286,6 @@ def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) ->
     shutil.rmtree(home, ignore_errors=True)
     env = {**os.environ, "COMPOSER_HOME": str(home), "COMPOSER_NO_INTERACTION": "1",
            "COMPOSER_ALLOW_SUPERUSER": "1", "COMPOSER_NO_AUDIT": "1"}
-    # The downloaded archives outlive the run where the run keeps its cache: a scan in a
-    # fresh container fetched 160+ archives from GitHub again, and a slow day ran out
-    # of time a third of the way through.
     if cache := os.environ.get("APPSEC_CACHE_DIR", "").strip():
         env["COMPOSER_CACHE_DIR"] = str(Path(cache) / "composer")
     run = dict(cwd=workspace, capture_output=True, text=True, env=env, encoding="utf-8",
@@ -304,16 +293,8 @@ def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) ->
     autoload = workspace / "vendor" / "autoload.php"
     proc = None
     try:
-        # Composer 2.9 refuses to install versions with known advisories — exactly the
-        # versions a scan exists to look at.
         subprocess.run(["composer", "config", "--global", "audit.block-insecure", "false"],
                        timeout=60, **run)
-        # --no-dev: what production code reaches is the question, and a project's own dev
-        # Psalm in vendor/ hijacks the scanner's Psalm (its Psalm\ classes load first).
-        # Again when it fails or runs out of time: one archive lost on the way, or a slow
-        # GitHub, stops composer before it writes the autoloader, and without one neither
-        # Psalm nor the dependency chain reads a line of PHP. The archives already
-        # fetched stay in the cache, so the next attempt only fetches what is missing.
         for attempt in range(1, _COMPOSER_ATTEMPTS + 1):
             try:
                 proc = subprocess.run(["composer", "install", "--no-interaction", "--no-progress",
@@ -378,7 +359,6 @@ def _install_npm(workspace: Path, result: InstallResult, registry: str, attempts
         removable = {name for name in missing if drop_dependency(manifest, name)}
         if not removable:
             lines = output.strip().splitlines()
-            # The error line, not the stack trace under it.
             said = [line.strip() for line in lines if re.search(r"\berr(?:or)?\b", line, re.I)
                     and not line.lstrip().startswith("at ")]
             reason = "\n".join(said[:3] or lines[-4:])

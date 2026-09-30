@@ -96,7 +96,6 @@ def _by_configuration(
     return None
 
 
-
 _SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["verdict", "evidence", "why"],

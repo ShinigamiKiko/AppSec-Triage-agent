@@ -156,14 +156,12 @@ class JavaScriptRules(LanguageRules):
                 if target and target not in found.receivers:
                     found.receivers.add(target)
                     grown = True
-            # A registry of instances: `instances[name] = axios.create(...)`.
             for match in _CONTAINER_ASSIGN.finditer(text):
                 rhs = re.sub(r"\s+", "", match.group("rhs")).replace("?.", ".")
                 target = re.sub(r"\s+", "", match.group("container"))
                 if self._bound_chain(rhs, found) and target not in found.receivers:
                     found.receivers.add(target)
                     grown = True
-            # Request handlers registered on a bound app: `app.use('*', async (req, res) => …)`.
             for receiver in sorted(found.receivers):
                 if "." in receiver or "[" in receiver:
                     continue
@@ -228,7 +226,6 @@ class JavaScriptRules(LanguageRules):
 
     def calls(self, text: str, bindings: Bindings, function: str, klass: str = "") -> list[CallMatch]:
         out: list[CallMatch] = []
-        # A function this file defines itself is not the package's, whatever its name.
         local = {m.group("f") or m.group("v") for m in _LOCAL_FUNCTION.finditer(text)}
         names = [function] + [local for local, original in bindings.functions.items()
                               if original == function and local != function]

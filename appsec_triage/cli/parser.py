@@ -20,7 +20,6 @@ def _triage_options(p: argparse.ArgumentParser) -> None:
                         "(default from pipeline.yaml; 1 = sequential)")
     p.add_argument("--limit", type=int)
     p.add_argument("--govulncheck", dest="govulncheck", type=Path)
-    # On by default; the flag stays so older commands and CI files keep working.
     p.add_argument("--resolve-symbols", dest="resolve_symbols", action="store_true")
     p.add_argument("--no-resolve-symbols", dest="resolve_symbols", action="store_false",
                    help="skip the dependency chain and judge a dependency on its version alone")
@@ -55,9 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="scan a source tree and triage the findings in one pass")
     r.add_argument("target"); r.add_argument("-s", "--scanner", action="append"); _triage_options(r)
     r.add_argument("--lsp-config", type=Path); r.add_argument("--sbom", type=Path); r.add_argument("--no-deps", action="store_true")
-    # Off by default: the job installs dependencies itself, through the registries it has
-    # access to. The flag is for runs outside that network (local tests): it installs
-    # into a copy from public sources, rewriting a private proxy's URLs in the lock file.
     r.add_argument("--install-deps", dest="install_deps", action="store_true",
                    help="outside the CI network only: install npm/composer dependencies from public "
                         "sources, at the lock file's versions, into a copy of the project")

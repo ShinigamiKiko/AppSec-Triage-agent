@@ -135,8 +135,6 @@ def _import_patterns(package: str, ecosystem: str | None) -> list[re.Pattern[str
     return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
-# Asked for every dependency finding, and the answer depends only on the package and
-# the tree: each ask walked the whole tree — vendor/ with it — and read the project again.
 _IMPORTED: dict[tuple, bool | None] = {}
 _SOURCE_LISTS: dict[tuple[str, frozenset], list[Path]] = {}
 _CACHE_LOCK = threading.Lock()

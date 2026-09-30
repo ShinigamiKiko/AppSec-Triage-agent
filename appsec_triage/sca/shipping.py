@@ -35,9 +35,6 @@ _JS_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".
 _BUILD_FILE = re.compile(
     r"(^|/)(?:[\w.-]+\.config\.[cm]?[jt]s|\.[\w.-]+rc(?:\.[cm]?[jt]s|\.json)?|gulpfile\.[jt]s|Gruntfile\.[jt]s)$"
     r"|(^|/)(scripts|tools|build|config/webpack|\.storybook|\.husky)/", re.IGNORECASE)
-# Server code by convention. The entry file itself is not guessed from its name
-# (`src/main.ts` is the browser entry of most SPAs): it is read from the start
-# command and package.json, see ProjectShipping._server_entries.
 _SERVER_FILE = re.compile(
     r"(^|/)(server|api|backend|functions|middleware|routes|controllers)/|entry-server\.|\.server\.",
     re.IGNORECASE)
@@ -55,8 +52,6 @@ _INSTALL = re.compile(r"\b(?:npm\s+(?:ci|install|i)\b|yarn(?:\s+install)?\b(?!\s
 class ImageFacts:
     """What the runtime stage of the Dockerfile carries."""
 
-    # full: node_modules/vendor with development packages; production: pruned; none: no
-    # installed tree in the runtime image; unknown: no Dockerfile or unreadable.
     tree: str = "unknown"
     detail: str = ""
     start_command: str = ""
@@ -65,12 +60,12 @@ class ImageFacts:
 @dataclass(slots=True)
 class ShippingFacts:
     package: str
-    shipped: str = "unknown"          # runtime | image_only | build_only | unknown
-    where: str = "unknown"            # browser | node | both | unknown
-    scope: str = "unknown"            # runtime | dev | unknown  (dependency graph)
-    declared: str = ""                # dependencies | devDependencies | transitive | ""
+    shipped: str = "unknown"
+    where: str = "unknown"
+    scope: str = "unknown"
+    declared: str = ""
     import_sites: list[str] = field(default_factory=list)
-    via: list[str] = field(default_factory=list)     # project requirements that load it
+    via: list[str] = field(default_factory=list)
     image: ImageFacts = field(default_factory=ImageFacts)
     detail: str = ""
 
@@ -180,7 +175,6 @@ class ProjectShipping:
         self.ssr = self._detect_ssr()
         self.bundler = self._detect_bundler()
 
-    # -- project-level facts ---------------------------------------------------------
     def _manifest(self) -> dict:
         try:
             return json.loads((self.root / "package.json").read_text(encoding="utf-8", errors="replace"))
@@ -314,7 +308,6 @@ class ProjectShipping:
             return "both"
         return "node" if server else "browser" if client else "unknown"
 
-    # -- per package ------------------------------------------------------------------
     def facts(self, package: str, ecosystem: str = "npm") -> ShippingFacts:
         key = (package or "").lower()
         with self._lock:
@@ -333,7 +326,6 @@ class ProjectShipping:
         facts.scope = self.graph.scope(package) if self.graph is not None else (
             "runtime" if package in prod else "dev" if package in dev else "unknown")
         if ecosystem not in ("npm", "node", "javascript", "yarn", ""):
-            # No bundling outside JS: the section and the image decide.
             return self._by_scope(facts)
 
         sites = self._scan()
@@ -375,7 +367,6 @@ class ProjectShipping:
 
     def _by_scope(self, facts: ShippingFacts) -> ShippingFacts:
         if facts.scope == "runtime" or facts.declared == "dependencies":
-            # Outside JS there is no browser bundle: the code runs in the server process.
             facts.shipped, facts.where = "runtime", "server"
         elif facts.scope == "dev" or facts.declared == "devDependencies":
             facts.shipped = "image_only" if self.image.tree == "full" else "build_only"
