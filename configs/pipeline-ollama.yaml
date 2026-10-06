@@ -1,12 +1,19 @@
 extends: pipeline.yaml
 provider: ollama
 
-max_tool_calls: 8
+# Вопросов модели на находку (исследование пакета и проход по коду). У остальных
+# провайдеров — 20 из pipeline.yaml.
+max_tool_calls: 3
 context_retrieval_rounds: 1
 callsite_search_rounds: 1
 callsite_dataflow_requests: 2
 
-skip_closure_audits: [not_reached, not_shipped, wrong_receiver, test_only]
+# Автозакрытие окончательное: закрытое скриптами модели не отдаётся — ни на
+# перепроверку слепой зоны, ни на вердикт. Дешёвые закрытия идут до первого
+# вызова модели.
+closures_final: true
+skip_closure_audits: [not_reached, not_shipped, wrong_receiver, test_only,
+                      unused, no_input_path, only_in_tests]
 
 verification:
   challenge_verdicts: []

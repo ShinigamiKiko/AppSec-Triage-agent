@@ -224,6 +224,11 @@ class PipelineConfig:
     callsite_search_rounds: int = 3
     callsite_dataflow_requests: int = 4
     skip_closure_audits: list[str] = field(default_factory=list)
+    # Автозакрытие окончательное: что закрыли скрипты, модели не отдаётся вовсе.
+    # Дешёвые закрытия (граф вызовов, только сборка, пакет не импортируется, импорт
+    # только в тестах) проверяются до первого вызова модели, а закрытая находка по
+    # зависимости не уходит на вердикт, даже если политике есть что уточнить.
+    closures_final: bool = False
     sbom_path: str = ""
     build_untrusted_input: bool = False
     parallel_llm: int = 2
@@ -256,7 +261,8 @@ def provider_kind(name: str, *, config_dir: Path | None = None) -> str:
 
 
 OLLAMA_PIPELINE = CONFIG_DIR / "pipeline-ollama.yaml"
-_OLLAMA_ONLY = ("callsite_search_rounds", "callsite_dataflow_requests", "skip_closure_audits")
+_OLLAMA_ONLY = ("callsite_search_rounds", "callsite_dataflow_requests", "skip_closure_audits",
+                "closures_final")
 
 
 def keep_ollama_only_settings(cfg: PipelineConfig, provider_kind: str) -> None:

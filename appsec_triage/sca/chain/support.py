@@ -25,12 +25,15 @@ class ChainSupport:
                  codeql_binary: str = "codeql", psalm_binary: str | None = None,
                  parallel_llm: int = 1, max_tool_calls: int = 20,
                  sbom_path: str = "", callsite_search_rounds: int = 3,
-                 callsite_dataflow_requests: int = 4, skip_closure_audits=()) -> None:
+                 callsite_dataflow_requests: int = 4, skip_closure_audits=(),
+                 closures_final: bool = False) -> None:
         self._client = client
         self._max_tool_calls = max_tool_calls
         self._callsite_rounds = max(1, callsite_search_rounds)
         self._callsite_dataflow = max(0, callsite_dataflow_requests)
         self._skip_audits = frozenset(skip_closure_audits or ())
+        # An automatic closure is final: checked before any model step (Ollama's profile).
+        self._closures_final = closures_final
         self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
         self._roots = [Path(r) for r in roots]
         self._lsp = lsp

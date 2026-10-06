@@ -152,7 +152,8 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
               f"вопросов на находку {cfg.max_tool_calls}, раундов проверки места вызова "
               f"{cfg.callsite_search_rounds}, без перепроверки закрытий: "
               f"{', '.join(cfg.skip_closure_audits) or 'нет'}, второй проход по подтверждённым: "
-              f"{'да' if cfg.verification.challenge_verdicts else 'нет'}", file=sys.stderr)
+              f"{'да' if cfg.verification.challenge_verdicts else 'нет'}, закрытое скриптами к модели "
+              f"не идёт: {'да' if cfg.closures_final else 'нет'}", file=sys.stderr)
     if provider_cfg.leaves_the_perimeter: cfg.redact_secrets = True
     log_path = attach_file_log(out)
     print(f"→ подробный лог: {log_path}", file=sys.stderr)

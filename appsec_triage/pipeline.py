@@ -220,6 +220,7 @@ class TriagePipeline:
                 callsite_search_rounds=cfg.callsite_search_rounds,
                 callsite_dataflow_requests=cfg.callsite_dataflow_requests,
                 skip_closure_audits=cfg.skip_closure_audits,
+                closures_final=cfg.closures_final,
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
@@ -356,6 +357,15 @@ class TriagePipeline:
                 dep_policy = self._dependency_policy(finding, chain)
                 sca_summary.priority, sca_summary.policy = dep_policy.priority, dep_policy.rule
                 if chain.closes and dep_policy.label == "false_positive":
+                    return records.dependency_closed(finding, chain, sca_summary,
+                                                 provider=self.provider_cfg.name)
+                if chain.closes and dep_policy.label != "confirmed" and self.cfg.closures_final:
+                    # The profile takes an automatic closure as final: what the policy would
+                    # still have asked about goes into the record, not to the model.
+                    sca_summary.problems.insert(0, (
+                        f"политика ({dep_policy.rule}): {dep_policy.reason or 'решение за моделью'} — "
+                        "модели не передавалось: профиль закрывает автоматически"))
+                    sca_summary.priority, sca_summary.policy = "none", f"closures_final:{dep_policy.rule}"
                     return records.dependency_closed(finding, chain, sca_summary,
                                                  provider=self.provider_cfg.name)
                 if not dep_policy.needs_model:
