@@ -17,6 +17,7 @@ from .. import request_readers
 from .. import lsp_tools as lsp_tools_mod, registries, unreached as unreached_mod
 from .. import verdict as verdict_mod, versions as versions_mod
 from ...lsp import code_tools as lsp_code_tools
+from ..resolve import VulnerableSymbol
 from .helpers import (_CODEQL_LANGUAGE, _finding_call_site, _flaw_of, _needs_llm_advisory,
                       _render_finding_trace)
 from .models import ChainResult
@@ -74,6 +75,8 @@ class DependencyChain(ChainSupport):
             finding, dependency, _, _ = item
             try:
                 advisory = self._advisory_for(finding, dependency)
+                if self._closures_final and self._closes_without_model(finding, dependency, advisory):
+                    return None
                 return self._resolve_symbol(advisory, dependency.installed_version or "")
             except Exception:  # noqa: BLE001 - подготовка не обязана удаться
                 log.debug("batch prepare skipped %s", getattr(finding, "finding_id", "?"), exc_info=True)
@@ -105,12 +108,8 @@ class DependencyChain(ChainSupport):
             self._batched[(language, package)] = (answer, frozenset(t.label for t in targets))
             log.info("codeql batch for %s: %d function(s) in one query", package, len(targets))
 
-    def run(self, finding: Finding, *, codeql_findings: Iterable[Finding] = ()) -> ChainResult:
-        dependency = finding.dependency
-        if dependency is None:
-            return ChainResult(decide(None, None, None))
-        problems: list[str] = []
-        identifiers = self._identifiers(finding)
+    def _reachability_for(self, finding: Finding, dependency, identifiers: list[str]):
+        """The call graph's answer for this finding: govulncheck's report, else the scanner's own."""
         reachability = None
         if self._reachability is not None and self._reachability.usable:
             reachability = self._reachability.lookup(finding.rule_id or "", *identifiers)
@@ -147,6 +146,94 @@ class DependencyChain(ChainSupport):
             if position and position not in sites:
                 sites.append(position)
             reachability.sites.extend(sites)
+        return reachability
+
+    def _closed_without_model(self, dependency, advisory, reachability, shipping,
+                              version_known: bool, problems: list[str],
+                              codeql_calls: list[str] | None = None) -> ChainResult | None:
+        """`closures_final`: a closure the scripts establish, before any model step.
+
+        The same facts `decide()` closes on and in its order — the call graph, build-only,
+        then imports of a direct package — taken before the symbol, the investigation and
+        the audit instead of after them. None: nothing closes here, the chain goes on.
+        """
+        if not self._roots:
+            return None
+        placement = self._placement(dependency.package or "")
+        symbol = None
+        if reachability is not None:
+            if reachability.reachable:
+                return None
+            kind, route = "not_reached", "callgraph"
+            audit = unreached_mod.not_rechecked(kind)
+            decision = decide(None, None, None, reachability=reachability, graph_audit=audit)
+        elif shipping is not None and shipping.shipped == "build_only":
+            kind, route = "not_shipped", "package"
+            audit = unreached_mod.not_rechecked(kind)
+            decision = decide(None, None, None, dev_only=True, closure_audit=audit)
+        elif placement is not None and placement.direct:
+            paths = tuple(getattr(advisory, "import_paths", None) or ())
+            package_used, package_used_detail = (
+                presence_mod.import_path_used(self._roots[0], dependency.ecosystem or "", paths)
+                if paths else (None, ""))
+            if package_used is False:
+                kind, route = "unused", "package"
+                audit = unreached_mod.not_rechecked(kind)
+                symbol = VulnerableSymbol(advisory_id=advisory.advisory_id, package=advisory.package,
+                                          package_paths=paths)
+                decision = decide(symbol, None, None, package_used=False,
+                                  package_used_detail=package_used_detail, direct=True,
+                                  closure_audit=audit)
+            elif package_used is None:
+                used, used_detail, test_only = self._package_usage(
+                    dependency, dependency.package or "", record=codeql_calls)
+                if used is not False:
+                    return None
+                kind, route = ("test_only" if test_only else "unused"), "package"
+                audit = unreached_mod.not_rechecked(kind)
+                decision = decide(None, None, None, used=False, used_detail=used_detail,
+                                  test_only=test_only, direct=True, closure_audit=audit)
+            else:
+                return None
+        else:
+            return None
+        if not decision.closes:
+            return None
+        return ChainResult(
+            decision, symbol, problems=problems, placement=placement, reachability=reachability,
+            route=route, codeql_calls=list(codeql_calls or []), flaw=_flaw_of(advisory),
+            shipping=shipping, advisory=advisory, version_known=version_known,
+            audit=audit.render(), closure_kind=kind, audited=True)
+
+    def _closes_without_model(self, finding: Finding, dependency, advisory) -> bool:
+        """`closures_final`: would `run` close this finding before its first model step?"""
+        version = versions_mod.check(dependency.installed_version or "", advisory,
+                                     dependency.package or "", dependency.ecosystem or "")
+        if version.unaffected:
+            return True
+        reachability = self._reachability_for(finding, dependency, self._identifiers(finding))
+        return self._closed_without_model(
+            dependency, advisory, reachability, self._shipping_facts(dependency),
+            version.state != versions_mod.UNKNOWN, []) is not None
+
+    def _tally(self, verdict: CVEVerdict) -> None:
+        if verdict is CVEVerdict.NOT_APPLICABLE:
+            self.stats["not_distributed"] += 1
+        elif verdict in (CVEVerdict.NO_DIRECT_CALL, CVEVerdict.MENTIONED_ONLY,
+                         CVEVerdict.ONLY_IN_TESTS, CVEVerdict.NOT_REACHED, CVEVerdict.ONLY_TEST_IMPORT):
+            self.stats["absent"] += 1
+        elif verdict in (CVEVerdict.ACTUAL, CVEVerdict.PRESENT_UNPROVEN):
+            self.stats["called"] += 1
+        else:
+            self.stats["undecided"] += 1
+
+    def run(self, finding: Finding, *, codeql_findings: Iterable[Finding] = ()) -> ChainResult:
+        dependency = finding.dependency
+        if dependency is None:
+            return ChainResult(decide(None, None, None))
+        problems: list[str] = []
+        identifiers = self._identifiers(finding)
+        reachability = self._reachability_for(finding, dependency, identifiers)
 
         key = (identifiers[0] if identifiers else "", dependency.package or "",
                dependency.ecosystem or "", dependency.installed_version or "")
@@ -174,6 +261,16 @@ class DependencyChain(ChainSupport):
         shipping = self._shipping_facts(dependency)
         build_only = bool(shipping is not None and shipping.shipped == "build_only")
         not_loaded = bool(shipping is not None and shipping.shipped in ("build_only", "image_only"))
+
+        if self._closures_final:
+            early_calls: list[str] = []
+            closed = self._closed_without_model(dependency, advisory, reachability, shipping,
+                                                version_known, problems, early_calls)
+            if closed is not None:
+                self._tally(closed.decision.verdict)
+                log.info("%s closed before any model step (%s): closures_final",
+                         advisory.advisory_id, closed.closure_kind)
+                return closed
 
         exclusion = components_mod.classify(advisory, self._deployment, self._client, self._roots)
         if exclusion is not None:
@@ -558,13 +655,5 @@ class DependencyChain(ChainSupport):
             self.stats["unaudited_closures"] += 1
             log.warning("closure for %s left unaudited, sent to review: %s",
                         advisory.advisory_id, checked.detail)
-        if verdict is CVEVerdict.NOT_APPLICABLE:
-            self.stats["not_distributed"] += 1
-        elif verdict in (CVEVerdict.NO_DIRECT_CALL, CVEVerdict.MENTIONED_ONLY,
-                         CVEVerdict.ONLY_IN_TESTS, CVEVerdict.NOT_REACHED, CVEVerdict.ONLY_TEST_IMPORT):
-            self.stats["absent"] += 1
-        elif verdict in (CVEVerdict.ACTUAL, CVEVerdict.PRESENT_UNPROVEN):
-            self.stats["called"] += 1
-        else:
-            self.stats["undecided"] += 1
+        self._tally(verdict)
         return result
