@@ -27,6 +27,7 @@ def dependency_closed(finding: Finding, result, sca, *, provider: str) -> Triage
         result.decision.verdict.value,
         bool(getattr(result, "audited", False)),
         getattr(result, "audit", ""),
+        waived=bool(getattr(result, "audit_waived", False)),
     )
     return TriageRecord(
         finding_id=finding.finding_id,

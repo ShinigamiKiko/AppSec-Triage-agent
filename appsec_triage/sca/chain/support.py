@@ -7,12 +7,17 @@ import threading
 from pathlib import Path
 
 from .. import advisories as adv
-from .. import codeql_api, codeql_reach, container as container_mod, exploitability as exploit_mod, psalm_api
+from .. import exploitability as exploit_mod
 from .. import presence as presence_mod, registries
 from ..bridge import BridgeWalk, entry_points, walk_bridge
+from ..engines import psalm
+from ..engines.answers import ApiAnswer, Reached, Target
+from ..engines.codeql import api as codeql_api, reach as codeql_reach
+from ..engines.investigation import declared_unaffected
 from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
 from ..resolve import SymbolResolver, VulnerableSymbol
+from ...lang.php import container as container_mod
 
 log = logging.getLogger(__name__)
 
@@ -22,9 +27,12 @@ class ChainSupport:
                  deployment=None, reachability=None, codeql_databases=None,
                  codeql_binary: str = "codeql", psalm_binary: str | None = None,
                  parallel_llm: int = 1, max_tool_calls: int = 20,
-                 sbom_path: str = "") -> None:
+                 sbom_path: str = "", closures_final: bool = False) -> None:
         self._client = client
         self._max_tool_calls = max_tool_calls
+        # An automatic closure is final: it is checked before any model step and
+        # its blind-spot audit is not asked of the model (provider `closures_final`).
+        self._closures_final = closures_final
         self._resolver = SymbolResolver(client, roots=[Path(r) for r in roots])
         self._roots = [Path(r) for r in roots]
         self._lsp = lsp
@@ -39,7 +47,7 @@ class ChainSupport:
         # Independent questions of one finding, asked side by side.
         self._parallel_llm = max(1, parallel_llm)
         self._dataflow: dict[tuple[str, tuple], codeql_reach.Answer] = {}
-        self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
+        self._api_answers: dict[tuple[str, tuple], ApiAnswer] = {}
         self._import_answers: dict[tuple[str, str], codeql_api.ImportAnswer] = {}
         self._dataflow_lock = threading.Lock()
         self._pending: dict[tuple[int, object], threading.Event] = {}
@@ -55,7 +63,7 @@ class ChainSupport:
         self._wirings: dict[str, container_mod.Wiring] = {}
         self._exploit = exploit_mod.ExploitabilityService()
         self._symbols: dict[tuple[str, str], object] = {}
-        self._batched: dict[tuple[str, str], tuple[codeql_api.ApiAnswer, frozenset[str]]] = {}
+        self._batched: dict[tuple[str, str], tuple[ApiAnswer, frozenset[str]]] = {}
         self._shipping: dict[str, object] = {}
         self._investigations: dict[tuple, object] = {}
         self.stats = {"resolved": 0, "called": 0, "absent": 0,
@@ -214,7 +222,7 @@ class ChainSupport:
         return False, f"CodeQL: импортов {package} нет; {text_detail}", text_test_only
 
     def _uses_psalm(self, dependency) -> bool:
-        return ((dependency.ecosystem or "").strip().lower() in psalm_api.SUPPORTED_ECOSYSTEMS
+        return ((dependency.ecosystem or "").strip().lower() in psalm.SUPPORTED_ECOSYSTEMS
                 and bool(self._psalm_binary) and bool(self._roots)
                 and (self._roots[0] / "vendor" / "autoload.php").is_file())
 
@@ -222,7 +230,7 @@ class ChainSupport:
         """Give each bare or short PHP method name the fully qualified classes that declare it."""
         pairs = list(pairs)
         bare = [function for function, klass in pairs if function and (not klass or "\\" not in klass)]
-        declared = psalm_api.qualify(self._roots[0], package, bare) if bare and self._roots else {}
+        declared = psalm.qualify(self._roots[0], package, bare) if bare and self._roots else {}
         out: list[tuple[str, str]] = []
         for function, klass in pairs:
             classes = declared.get(function) or []
@@ -235,7 +243,7 @@ class ChainSupport:
         return out
 
     def _engine_name(self, dependency) -> str:
-        return psalm_api.ENGINE if self._uses_psalm(dependency) else "CodeQL"
+        return psalm.ENGINE if self._uses_psalm(dependency) else "CodeQL"
 
     def _entry_points(self, dependency, symbol) -> list:
         """Public functions of the vulnerable package that reach its vulnerable one."""
@@ -263,7 +271,6 @@ class ChainSupport:
         (None, None) when the engine cannot tell.
         """
         from .. import unreached as unreached_mod
-        from ..codeql_agent import declared_unaffected
 
         entries = self._entry_points(dependency, symbol)
         if not entries:
@@ -295,7 +302,7 @@ class ChainSupport:
         """The installed PHP package's public methods, for the model's choice of questions."""
         if not self._uses_psalm(dependency) or not self._roots:
             return ""
-        return psalm_api.public_api(self._roots[0], package)
+        return psalm.public_api(self._roots[0], package)
 
     def _codeql_api_available(self, dependency) -> bool:
         """Whether an engine this chain may query answers for the dependency's language: a CodeQL database for JavaScript, Psalm with an installed vendor tree for PHP."""
@@ -305,13 +312,13 @@ class ChainSupport:
         return bool(self._roots) and language in codeql_api.SUPPORTED and language in self._databases
 
     def _psalm_api_for(self, dependency, package: str, pairs, *, record: list[str] | None,
-                       asked_by: str) -> codeql_api.ApiAnswer | None:
-        targets = tuple(sorted({codeql_api.Target(package, function, (klass or "").lstrip("\\"))
+                       asked_by: str) -> ApiAnswer | None:
+        targets = tuple(sorted({Target(package, function, (klass or "").lstrip("\\"))
                                 for function, klass in pairs if function},
                                key=lambda t: (t.klass, t.function)))
         if not targets:
             return None
-        answer, cached = self._once(self._api_answers, ("php", targets), lambda: psalm_api.run(
+        answer, cached = self._once(self._api_answers, ("php", targets), lambda: psalm.run(
             self._roots[0], list(targets), binary=self._psalm_binary))
         if record is not None:
             outcome = (f"не выполнен: {answer.problem}" if answer.problem else "; ".join(
@@ -365,7 +372,7 @@ class ChainSupport:
 
     def _codeql_api_for(self, dependency, package: str, pairs, *,
                         record: list[str] | None = None,
-                        asked_by: str = "цепочка") -> codeql_api.ApiAnswer | None:
+                        asked_by: str = "цепочка") -> ApiAnswer | None:
         """CodeQL's answer for these functions of `package`, or None when it cannot be asked."""
         if self._uses_psalm(dependency):
             return self._psalm_api_for(dependency, package, pairs, record=record, asked_by=asked_by)
@@ -373,7 +380,7 @@ class ChainSupport:
         database = self._databases.get(language or "")
         if database is None or language not in codeql_api.SUPPORTED or not self._roots or not package:
             return None
-        targets = tuple(sorted({codeql_api.Target(package, function, klass or "")
+        targets = tuple(sorted({Target(package, function, klass or "")
                                 for function, klass in pairs if function},
                                key=lambda t: (t.function, t.klass)))
         if not targets:
@@ -385,7 +392,7 @@ class ChainSupport:
                          "вызову неоткуда взяться")
                 record.append(entry)
                 log.info("codeql call skipped: %s", entry)
-            return codeql_api.ApiAnswer()
+            return ApiAnswer()
         batched = self._batched.get((language, package))
         if batched is not None:
             shared, covered = batched
@@ -434,7 +441,7 @@ class ChainSupport:
         verdict = None if answer.problem else answer.verdict(sites)
         if record is not None:
             outcome = (f"не выполнен: {answer.problem}" if answer.problem
-                       else verdict.render() if isinstance(verdict, codeql_reach.Reached)
+                       else verdict.render() if isinstance(verdict, Reached)
                        else "путь от пользовательского ввода не найден" if verdict is False
                        else "позиции не оценены")
             entry = (f"{asked_by} → CodeQL, позиции {', '.join(f'{f}:{l}' for f, l in sites)}: "

@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
+from ..fs import SKIP_DIRS
 from ..testpaths import is_test
 from .client import path_to_uri, uri_to_path
 
@@ -16,7 +17,6 @@ _KINDS = {1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "
           7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface",
           12: "function", 13: "variable", 14: "constant", 22: "enum member",
           23: "struct", 24: "event", 25: "operator", 26: "type parameter"}
-_SKIP = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv", "target"}
 _MAX_LISTED = 20
 _MAX_SCAN = 20000
 _READ_LINES = 80
@@ -67,7 +67,7 @@ class CodeTools:
             counts: dict[str, int] = {}
             seen = 0
             for parent, dirnames, filenames in os.walk(self.root):
-                dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
+                dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
                 for name in filenames:
                     seen += 1
                     language = self.lsp.cfg.language_for(name)
@@ -98,7 +98,7 @@ class CodeTools:
 
     def _first_file(self, language: str) -> Path | None:
         for parent, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
             for name in sorted(filenames):
                 if self.lsp.cfg.language_for(name) == language:
                     return Path(parent) / name
@@ -197,7 +197,7 @@ class CodeTools:
         tests = 0
         per_file: dict[str, int] = {}
         for parent, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP and not d.startswith("."))
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
             for name in sorted(filenames):
                 path = Path(parent) / name
                 if (path.suffix.lower() not in _SEARCHABLE and name.lower() not in _SEARCHABLE_NAMES
@@ -374,7 +374,7 @@ class CodeTools:
         scanned = 0
         tests = 0
         for parent, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
             for filename in sorted(filenames):
                 language = self.lsp.cfg.language_for(filename)
                 if not language or language not in self.available():

@@ -301,6 +301,17 @@ def decide(
                     lsp_audit, "condition_absent", condition.render(),
                     "отсутствие имён в файлах — не доказательство: вызов может идти через "
                     "обёртку, настройка — собираться во время работы")
+            if getattr(condition, "source", "") == "detector":
+                # A framework detector reads one place by pattern: a closure like the rest.
+                if not _audited(closure_audit, "condition_absent"):
+                    return _unchecked(
+                        "по настройкам условие эксплуатации не выполняется, но закрытие не проверено",
+                        closure_audit, "condition_absent", condition.render())
+                return CVEDecision(
+                    CVEVerdict.CONDITION_ABSENT,
+                    f"условие эксплуатации не выполняется: {condition.statement}",
+                    [condition.render(), closure_audit.render()],
+                )
             return CVEDecision(
                 CVEVerdict.CONDITION_ABSENT,
                 f"условие эксплуатации не выполняется: {condition.statement}",

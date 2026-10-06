@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-from .codeql_api import ApiAnswer, Target, _hit
-from .codeql_reach import Reached
+from ...lang.php import PhpRules
+from ...testpaths import is_test
+from .answers import ApiAnswer, Reached, Target, hit
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_ECOSYSTEMS = frozenset({"composer", "packagist", "php"})
+SUPPORTED_ECOSYSTEMS = PhpRules.ecosystems
 ENGINE = "Psalm"
 _TIMEOUT_S = 1800
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -133,8 +134,6 @@ _MAX_PACKAGE_FILES = 4000
 
 def qualify(project_root: Path | str, package: str, names: list[str]) -> dict[str, list[str]]:
     """Fully qualified classes of the installed `package` that declare each method name."""
-    from ..testpaths import is_test
-
     package_dir = Path(project_root) / "vendor" / package
     wanted = [name for name in dict.fromkeys(names) if _IDENTIFIER.match(name or "")]
     found: dict[str, list[str]] = {name: [] for name in wanted}
@@ -169,8 +168,6 @@ _PUBLIC_METHOD = re.compile(
 
 def public_api(project_root: Path | str, package: str, limit: int = 40) -> str:
     """The installed package's public methods, as a line the model chooses its questions from."""
-    from ..testpaths import is_test
-
     package_dir = Path(project_root) / "vendor" / package
     if not package or not package_dir.is_dir():
         return ""
@@ -406,7 +403,7 @@ def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm
                 return ApiAnswer(problem=problem, engine="psalm")
             references[sig.label] = parse_references(output, work, project)
             if references[sig.label]:
-                answer.calls[sig.label] = [_hit(project, file, line) for file, line in references[sig.label]]
+                answer.calls[sig.label] = [hit(project, file, line) for file, line in references[sig.label]]
 
         stub_path = work / "sca-sinks.php"
         stub_path.write_text(stub(signatures), encoding="utf-8")
@@ -423,7 +420,7 @@ def run(project_root: Path | str, targets: list[Target], *, binary: str = "psalm
             return ApiAnswer(calls=answer.calls, problem=f"отчёт taint-анализа не прочитан: {exc}", engine="psalm")
         answer.reached = parse_taint(document, work, project, signatures, references)
         for label, reached in answer.reached.items():
-            site = _hit(project, reached.file, reached.line)
+            site = hit(project, reached.file, reached.line)
             if all((hit.file, hit.line) != (site.file, site.line) for hit in answer.calls.get(label, [])):
                 answer.calls.setdefault(label, []).append(site)
 

@@ -212,7 +212,7 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
         findings = [f for f in findings if f.finding_id not in done_ids]
         print(f"→ resuming an interrupted run: {len(recovered)} verdict(s) already decided, {len(findings)} of {before} left", file=sys.stderr)
 
-    from ..sca.govulncheck import GovulncheckUnavailable
+    from ..sca.engines.govulncheck import GovulncheckUnavailable
     client = build_client(provider_cfg)
     try:
         with audit.Journal(journal_path, cfg.prompt_pack) as journal:
@@ -233,7 +233,7 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
                 run.reuse = reuse_plan.summary()
     finally:
         client.close()
-        from ..sca.codeql_runner import close_servers
+        from ..sca.engines.codeql.runner import close_servers
         close_servers()
         if symbols:
             print(f"→ language server: {symbols.stats}", file=sys.stderr)

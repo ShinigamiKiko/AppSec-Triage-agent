@@ -1,0 +1,5 @@
+# Необязательный резолвер для остальных языков CodeQL: обогащает триаж
+# определениями и вызывающими; SAST-находки по-прежнему даёт CodeQL.
+command: [solargraph, stdio]
+language_id: ruby
+extensions: [".rb"]

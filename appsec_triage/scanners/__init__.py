@@ -8,7 +8,15 @@ from pathlib import Path
 
 from ..config import ConfigError, list_scanners, load_scanner_config
 from .base import Availability, Scanner, ScannerError, ScanResult
-from .tools import REGISTRY
+from .codeql import CodeQLScanner
+from .psalm import PsalmScanner
+from .wolfee import WolfeeScanner
+
+REGISTRY: dict[str, type[Scanner]] = {
+    "wolfee": WolfeeScanner,
+    "codeql": CodeQLScanner,
+    "psalm": PsalmScanner,
+}
 
 
 def build_scanner(name: str) -> Scanner:

@@ -1,4 +1,4 @@
-"""Config loading: one YAML profile per provider + one pipeline config."""
+"""Config loading: `pipeline.yaml`, `lsp.yaml`, and one YAML file per provider, scanner and language server."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "configs"
+# One file per profile, named by it: providers/deepseek.yaml, scanners/psalm.yaml, lsp/php.yaml.
+_PROFILE_KINDS = {"providers": "provider", "scanners": "scanner", "lsp": "language server"}
 
 
 class ConfigError(RuntimeError):
@@ -74,17 +76,14 @@ class ProviderConfig:
     budget_usd: float = 5.0
     keep_raw_response: bool = False
     tool_calling: bool = True
+    # An automatic closure is final: no blind-spot audit by the model, and a closed
+    # dependency finding never reaches the model at all (see sca/chain/orchestration.py).
+    closures_final: bool = False
+    # Model questions per finding (investigation and code walk); None keeps
+    # `max_tool_calls` from pipeline.yaml.
+    max_tool_calls: int | None = None
 
     options: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> ProviderConfig:
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        unknown = set(data) - known - {"name"}
-        if unknown:
-            raise ConfigError(f"provider '{name}': unknown config keys: {sorted(unknown)}")
-        data = {**data, "name": name}
-        return cls(**data)
 
 
 @dataclass(slots=True)
@@ -126,14 +125,6 @@ class ScannerConfig:
     docker_args: list[str] = field(default_factory=list)
     run_in_target: bool = False
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any], *, name: str) -> ScannerConfig:
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        unknown = set(data) - known - {"name"}
-        if unknown:
-            raise ConfigError(f"scanner '{name}': unknown config keys: {sorted(unknown)}")
-        return cls(**{**data, "name": name})
-
 
 @dataclass(slots=True)
 class ScopeConfig:
@@ -158,6 +149,8 @@ class LSPConfig:
     startup_timeout_s: float = 120.0
     index_timeout_s: float = 90.0
     request_timeout_s: float = 20.0
+    # In the YAML: omitted = every file in configs/lsp/, a list = those names only,
+    # a mapping = the specs inline. Loaded, it is always name -> spec.
     servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     required_languages: list[str] = field(default_factory=list)
 
@@ -256,20 +249,40 @@ class PipelineConfig:
     scan_out_dir: str | None = None
 
 
+def _read(path: Path) -> dict[str, Any]:
+    return _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
+
+
+def _strict(cls, data: dict[str, Any], where: str, **fixed: Any):
+    """`cls(**data)`, refusing keys the dataclass does not have."""
+    unknown = set(data) - set(cls.__dataclass_fields__) - set(fixed)
+    if unknown:
+        raise ConfigError(f"{where}: unknown config keys: {sorted(unknown)}")
+    return cls(**{**data, **fixed})
+
+
+def _list(kind: str, config_dir: Path | None = None) -> list[str]:
+    base = (config_dir or CONFIG_DIR) / kind
+    return sorted(p.stem for p in base.glob("*.yaml")) if base.is_dir() else []
+
+
+def _profile(kind: str, name: str, config_dir: Path | None = None) -> dict[str, Any]:
+    """The contents of `configs/<kind>/<name>.yaml`."""
+    path = (config_dir or CONFIG_DIR) / kind / f"{name}.yaml"
+    if not path.is_file():
+        raise ConfigError(f"no {_PROFILE_KINDS[kind]} profile '{name}' at {path}. "
+                          f"Available: {_list(kind, config_dir)}")
+    return _read(path)
+
+
 def load_provider_config(name: str, *, config_dir: Path | None = None) -> ProviderConfig:
     """Load `configs/providers/<name>.yaml`."""
-    base = config_dir or CONFIG_DIR
-    path = base / "providers" / f"{name}.yaml"
-    if not path.is_file():
-        available = sorted(p.stem for p in (base / "providers").glob("*.yaml"))
-        raise ConfigError(f"no provider profile '{name}' at {path}. Available: {available}")
-    data = _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-    return ProviderConfig.from_dict(data, name=name)
+    return _strict(ProviderConfig, _profile("providers", name, config_dir), f"provider '{name}'", name=name)
 
 
 def load_pipeline_config(path: Path | None = None) -> PipelineConfig:
     path = path or (CONFIG_DIR / "pipeline.yaml")
-    raw = _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {}) if path.is_file() else {}
+    raw = _read(path) if path.is_file() else {}
     scope = ScopeConfig(**raw.pop("scope", {}) or {})
     queue = TriageQueueConfig(**raw.pop("queue", {}) or {})
     verify = VerificationConfig(**raw.pop("verification", {}) or {})
@@ -281,32 +294,25 @@ def load_pipeline_config(path: Path | None = None) -> PipelineConfig:
 
 
 def load_lsp_config(path: Path | None = None) -> LSPConfig:
+    """`configs/lsp.yaml` (or a profile such as `configs/profiles/lsp-php-only.yaml`) plus its servers."""
     path = path or (CONFIG_DIR / "lsp.yaml")
     if not path.is_file():
         return LSPConfig()
-    raw = _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-    known = set(LSPConfig.__dataclass_fields__)  # type: ignore[attr-defined]
-    unknown = set(raw) - known
-    if unknown:
-        raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
-    return LSPConfig(**raw)
+    raw = _read(path)
+    servers = raw.get("servers")
+    if not isinstance(servers, dict):
+        names = _list("lsp") if servers is None else list(servers)
+        raw["servers"] = {name: _profile("lsp", name) for name in names}
+    return _strict(LSPConfig, raw, str(path))
 
 
 def list_providers(config_dir: Path | None = None) -> list[str]:
-    base = (config_dir or CONFIG_DIR) / "providers"
-    return sorted(p.stem for p in base.glob("*.yaml")) if base.is_dir() else []
+    return _list("providers", config_dir)
 
 
 def load_scanner_config(name: str, *, config_dir: Path | None = None) -> ScannerConfig:
-    base = config_dir or CONFIG_DIR
-    path = base / "scanners" / f"{name}.yaml"
-    if not path.is_file():
-        available = sorted(p.stem for p in (base / "scanners").glob("*.yaml"))
-        raise ConfigError(f"no scanner profile '{name}' at {path}. Available: {available}")
-    data = _expand_env(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-    return ScannerConfig.from_dict(data, name=name)
+    return _strict(ScannerConfig, _profile("scanners", name, config_dir), f"scanner '{name}'", name=name)
 
 
 def list_scanners(config_dir: Path | None = None) -> list[str]:
-    base = (config_dir or CONFIG_DIR) / "scanners"
-    return sorted(p.stem for p in base.glob("*.yaml")) if base.is_dir() else []
+    return _list("scanners", config_dir)

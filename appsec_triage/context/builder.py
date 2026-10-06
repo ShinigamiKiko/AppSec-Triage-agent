@@ -13,7 +13,7 @@ from .source import SourceResolver
 if TYPE_CHECKING:
     from ..lsp.service import SymbolContext
     from .deps import DependencyIndex
-    from .routes import RouteIndex
+    from ..lang.php.routes import RouteIndex
 
 
 DATAFLOW_CWES = {

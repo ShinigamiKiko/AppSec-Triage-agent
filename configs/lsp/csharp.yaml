@@ -1,0 +1,5 @@
+# Необязательный резолвер для остальных языков CodeQL: обогащает триаж
+# определениями и вызывающими; SAST-находки по-прежнему даёт CodeQL.
+command: [OmniSharp, --languageserver, --stdio]
+language_id: csharp
+extensions: [".cs"]

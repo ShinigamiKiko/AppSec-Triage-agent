@@ -220,11 +220,6 @@ def enclosing_in(parsed: list[Declaration], offset: int) -> Declaration | None:
     return best
 
 
-def enclosing(path: str, text: str, offset: int) -> Declaration | None:
-    """The declaration containing `offset` — the nearest one before it."""
-    return enclosing_in(declarations(path, text), offset)
-
-
 def call_pattern(function: str, language: str | None = None) -> re.Pattern[str]:
     """Call syntax for a named function, across the languages we scan."""
     name = re.escape(function)

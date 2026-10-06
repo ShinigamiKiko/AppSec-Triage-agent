@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..fs import SKIP_DIRS
 from ..prompts import registry
 from .verdict import CVEDecision, CVEVerdict
 
@@ -25,7 +26,6 @@ _SCHEMA = {
     },
 }
 
-_SKIP_DIRS = {".git", "vendor", "node_modules", "venv", ".venv", "target", "build", "dist", "__pycache__"}
 _MARKER_SUFFIXES = {".go", ".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".java", ".kt", ".php", ".cs",
                     ".yaml", ".yml", ".json", ".toml", ".conf", ".sh"}
 _MAX_FILES = 8000
@@ -91,7 +91,7 @@ def markers_in(roots, markers: list[str]) -> list[str]:
         root = Path(root)
         visited = 0
         for parent, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for name in filenames:
                 visited += 1
                 if len(hits) >= _MAX_MARKERS or visited > _MAX_FILES:

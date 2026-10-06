@@ -4,16 +4,27 @@ import os
 import logging
 from pathlib import Path
 
+from ..lang.go import GoRules
+from ..lang.js import JavaScriptRules
+from ..lang.php import PhpRules
+
 log = logging.getLogger(__name__)
 
+# Go, PHP and JS/TS take their extensions from the rules that parse them
+# (appsec_triage/lang): `.mts`, `.cts`, `.phtml` and `.inc` are source files too, and a
+# file this table does not list is a file no search opens.
+_JS = set(JavaScriptRules.suffixes) | {".astro"}
+_PHP = set(PhpRules.suffixes)
+_GO = set(GoRules.suffixes)
+
 ECOSYSTEM_SUFFIXES = {
-    "npm": {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".astro", ".mjs", ".cjs"},
-    "composer": {".php"},
-    "packagist": {".php"},
+    "npm": _JS,
+    "composer": _PHP,
+    "packagist": _PHP,
     "pypi": {".py"},
     "python": {".py"},
-    "go": {".go"},
-    "golang": {".go"},
+    "go": _GO,
+    "golang": _GO,
     "maven": {".java", ".kt"},
     "java": {".java", ".kt"},
     "rubygems": {".rb"},

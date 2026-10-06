@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ..fs import SKIP_DIRS
 from . import probe_all
 
 
@@ -29,7 +30,6 @@ _LANG_SCANNERS = {
     ".rs": ["codeql"], ".swift": ["codeql"],
 }
 _ALWAYS_SCANNERS = ["wolfee"]
-_SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "vendor", "target", "build", "dist", "__pycache__"}
 
 
 def scanners_for_target(target: Path) -> list[str]:
@@ -37,7 +37,7 @@ def scanners_for_target(target: Path) -> list[str]:
     wanted: list[str] = []
     seen_ext: set[str] = set()
     for path in Path(target).rglob("*"):
-        if not path.is_file() or _SKIP_DIRS & set(path.parts):
+        if not path.is_file() or SKIP_DIRS & set(path.parts):
             continue
         ext = path.suffix.lower()
         if ext in _LANG_SCANNERS and ext not in seen_ext:

@@ -8,14 +8,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..fs import SKIP_DIRS
 from .detection import get_source_suffixes
 
 log = logging.getLogger(__name__)
 
-_SKIP_DIRS = {
-    ".git", "vendor", "node_modules", "venv", ".venv", "target", "build",
-    "dist", "__pycache__", ".idea", ".vscode",
-}
+_SKIP_DIRS = SKIP_DIRS | {".idea", ".vscode"}
 
 
 def _skip_path(path: Path) -> bool:

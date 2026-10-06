@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
+from ..base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
 
 _QNAME = r"\\?[A-Za-z_][\w]*(?:\\[A-Za-z_][\w]*)*"
 _USE = re.compile(rf"^\s*use\s+(?P<kind>function\s+|const\s+)?(?P<body>[^;]+);", re.M)
@@ -31,6 +31,7 @@ def _in_namespaces(qname: str, namespaces: list[str]) -> bool:
 class PhpRules(LanguageRules):
     name = "php"
     suffixes = frozenset({".php", ".phtml", ".inc"})
+    ecosystems = frozenset({"composer", "packagist", "php"})
 
     def strip_comments(self, text: str) -> str:
         return blank_comments(text, line_comments=("//",), hash_comments=True, backtick_strings=False)

@@ -692,14 +692,18 @@ def _question_from_override(overrides: list[str], original: Verdict) -> str:
 _BOUND_CALL = {"present", "actual"}
 
 
-def guard_dependency_verdict(result: Verdict, sca, overrides: list[str]) -> Verdict:
+def guard_dependency_verdict(result: Verdict, sca, overrides: list[str], *,
+                             not_shipped_refused: bool = False) -> Verdict:
     """The model does not get to overrule the dependency chain on a hunch.
 
     * a call bound to the package (outcome `present`/`actual`, attributed by import,
       CodeQL or LSP) cannot become `false_positive` unless the model names a defence
       (SANITIZED_DATAFLOW) or a precondition fact (IDENTIFIER_ONLY);
     * the shipping check has the last word on shipping: a model that closes a package
-      the running application loads, on the ground that it "does not ship", is wrong.
+      the running application loads, on the ground that it "does not ship", is wrong;
+    * so is one that closes on that ground after the `not_shipped` audit did not run or
+      reopened the closure (`not_shipped_refused`): the model may not grant what the
+      audit refused.
     """
     if sca is None or result.verdict is not VerdictLabel.false_positive:
         return result
@@ -707,11 +711,18 @@ def guard_dependency_verdict(result: Verdict, sca, overrides: list[str]) -> Verd
     evidence = getattr(sca, "call_evidence", "")
     shipped = getattr(sca, "shipped", "")
     reason = f"{result.reason} {result.confidence_rationale}".lower()
-    if shipped == "runtime" and re.search(r"not shipped|не поставляется|dev[- ]?only|devdependencies|"
-                                          r"development only|только для разработки", reason):
+    claims_not_shipped = re.search(r"not shipped|не поставляется|dev[- ]?only|devdependencies|build[- ]only|"
+                                   r"development only|только для разработки|только (?:для )?сборк", reason)
+    if shipped == "runtime" and claims_not_shipped:
         overrides.append(
             "shipping_conflict: closed as \"not shipped\", but the shipping check found that the running "
             f"application loads the package ({getattr(sca, 'runtime', '') or 'runtime'})")
+        return _to_unknown(result, EvidenceClass.insufficient_context)
+    if claims_not_shipped and not_shipped_refused:
+        overrides.append(
+            "unaudited_closure: closed as \"not shipped\", but the audit of that closure "
+            + ("reopened it" if getattr(sca, "audited", False) else "did not run")
+            + f" ({getattr(sca, 'audit', '') or 'no audit note'})")
         return _to_unknown(result, EvidenceClass.insufficient_context)
     if (outcome in _BOUND_CALL and evidence in ("import", "codeql", "psalm", "lsp")
             and result.evidence_class not in (EvidenceClass.sanitized_dataflow, EvidenceClass.identifier_only)):

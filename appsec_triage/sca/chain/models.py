@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .. import codeql_reach
 from .. import conditions as conditions_mod
 from .. import exploitability as exploit_mod
-from .. import govulncheck as govulncheck_mod
 from .. import presence as presence_mod
 from .. import reach as reach_mod
 from ..bridge import BridgeResult
+from ..engines import govulncheck as govulncheck_mod
+from ..engines.answers import Reached
 from ..graph import Placement
 from ..resolve import VulnerableSymbol
 from ..verdict import CVEDecision
@@ -28,13 +28,17 @@ class ChainResult:
     searched_for: list[str] = field(default_factory=list)
     condition: conditions_mod.Condition | None = None
     exploitability: exploit_mod.Exploitability | None = None
-    dataflow: codeql_reach.Reached | None = None
+    dataflow: Reached | None = None
     dataflow_status: str = ""
     reachability: govulncheck_mod.Verdict | None = None
     matched_symbol: str = ""
     audit: str = ""
     closure_kind: str = ""
     audited: bool = False
+    # The audit of `closure_kind` ran and found nothing against the closure.
+    closure_holds: bool = False
+    # The closure stands without its audit: the provider profile sets `closures_final`.
+    audit_waived: bool = False
     # excluded | callgraph | codeql | text | package | condition | unknown
     route: str = ""
     codeql_calls: list[str] = field(default_factory=list)

@@ -1,4 +1,4 @@
-"""The model investigates a dependency CVE, and CodeQL answers every question."""
+"""The model investigates a dependency CVE, and an engine (CodeQL or Psalm) answers every question."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-from ..prompts import registry
-from . import codeql_reach
+from ...prompts import registry
+from .answers import Reached
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class Investigation:
     klass: str = ""
     found: object = None
     answer: object = None
-    reached: codeql_reach.Reached | None = None
+    reached: Reached | None = None
     requests: int = 0
     detail: str = ""
     via_tools: bool = False
@@ -287,7 +287,7 @@ class _Session:
 
     def usages(self, name: str, klass: str, vulnerable: bool) -> str:
         """Ask the language server who in the project calls one package function."""
-        from .lsp_tools import valid_name
+        from ..lsp_tools import valid_name
 
         name = str(name or "").split("::")[-1].split(".")[-1].strip().rstrip("()")
         klass = str(klass or "").strip().lstrip("\\")
@@ -321,8 +321,7 @@ class _Session:
 
     def code_question(self, method: str, arguments: dict) -> str:
         """One entity question to the project's language servers, logged for the report."""
-        from ..lsp.code_tools import as_int
-        from ..redact import redact_secrets
+        from ...lsp.code_tools import as_int
 
         code = self.code
         file = str(arguments.get("file") or "").replace("\\", "/")
@@ -371,7 +370,7 @@ class _Session:
         result.requests += 1
         outcome = self.ask_sites(sites)
         where = ", ".join(f"{file}:{line}" for file, line in sites)
-        if isinstance(outcome, codeql_reach.Reached):
+        if isinstance(outcome, Reached):
             at_vulnerable_call = result.found is not None and any(
                 (hit.file, hit.line) == (outcome.file, outcome.line) for hit in result.found.hits)
             if at_vulnerable_call:
@@ -495,7 +494,7 @@ def _investigate_with_tools(client, session: _Session, material: str, rounds: in
     if session.lsp is not None:
         tools += LSP_TOOLS
     if session.code is not None:
-        from ..lsp.code_tools import function_tools, reading_tools
+        from ...lsp.code_tools import function_tools, reading_tools
 
         tools += reading_tools(_function_tool) + function_tools(_function_tool)
     offered = {tool["function"]["name"] for tool in tools}

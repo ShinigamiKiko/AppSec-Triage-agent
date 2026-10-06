@@ -8,12 +8,24 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from ..lang import rules_for_ecosystem
 from ..lsp.client import uri_to_path
 from . import registries
 
 log = logging.getLogger(__name__)
 
-ECOSYSTEM_LANGUAGE = {"npm": "typescript", "composer": "php", "go": "go", "golang": "go"}
+# Language rules (appsec_triage/lang) -> the server that answers for them in configs/lsp/.
+_SERVER = {"js": "typescript", "php": "php", "go": "go"}
+
+
+def server_for(ecosystem: str) -> str:
+    """The language server of an ecosystem, under any name it is reported by.
+
+    SARIF ingest writes Composer packages as `packagist`, the SBOM as `composer`;
+    both are PHP, and both get phpactor.
+    """
+    rules = rules_for_ecosystem(ecosystem)
+    return _SERVER.get(rules.name, "") if rules is not None else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +99,7 @@ class LSPTools:
         self.lsp = lsp
         self.root = Path(root)
         self.ecosystem = (ecosystem or "").strip().lower()
-        self.language = ECOSYSTEM_LANGUAGE.get(self.ecosystem, "")
+        self.language = server_for(self.ecosystem)
         self.package = package
         self.package_dir = registries.locate(self.root, self.ecosystem, package, version) if self.language else None
         self._client = None

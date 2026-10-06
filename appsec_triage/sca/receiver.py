@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..lang.php import container as container_mod
+from ..lsp.client import uri_to_path
 from ..prompts import registry
-from . import container as container_mod
 from .presence import Hit, PresenceResult, SymbolPresence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -43,12 +44,10 @@ def _definition_class(location: dict, path_map: dict[str, str] | None = None) ->
     uri = location.get("uri") or location.get("targetUri") or ""
     if not uri:
         return "", ""
-    path = uri.replace("file://", "")
-    for prefix, replacement in (path_map or {}).items():
-        if path.startswith(prefix):
-            path = replacement + path[len(prefix):]
-            break
-    return Path(path).stem, path
+    # Servers percent-encode (`node_modules/%40scope/`, `c%3A/`) and may see the project
+    # under another root; an undecoded path is never inside the package it points into.
+    path = uri_to_path(uri, path_map)
+    return path.stem, str(path)
 
 
 _RECEIVER = re.compile(

@@ -25,13 +25,14 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..fs import SKIP_DIRS
+from ..lang.js import JavaScriptRules
 from ..testpaths import is_test
 
 log = logging.getLogger(__name__)
 
-_SKIP_DIRS = {"node_modules", "vendor", ".git", "dist", "build", "coverage", ".nuxt", ".next",
-              "__pycache__", ".venv", "venv", "target"}
-_JS_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte"}
+_SKIP_DIRS = SKIP_DIRS | {"coverage", ".nuxt", ".next"}
+_JS_SUFFIXES = JavaScriptRules.suffixes
 _BUILD_FILE = re.compile(
     r"(^|/)(?:[\w.-]+\.config\.[cm]?[jt]s|\.[\w.-]+rc(?:\.[cm]?[jt]s|\.json)?|gulpfile\.[jt]s|Gruntfile\.[jt]s)$"
     r"|(^|/)(scripts|tools|build|config/webpack|\.storybook|\.husky)/", re.IGNORECASE)
@@ -235,7 +236,7 @@ class ProjectShipping:
                     if path.suffix.lower() not in _JS_SUFFIXES:
                         continue
                     rel = path.relative_to(self.root).as_posix()
-                    if is_test(rel) or _BUILD_FILE.search(rel):
+                    if is_test(rel) or self._build_file(rel):
                         continue
                     try:
                         if path.stat().st_size > 600_000:
@@ -269,14 +270,34 @@ class ProjectShipping:
         prod, dev = self.declared()
         return {token for token in re.findall(r"[\w@/.-]+", text) if token.lower() in prod | dev}
 
-    def _server_entries(self) -> set[str]:
-        """Files Node starts: `main` of package.json and the files the start scripts run."""
+    def _build_file(self, rel: str) -> bool:
+        """Build or tooling code by its path — unless the application is started from there.
+
+        `scripts/` and `tools/` hold build helpers in most projects and the server in some
+        (`node scripts/server.js` as the image's command). What the start command runs,
+        and the code next to it, is production whatever its directory is called.
+        """
+        if not _BUILD_FILE.search(rel):
+            return False
+        started = getattr(self, "_started", None)
+        if started is None:
+            started = self._started = self._server_entries(production=True)
+        return not any(rel == entry or ("/" in entry and rel.startswith(entry.rsplit("/", 1)[0] + "/"))
+                       for entry in started)
+
+    def _server_entries(self, *, production: bool = False) -> set[str]:
+        """Files Node starts: `main` of package.json and the files the start scripts run.
+
+        `production` leaves the `dev` script out: what a developer runs locally says
+        nothing about what the shipped application loads.
+        """
         manifest = self._manifest()
         entries: set[str] = set()
         if isinstance(manifest.get("main"), str):
             entries.add(manifest["main"])
         scripts = manifest.get("scripts") or {}
-        commands = [str(scripts.get(k, "")) for k in ("start", "serve", "server", "prod", "dev")]
+        names = ("start", "serve", "server", "prod") if production else ("start", "serve", "server", "prod", "dev")
+        commands = [str(scripts.get(k, "")) for k in names]
         commands.append(self.image.start_command)
         for command in commands:
             for token in re.findall(r"(?:node|ts-node|tsx|nodemon|bun|deno\s+run)\s+(?:--?[\w-]+(?:=\S+)?\s+)*([\w./-]+)",

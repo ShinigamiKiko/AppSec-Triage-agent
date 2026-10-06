@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.." || exit 1
 PROVIDER="${PROVIDER:-deepseek}"
 OUT_ROOT="${OUT_ROOT:-out/nightly}"
 WORKERS="${WORKERS:-4}"
-# Only set when it is not already on PATH; the launcher is read from lsp.yaml.
+# Only set when it is not already on PATH; the launcher is read from configs/lsp/php.yaml.
 export PHPACTOR_PHAR="${PHPACTOR_PHAR:-$HOME/phpactor.phar}"
 
 targets=("$@")

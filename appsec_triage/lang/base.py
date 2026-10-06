@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-_BUILTINS_DIR = Path(__file__).with_name("builtins")
+_LANG_DIR = Path(__file__).parent
 
 
 @lru_cache(maxsize=None)
 def builtin_names(language: str) -> frozenset[str]:
-    """Names the language or its runtime owns, from `builtins/<language>.txt`."""
-    path = _BUILTINS_DIR / f"{language}.txt"
+    """Names the language or its runtime owns, from `<language>/builtins.txt`."""
+    path = _LANG_DIR / language / "builtins.txt"
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -110,14 +110,13 @@ def line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-_IDENT = r"[A-Za-z_$][\w$]*"
-
-
 class LanguageRules:
     """Shared machinery; each language supplies its binding and call syntax."""
 
     name = ""
     suffixes: frozenset[str] = frozenset()
+    # Ecosystem names a package of this language is reported under.
+    ecosystems: frozenset[str] = frozenset()
     # Method names so common that a match without a binding says nothing.
     ubiquitous: frozenset[str] = frozenset({
         "get", "set", "post", "put", "delete", "patch", "request", "load", "parse", "format",
@@ -147,7 +146,24 @@ class LanguageRules:
         return False
 
     def is_ubiquitous(self, function: str) -> bool:
-        return function in self.ubiquitous or function.lower() in {u.lower() for u in self.ubiquitous}
+        return function.lower() in _lowered(self.ubiquitous)
+
+    # Re-exports across project files; only a language with module-level exports has them.
+    def exports_bound(self, text: str, found: Bindings) -> set[str]:
+        """Names this file exports that stand for the package."""
+        return set()
+
+    def local_imports(self, text: str) -> list[tuple[str, str, str]]:
+        """(spec, imported name, local name) for each import of a project file."""
+        return []
+
+    def _derive(self, text: str, found: Bindings) -> None:
+        """Extend `found` with names built from the bound ones."""
+
+
+@lru_cache(maxsize=None)
+def _lowered(names: frozenset[str]) -> frozenset[str]:
+    return frozenset(n.lower() for n in names)
 
 
 def call_regex(function: str) -> re.Pattern[str]:
@@ -159,12 +175,3 @@ def call_regex(function: str) -> re.Pattern[str]:
         rf"|(?<![\w$.>:\\])(?P<bare>{name})\s*\("
     )
 
-
-def receiver_root(receiver: str) -> str:
-    """`this.api.client` -> `this`, `http.v2` -> `http`, `$this->yaml` -> `$this`."""
-    match = re.match(r"\s*(\$?[A-Za-z_\\][\w\\]*)", receiver or "")
-    return match.group(1) if match else ""
-
-
-def receiver_parts(receiver: str) -> list[str]:
-    return [p for p in re.split(r"\s*(?:\??\.|->|::)\s*", (receiver or "").strip()) if p]

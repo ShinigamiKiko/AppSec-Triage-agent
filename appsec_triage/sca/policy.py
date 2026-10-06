@@ -11,7 +11,10 @@ Most outcomes are decided here without a model call:
 | build-only, advisory about the build             | confirmed       | low (CI risk)     | no      |
 |   (a hostile package; a code-execution flaw only |                 |                   |         |
 |   when the build takes untrusted input)          |                 |                   |         |
-| build-only, no build risk                         | false_positive  | low               | no      |
+| build-only, no build risk — only once the        | false_positive  | low               | no      |
+|   `not_shipped` audit ran and held; without it   |                 |                   |         |
+|   the rows below apply, as if shipping were      |                 |                   |         |
+|   unknown                                        |                 |                   |         |
 | gadget: needs another flaw to fire first         | false_positive* | low               | no      |
 | image-only: in the image, nothing loads it       | false_positive* | low               | no      |
 | LSP resolved every reference, none in project   | false_positive  | none              | no      |
@@ -134,8 +137,13 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
            build_risk: bool = False, proven: bool = False, parent_calls: bool | None = None,
            bridge_present: bool = False,
            condition_state: str = "", installed_symbol_absent: bool = False,
-           needs_other_vuln: bool = False) -> DependencyPolicy:
-    """The deterministic part of a dependency verdict; `label == ""` leaves it to the model."""
+           needs_other_vuln: bool = False, not_shipped_audited: bool = False) -> DependencyPolicy:
+    """The deterministic part of a dependency verdict; `label == ""` leaves it to the model.
+
+    `not_shipped_audited`: the blind-spot audit of the `not_shipped` closure ran and held.
+    "Build-only" from the shipping check is a mechanical closure like any other — without
+    that audit it closes nothing here, and the finding goes on as if shipping were unknown.
+    """
     severity = (severity or "").lower()
     fix = f"обновить до {upgrade_target}" if upgrade_target else "опубликованного исправления нет"
     via_text = f" через {', '.join(via[:3])}" if via else ""
@@ -150,7 +158,10 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
                                 f"пакет только для сборки, но advisory бьёт по самой сборке (CI) — {fix}",
                                 "build_risk")
 
-    if outcome is not None and outcome is not CVEVerdict.NOT_SHIPPED and shipped == "image_only":
+    # A traced path into the vulnerable call says the code runs; "nothing loads it" is the
+    # shipping check's guess from imports, and it gives way to the path.
+    traced = outcome is CVEVerdict.ACTUAL and proven
+    if outcome is not None and outcome is not CVEVerdict.NOT_SHIPPED and shipped == "image_only" and not traced:
         if build_risk:
             return DependencyPolicy("confirmed", "low", False,
                                     f"в образе, не загружается, но advisory бьёт по сборке/образу — {fix}",
@@ -192,7 +203,7 @@ def decide(outcome: CVEVerdict | None, *, shipped: str = "unknown", severity: st
         return DependencyPolicy("confirmed", priority, severity in ("critical", "high"),
                                 f"пользовательский ввод доходит до уязвимого вызова — {fix}", "actual")
 
-    if (outcome is CVEVerdict.NOT_SHIPPED or shipped == "build_only") and not build_risk:
+    if (outcome is CVEVerdict.NOT_SHIPPED or (shipped == "build_only" and not_shipped_audited)) and not build_risk:
         return DependencyPolicy(
             "false_positive", "low", False,
             f"только сборка и тесты — в рабочий образ не попадает; {fix}",

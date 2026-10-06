@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import deployment as deployment_ctx
@@ -20,7 +20,7 @@ from . import scope as scope_filter
 from . import verify as verify_pass
 from .config import PipelineConfig, ProviderConfig
 from .context import builder, deps, heuristics
-from .context import routes as route_index
+from .lang.php import routes as route_index
 from .context import stack as stack_detect
 from .context.builder import HistoryStore
 from .context.evidence import RepositoryEvidence, _redact
@@ -143,6 +143,11 @@ class TriagePipeline:
         source: SourceResolver | None = None,
         symbols: LSPService | None = None,
     ) -> None:
+        limit = getattr(provider_cfg, "max_tool_calls", None)
+        if limit is not None and limit != cfg.max_tool_calls:
+            # The provider profile sets its own budget of model questions per finding.
+            cfg = replace(cfg, max_tool_calls=limit)
+            log.info("model questions per finding: %d (provider %s)", limit, provider_cfg.name)
         self.client = client
         self.provider_cfg = provider_cfg
         self.cfg = cfg
@@ -169,8 +174,8 @@ class TriagePipeline:
             reachability = None
             report_path = getattr(cfg, "govulncheck_report", None)
             if report_path:
-                from .sca import govulncheck
-                from .sca.govulncheck import GovulncheckUnavailable
+                from .sca.engines import govulncheck
+                from .sca.engines.govulncheck import GovulncheckUnavailable
 
                 reachability = govulncheck.load(report_path)
                 if reachability.problem or not reachability.usable:
@@ -190,7 +195,7 @@ class TriagePipeline:
             scan_dir = getattr(cfg, "scan_out_dir", None)
             if scan_dir:
                 from .config import ConfigError, load_scanner_config
-                from .scanners.tools import CodeQLScanner
+                from .scanners.codeql import CodeQLScanner
 
                 databases = CodeQLScanner.databases(scan_dir)
                 if databases:
@@ -206,7 +211,7 @@ class TriagePipeline:
                 import shutil
 
                 from .config import ConfigError, load_scanner_config
-                from .scanners.tools import PsalmScanner
+                from .scanners.psalm import PsalmScanner
 
                 candidate = PsalmScanner(load_scanner_config("psalm")).resolve_binary("psalm")
                 if Path(candidate).is_file() or shutil.which(candidate):
@@ -223,6 +228,7 @@ class TriagePipeline:
                 parallel_llm=cfg.parallel_llm,
                 max_tool_calls=cfg.max_tool_calls,
                 sbom_path=getattr(cfg, "sbom_path", ""),
+                closures_final=getattr(provider_cfg, "closures_final", False),
             )
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
@@ -356,6 +362,16 @@ class TriagePipeline:
                 dep_policy = self._dependency_policy(finding, chain)
                 sca_summary.priority, sca_summary.policy = dep_policy.priority, dep_policy.rule
                 if chain.closes and dep_policy.label == "false_positive":
+                    return records.dependency_closed(finding, chain, sca_summary,
+                                                 provider=self.provider_cfg.name)
+                if (chain.closes and dep_policy.label != "confirmed"
+                        and getattr(self.provider_cfg, "closures_final", False)):
+                    # The profile takes an automatic closure as final: what the policy would
+                    # still have asked about goes into the record, not to the model.
+                    sca_summary.problems.insert(0, (
+                        f"политика ({dep_policy.rule}): {dep_policy.reason or 'решение за моделью'} — "
+                        "модели не передавалось: профиль провайдера закрывает автоматически"))
+                    sca_summary.priority, sca_summary.policy = "none", f"closures_final:{dep_policy.rule}"
                     return records.dependency_closed(finding, chain, sca_summary,
                                                  provider=self.provider_cfg.name)
                 if not dep_policy.needs_model:
@@ -539,7 +555,10 @@ class TriagePipeline:
         outcome = postvalidation.validate(raw_verdict, pkg, finding, self.cfg.post_validation)
         verdict, overrides = outcome.verdict, list(outcome.overrides)
         capped = postvalidation.cap_unproven_call(verdict, sca_summary, overrides)
-        guarded = postvalidation.guard_dependency_verdict(capped, sca_summary, overrides)
+        guarded = postvalidation.guard_dependency_verdict(
+            capped, sca_summary, overrides,
+            not_shipped_refused=(chain is not None and chain.closure_kind == "not_shipped"
+                                 and not chain.closure_holds))
         guarded = postvalidation.cap_unproven_dependency_confirmation(
             guarded, finding, chain, overrides, sca_summary)
         decided_by = ("post_validation" if outcome.changed or guarded is not verdict else "llm")
@@ -661,6 +680,8 @@ class TriagePipeline:
                                      and chain.symbol.declared_in_installed is False),
             needs_other_vuln=policy_mod.needs_other_vulnerability(
                 advisory, chain.condition.statement if chain.condition is not None else ""),
+            not_shipped_audited=(getattr(chain, "closure_kind", "") == "not_shipped"
+                                 and bool(getattr(chain, "closure_holds", False))),
         )
 
     def _raise_if_fatal(self) -> None:

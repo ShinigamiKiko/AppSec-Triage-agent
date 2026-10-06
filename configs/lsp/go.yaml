@@ -1,0 +1,6 @@
+# Go — gopls. Ставится через `go install golang.org/x/tools/gopls@latest`.
+# Для Go основной анализ — CodeQL; LSP отвечает на тот же вопрос, что и для PHP:
+# откуда пришло значение и вызывается ли код снаружи.
+command: [gopls]
+language_id: go
+extensions: [".go"]

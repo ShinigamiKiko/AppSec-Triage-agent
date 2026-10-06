@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 from ..prompts import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ..context.routes import RouteIndex
+    from ..lang.php.routes import RouteIndex
     from ..lsp.service import LSPService
     from ..models import Finding
     from .presence import Hit

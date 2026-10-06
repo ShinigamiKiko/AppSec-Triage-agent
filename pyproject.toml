@@ -29,4 +29,4 @@ line-length = 120
 target-version = "py311"
 
 [tool.setuptools.package-data]
-"appsec_triage.sca.lang" = ["builtins/*.txt"]
+"appsec_triage.lang" = ["*/builtins.txt"]

@@ -10,13 +10,12 @@ from enum import Enum
 from pathlib import Path
 
 from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
+from ..fs import SKIP_DIRS
 from ..prompts import registry
 from ..testpaths import is_test
 
 log = logging.getLogger(__name__)
 
-_SKIP_DIRS = {".git", "vendor", "node_modules", "venv", ".venv", "target",
-              "build", "dist", "__pycache__"}
 _MAX_FILES = 8000
 _MAX_BYTES = 600_000
 
@@ -52,6 +51,8 @@ class Condition:
             return (f"условие выполняется: {self.statement} "
                     f"(найдено: {', '.join(self.hits[:3])})")
         if self.state is ConditionState.ABSENT:
+            if self.source == "detector" and self.hits:
+                return f"условие не выполняется: {self.statement} — по настройкам: {'; '.join(self.hits[:2])}"
             return (f"условие не выполняется: {self.statement} — "
                     f"в коде нет ни одного из: {', '.join(self.tokens[:5])}")
         if self.state is ConditionState.INFRASTRUCTURE:
@@ -128,7 +129,7 @@ def _files(root: Path, suffixes: set[str]):
             break
         if not path.is_file() or path.suffix.lower() not in suffixes:
             continue
-        if (_SKIP_DIRS.intersection(path.parts)
+        if (SKIP_DIRS.intersection(path.parts)
                 or any(part.lower().startswith("appsec-out") for part in path.parts)):
             continue
         # A condition met only in tests or in a local compose file is not met in
@@ -162,7 +163,7 @@ def check(
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="не задан ни один корень исходников — искать негде")
 
-    from .framework_detectors import detect_framework_condition
+    from ..lang import detect_framework_condition
 
     detected = detect_framework_condition([Path(root) for root in roots], tokens)
     if detected is not None:

@@ -1,0 +1,5 @@
+# JS/TS — typescript-language-server, ставится через npm. Один сервер на
+# .ts/.tsx/.js/.jsx, поэтому `typescript` в required_languages делает строгими оба.
+command: [typescript-language-server, --stdio]
+language_id: typescript
+extensions: [".ts", ".tsx", ".js", ".jsx"]

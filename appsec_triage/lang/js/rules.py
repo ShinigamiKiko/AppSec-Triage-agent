@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
+from ..base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
 
 _SPEC = r"""(?P<q>['"`])(?P<spec>[^'"`\n]+)(?P=q)"""
 _NAME = r"[A-Za-z_$][\w$]*"
@@ -82,6 +82,7 @@ def _add_member(bindings: Bindings, original: str, local: str) -> None:
 class JavaScriptRules(LanguageRules):
     name = "js"
     suffixes = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte"})
+    ecosystems = frozenset({"npm", "node", "javascript", "yarn", "js", "ts"})
 
     def strip_comments(self, text: str) -> str:
         return blank_comments(text, line_comments=("//",))

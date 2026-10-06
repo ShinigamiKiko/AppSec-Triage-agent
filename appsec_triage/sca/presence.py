@@ -9,17 +9,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from ..testpaths import is_test
+from .. import lang as lang_mod
 from ..context.detection import DEFAULT_SOURCE_SUFFIXES, DetectionError, get_source_suffixes
+from ..fs import SKIP_DIRS
+from ..lang.js.aliases import project_aliases
+from ..testpaths import is_test
 
 log = logging.getLogger(__name__)
 
 _INTERNAL_SEGMENT = re.compile(r"(?:^|/)internal(?:/|$)")
 
-_SKIP_DIRS = {
-    ".git", "vendor", "node_modules", "venv", ".venv", "target", "build",
-    "dist", "__pycache__", ".idea", ".vscode", ".tox", ".mypy_cache",
-}
+_SKIP_DIRS = SKIP_DIRS | {".idea", ".vscode", ".tox", ".mypy_cache"}
 
 
 def _skip_path(path: Path) -> bool:
@@ -406,8 +406,6 @@ def find_symbol(
             SymbolPresence.ABSENT, label, [], 0, truncated,
             detail=(f"в проекте нет файлов на языке пакета "
                     f"({', '.join(sorted(suffixes))}) — вызывать неоткуда"))
-    from . import lang as lang_mod
-
     rules = lang_mod.rules_for_ecosystem(ecosystem)
     if rules is not None and package and (function or klass):
         return _find_with_rules(root, files, truncated, rules, label, function=function, klass=klass,
@@ -492,18 +490,16 @@ _ALIASES: dict[str, dict[str, list[str]]] = {}
 
 
 def _aliases_for(root: Path) -> dict[str, list[str]]:
-    from . import lang as lang_mod
-
     key = str(root)
     if key not in _ALIASES:
-        _ALIASES[key] = lang_mod.project_aliases(root)
+        _ALIASES[key] = project_aliases(root)
     return _ALIASES[key]
 
 
 def _find_with_rules(root: Path, files: list[Path], truncated: bool, rules, label: str, *,
                      function: str, klass: str, package: str, ecosystem: str, file_hint: str,
                      max_hits: int) -> PresenceResult:
-    """Calls attributed through bindings, per language (see `sca/lang`).
+    """Calls attributed through bindings, per language (see `appsec_triage/lang`).
 
     A call counts when its receiver is bound to the package in that file —
     imported, required, `use`d, or one assignment away from one. Name-only
@@ -511,8 +507,6 @@ def _find_with_rules(root: Path, files: list[Path], truncated: bool, rules, labe
     owns (`Date.parse`, `Object.assign`, `new FormData()`), are not calls.
     """
     import re as _re
-
-    from . import lang as lang_mod
 
     namespaces = package_namespaces(ecosystem, package)
     namespaces += [n for n in installed_namespaces(root, ecosystem, package) if n not in namespaces]

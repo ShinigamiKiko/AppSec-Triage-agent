@@ -1,0 +1,7 @@
+# Python — pylsp. Ставится `pipx install python-lsp-server` → бинарь `pylsp` в ~/.local/bin.
+# Запускаем сам бинарь, а не `python -m pylsp`: в системе интерпретатор зовётся
+# python3 (не python), и pipx держит pylsp в изолированном venv, недоступном
+# системному python.
+command: [pylsp]
+language_id: python
+extensions: [".py"]

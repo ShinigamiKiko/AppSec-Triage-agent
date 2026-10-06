@@ -116,7 +116,7 @@ RUN composer global require "vimeo/psalm:^6" --no-interaction --no-progress \
 
 # --- language-server support ---------------------------------------------------
 # pylsp is a *language server* (invoked as the `pylsp` console script, matching
-# configs/lsp.yaml).
+# configs/lsp/python.yaml).
 RUN pip install \
         "python-lsp-server==${PYLSP_VERSION}" \
     && pylsp --help >/dev/null

@@ -116,8 +116,13 @@ _AUDIT_GATED = {"not_reached", "unused", "not_shipped", "test_only_import", "wro
                 "not_called"}
 
 
-def calibrate_closure(outcome: str, audited: bool, audit_note: str = "") -> Calibration:
-    """Confidence for a finding the dependency chain closed without the model."""
+def calibrate_closure(outcome: str, audited: bool, audit_note: str = "",
+                      waived: bool = False) -> Calibration:
+    """Confidence for a finding the dependency chain closed without the model.
+
+    `waived`: the provider profile takes automatic closures as final, so no audit
+    was asked for. The closure keeps the strength of its own check, nothing more.
+    """
     score = _CLOSURE_STRENGTH.get(outcome, 0.5)
     reasons = ["closed by the dependency chain on a checked fact, without a verdict call"]
     if evidence := _CLOSURE_EVIDENCE.get(outcome):
@@ -126,6 +131,8 @@ def calibrate_closure(outcome: str, audited: bool, audit_note: str = "") -> Cali
         if audited:
             score += 0.05
             reasons.append("the audit of this closure's blind spot ran and did not overturn it")
+        elif waived:
+            reasons.append("the blind-spot audit was not run: the provider profile closes automatically")
         else:
             score = min(score, 0.45)
             reasons.append(audit_note or "no audit of this closure's blind spot is recorded")

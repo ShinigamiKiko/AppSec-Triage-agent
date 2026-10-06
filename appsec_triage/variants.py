@@ -7,12 +7,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .fs import SKIP_DIRS
+
 log = logging.getLogger(__name__)
 
-_SKIP_DIRS = {
-    ".git", "vendor", "node_modules", "venv", ".venv", "target", "build",
-    "dist", "__pycache__", ".idea", ".vscode", "var", "cache",
-}
+_SKIP_DIRS = SKIP_DIRS | {".idea", ".vscode", "var", "cache"}
 _SOURCE_SUFFIXES = {".php", ".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".rb", ".java", ".kt", ".cs", ".rs"}
 
 _MAX_FILES = 6000

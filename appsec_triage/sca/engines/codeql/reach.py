@@ -13,6 +13,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..answers import Reached
+from .runner import query_file, via_server, write_external
+
 log = logging.getLogger(__name__)
 
 _THREADS = os.environ.get("APPSEC_CODEQL_THREADS", "0")
@@ -46,7 +49,6 @@ def database_lock(database: str | Path) -> threading.Lock:
 
 def _execute(argv: list[str], **kwargs):
     """Through the long-lived cli-server when it can answer, else a process of its own."""
-    from .codeql_runner import via_server
 
     timeout = kwargs.get("timeout") or _TIMEOUT_S
     done = via_server(argv, timeout)
@@ -152,29 +154,6 @@ select
 
 
 @dataclass(slots=True)
-class Reached:
-    """One call site the query proved reachable, and where the input enters."""
-
-    file: str
-    line: int
-    source_file: str = ""
-    source_line: int = 0
-    steps: list[str] = field(default_factory=list)
-    engine: str = "CodeQL"
-
-    @property
-    def site(self) -> tuple[str, int]:
-        return (self.file, self.line)
-
-    def render(self) -> str:
-        head = (f"{self.engine}: пользовательский ввод из {self.source_file}:{self.source_line} "
-                f"доходит до {self.file}:{self.line}")
-        if len(self.steps) > 1:
-            return f"{head}; трасса {self.engine}: {' → '.join(self.steps[:12])}"
-        return head
-
-
-@dataclass(slots=True)
 class Answer:
     """What the query established for the whole batch of call sites."""
 
@@ -197,12 +176,6 @@ class Answer:
         return False if any(s in self.evaluated for s in sites) else None
 
 
-def _predicate(sites: list[tuple[str, int]]) -> str:
-    clauses = [f'  path = "{file}" and line = {line}'
-               for file, line in sorted(sites)]
-    return "\n  or\n".join(clauses)
-
-
 def run(database: Path | str, language: str, sites: list[tuple[str, int]],
         *, binary: str = "codeql", timeout_s: int = _TIMEOUT_S, finding_id: str = "") -> Answer:
     """Ask one database which of these call sites user input reaches."""
@@ -218,7 +191,6 @@ def run(database: Path | str, language: str, sites: list[tuple[str, int]],
     if not (database / "codeql-database.yml").is_file():
         return Answer(problem=f"база CodeQL не найдена или недостроена: {database}")
 
-    from .codeql_runner import query_file, write_external
 
     query = query_file(language, _QUERY.format(
         imports=dialect["imports"], helpers=dialect["helpers"],

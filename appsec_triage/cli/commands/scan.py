@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from ... import scanners
-from ...scanners import tools as scanner_tools
+from ...scanners import codeql as scanner_codeql
 from ...scanners.selection import scanners_for_target
 from ..common import run_triage
 
@@ -77,7 +77,7 @@ def _install_dependencies(target: Path) -> Path:
     The bridge into a parent package reads the parent's installed source; without
     it every transitive finding ends as "the path could not be checked".
     """
-    from ...sca import install as install_mod
+    from ...lang.js import install as install_mod
 
     if not install_mod.needs_install(target):
         return target
@@ -124,7 +124,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     scan_dir = out / "scans"
     if out.is_relative_to(target):
         relative = out.relative_to(target)
-        scanner_tools.exclude_directory(relative.parts[0])
+        scanner_codeql.exclude_directory(relative.parts[0])
         print(f"→ каталог вывода {relative.parts[0]}/ внутри цели — исключён из скана", file=sys.stderr)
     if cmd_scan(argparse.Namespace(target=target, out=scan_dir, scanner=args.scanner)) != 0: return 1
     reports = [p for p in scan_dir.iterdir() if p.suffix in (".json", ".sarif") and p.name != "scan-manifest.json"]

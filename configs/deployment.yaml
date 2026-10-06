@@ -46,6 +46,37 @@ facts:
   # строкой, и станет видно, что факт устарел.
   no_laravel_in_projects: true
   no_react_in_projects: true
+  # Рабочая нагрузка — только Linux-контейнер. Уязвимости, существующие лишь на
+  # Windows, macOS, BSD и мобильных ОС, к подам не относятся.
+  linux_containers_only: true
+  # Край HTTP принадлежит ingress: разбор границ запроса (request smuggling),
+  # заголовки X-Forwarded-* и PROXY protocol настраивает его владелец, не сервис.
+  http_edge_owned_by_ingress: true
+  # FTP, Telnet, SMB/NFS и LDAP в сервисах не используются — ни как сервер, ни
+  # как клиент.
+  no_ftp_telnet_in_workloads: true
+  no_smb_nfs_in_workloads: true
+  no_ldap_in_workloads: true
+
+  # --- Ниже выключено. Ставьте true только по факту: каждый факт закрывает CVE. ---
+  # Ingress ходит к подам по HTTP/1.1; ни один сервис не принимает HTTP/2
+  # (h2c, gRPC). Если есть хоть один gRPC-сервис — оставьте false.
+  http1_only_to_backends: false
+  # В подах нет локальных учётных записей и интерактивных сессий: второй
+  # пользователь на той же машине и человек за терминалом здесь не существуют.
+  no_local_users_in_workloads: false
+  # В рабочих образах не запускаются dev-серверы, профилировщики, отладочные
+  # панели и тест-раннеры.
+  no_dev_tooling_in_production: false
+  # Все БД, брокеры, кэши и хранилища, к которым подключаются сервисы, находятся
+  # внутри кластера или управляются платформой: подставного сервера у клиента нет.
+  backends_are_trusted: false
+  # Фреймворки и продукты, на которых не написан ни один сервис.
+  no_angular_in_projects: false
+  no_nextjs_in_projects: false
+  no_svelte_in_projects: false
+  no_php_cms_in_projects: false
+  no_electron_in_projects: false
 
 # Компоненты, которых в сервисах платформы нет по решению её владельца. CVE,
 # эксплуатируемая ТОЛЬКО через такой компонент, закрывается сразу — до поиска в
@@ -114,6 +145,192 @@ out_of_scope_components:
     keywords: [GUI, "graphical user interface", X11, Wayland, GTK, Qt, printer, CUPS, webcam, camera, microphone, audio, touchscreen]
     markers: [DISPLAY, WAYLAND_DISPLAY, /dev/video, /dev/snd, /dev/dri]
     why: "в pod нет desktop GUI и физических устройств; это не runtime приложения"
+
+  # ---- Платформа: Kubernetes и ingress ----------------------------------------
+  # У записей ниже нет markers: компонент узнаётся по словам в самой CVE.
+  - id: inbound_tls
+    requires: tls_terminated_at_ingress
+    owner: platform-security
+    describe: >-
+      TLS on a socket the service itself listens on: the server side of the TLS
+      handshake, the listener's certificate and key, SNI and ALPN selection by a
+      server, session tickets and resumption on the server, renegotiation, client
+      certificate verification by a server, ACME / automatic certificate issuance.
+      Does NOT cover TLS the service uses as a client: certificate or hostname
+      verification of a server it connects to, and outgoing HTTPS, database or
+      broker connections. A flaw that fires on both sides does NOT count.
+    keywords: ["TLS server", "TLS handshake", ClientHello, SNI, ALPN, "session ticket", "session resumption", renegotiation, "client certificate", ACME, autocert]
+    why: "TLS терминируется на ingress, сервис слушает plaintext; серверная сторона TLS — зона платформы"
+  - id: inbound_http2
+    requires: http1_only_to_backends
+    owner: platform-security
+    describe: >-
+      The server side of HTTP/2 and HTTP/3: frame and stream handling by a server
+      (rapid reset, RST_STREAM and CONTINUATION floods, SETTINGS and PING floods),
+      HPACK / QPACK decoding by a server, h2c upgrade, QUIC listeners. Does NOT
+      cover an HTTP/2 client talking to another server.
+    keywords: ["HTTP/2", h2c, HPACK, "rapid reset", RST_STREAM, CONTINUATION, "SETTINGS frame", "HTTP/3", QUIC, QPACK]
+    why: "ingress ходит к подам по HTTP/1.1; серверный HTTP/2 в сервисах не включён"
+  - id: http_edge
+    requires: http_edge_owned_by_ingress
+    owner: platform-security
+    describe: >-
+      Behaviour that exists only between a front proxy and the backend behind it:
+      HTTP request smuggling and desynchronisation (conflicting Content-Length and
+      Transfer-Encoding, ambiguous chunking, header folding), trust in
+      X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto / Forwarded headers,
+      the PROXY protocol, trusted-proxy lists. Does NOT cover a flaw in parsing a
+      request body, a URL or a header value that needs no proxy in front to fire.
+    keywords: ["request smuggling", desync, desynchronization, "Transfer-Encoding", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded header", "PROXY protocol", "trusted proxy", "reverse proxy"]
+    why: "границу HTTP-запроса и forwarded-заголовки определяет настройка ingress, а не код сервиса"
+  - id: cluster_services
+    requires: host_platform_owned
+    owner: platform-security
+    describe: >-
+      Kubernetes control-plane and cluster add-ons as running services:
+      kube-apiserver, kube-controller-manager, kube-scheduler, kube-proxy, CoreDNS,
+      CNI and CSI plugins, ingress controllers, admission controllers and
+      webhooks, cert-manager, service-mesh proxies and sidecars (Istio, Envoy,
+      Linkerd), Helm and kubectl as tools. Does NOT cover a Kubernetes client
+      library that the service imports and calls.
+    keywords: ["kube-apiserver", "kube-proxy", "kube-controller-manager", "kube-scheduler", CoreDNS, CNI, CSI, "ingress-nginx", "ingress controller", "admission controller", "admission webhook", "cert-manager", Istio, Envoy, Linkerd, Helm, kubectl]
+    why: "компоненты кластера ведёт платформа; в поде приложения они не работают"
+  - id: container_engine
+    requires: host_platform_owned
+    owner: platform-security
+    describe: >-
+      The container engine and image tooling as running software: the Docker
+      daemon, Docker Engine API server, BuildKit, Moby, image build and image
+      pull, registries, the Docker socket. Does NOT cover a Docker client or SDK
+      that the service imports and calls.
+    keywords: ["Docker daemon", dockerd, "Docker Engine", BuildKit, Moby, "docker.sock", "image pull", "docker build", "container registry"]
+    why: "движок контейнеров и сборка образов — зона платформы и CI, не приложения в поде"
+
+  # ---- Среда пода --------------------------------------------------------------
+  - id: non_linux_os
+    requires: linux_containers_only
+    describe: >-
+      A flaw that exists only on an operating system other than Linux: Windows
+      (NTFS, UNC paths, drive letters, cmd.exe, PowerShell, the registry, DLL
+      loading, Win32 APIs), macOS / Darwin, iOS, Android, FreeBSD, OpenBSD,
+      NetBSD. Does NOT cover a flaw the advisory describes as cross-platform or
+      as also affecting Linux, even when Windows is named as one more case.
+    keywords: [Windows, macOS, Darwin, iOS, Android, FreeBSD, OpenBSD, NetBSD, NTFS, "UNC path", "cmd.exe", PowerShell, Win32]
+    why: "сервисы работают только в Linux-контейнерах; уязвимость другой ОС к ним не относится"
+  - id: local_multiuser
+    requires: no_local_users_in_workloads
+    owner: platform-security
+    describe: >-
+      An attack that needs another local account on the same machine: a local
+      unprivileged user reading or replacing files of the process, a shared or
+      world-writable temporary directory, symlink races set up by a local user,
+      setuid binaries, PAM, sudo, polkit, cron jobs of other users, local
+      privilege escalation. Does NOT cover a flaw triggered by a file or input
+      that a remote party supplies — an upload, a request body, an archive the
+      service unpacks.
+    keywords: ["local user", "local attacker", "local privilege escalation", "unprivileged local", "other local users", "world-writable", "world-readable", setuid, "symlink attack", PAM, sudo, polkit, crontab]
+    why: "в поде нет локальных учётных записей; второго пользователя на той же машине не существует"
+  - id: interactive_terminal
+    requires: no_local_users_in_workloads
+    owner: platform-security
+    describe: >-
+      A flaw that needs a person at a terminal attached to the process: terminal
+      escape sequences interpreted by a terminal emulator, readline and line
+      editing, shell completion, pagers, interactive prompts and REPLs. Does NOT
+      cover the same output when it is written to a log file, an HTTP response or
+      another program.
+    keywords: [TTY, "escape sequence", "ANSI escape", "terminal emulator", readline, "shell completion", "tab completion", pager, REPL]
+    why: "в поде нет интерактивных сессий; у процесса нет терминала и человека за ним"
+  - id: dev_tooling
+    requires: no_dev_tooling_in_production
+    describe: >-
+      Tooling that runs on a developer's machine or in CI and never in a
+      production pod: development servers (webpack-dev-server, the Vite dev
+      server, PHP's built-in web server), hot module replacement, debug toolbars
+      and profilers (the Symfony web profiler), Storybook, test runners and their
+      helper endpoints (PHPUnit eval-stdin). Does NOT cover a flaw in the
+      production build output or in the library's runtime API.
+    keywords: ["dev server", "development server", "webpack-dev-server", "hot module replacement", HMR, "debug toolbar", "web profiler", "built-in web server", Storybook, PHPUnit, "eval-stdin"]
+    why: "dev-серверы, отладочные панели и тест-раннеры в рабочих подах не запускаются"
+  - id: malicious_backend
+    requires: backends_are_trusted
+    describe: >-
+      A client library of a database, message broker, cache or object store
+      attacked by the server it connects to: a malicious or compromised server
+      sending crafted protocol responses. Does NOT cover an HTTP client that
+      fetches a URL chosen by a user, a redirect to another host, or a registry
+      or mirror on the public internet.
+    keywords: ["malicious server", "rogue server", "attacker-controlled server", "compromised server", "untrusted server", "malicious database", "malicious broker"]
+    why: "БД, брокеры и кэши находятся внутри кластера или управляются платформой; подставного сервера у клиента нет"
+
+  # ---- Сетевые сервисы, которых в сервисах нет ---------------------------------
+  - id: ftp_telnet
+    requires: no_ftp_telnet_in_workloads
+    describe: >-
+      FTP, FTPS, TFTP and Telnet used by the service on either side: running
+      such a server or connecting to one. Counts only when the protocol itself is
+      the sole path to the flaw. An advisory that lists FTP among several
+      affected transports ("HTTP, HTTPS and FTP") does NOT count.
+    keywords: [FTP, FTPS, TFTP, Telnet]
+    why: "FTP и Telnet в сервисах не используются ни как сервер, ни как клиент"
+  - id: smb_nfs
+    requires: no_smb_nfs_in_workloads
+    describe: >-
+      Network file sharing used by the service on either side: SMB, CIFS, Samba,
+      NFS shares and their clients. Counts only when the file-sharing protocol is
+      the sole path to the flaw.
+    keywords: [SMB, CIFS, Samba, NFS]
+    why: "сетевые файловые ресурсы SMB/NFS в сервисах не используются"
+  - id: ldap
+    requires: no_ldap_in_workloads
+    describe: >-
+      LDAP and NTLM used by the service on either side: a directory server
+      (OpenLDAP, slapd, Active Directory) and client libraries that bind to one
+      or authenticate with NTLM. Counts only when an LDAP or NTLM exchange is the
+      sole path to the flaw.
+    keywords: [LDAP, slapd, OpenLDAP, "Active Directory", NTLM]
+    why: "LDAP и NTLM в сервисах не используются ни как сервер, ни как клиент"
+
+  # ---- Фреймворки и продукты, на которых не написан ни один сервис --------------
+  - id: angular
+    requires: no_angular_in_projects
+    describe: >-
+      The Angular and AngularJS frameworks: their template compiler, sanitizer,
+      router and server-side rendering. Counts only when Angular's own code is the
+      sole path to the flaw.
+    keywords: [Angular, AngularJS, "ng-template", "ngSanitize"]
+    why: "ни один сервис не написан на Angular"
+  - id: nextjs
+    requires: no_nextjs_in_projects
+    describe: >-
+      The Next.js framework: its server, image optimisation, middleware, Server
+      Actions, getServerSideProps and routing. Counts only when Next.js's own
+      code is the sole path to the flaw.
+    keywords: ["Next.js", "next/image", getServerSideProps, "Server Actions"]
+    why: "ни один сервис не написан на Next.js"
+  - id: svelte
+    requires: no_svelte_in_projects
+    describe: >-
+      The Svelte compiler and runtime and the SvelteKit framework. Counts only
+      when their own code is the sole path to the flaw.
+    keywords: [Svelte, SvelteKit]
+    why: "ни один сервис не написан на Svelte"
+  - id: php_cms
+    requires: no_php_cms_in_projects
+    describe: >-
+      PHP content-management systems and shops as products: WordPress, Drupal,
+      Joomla, Magento, their plugins, themes and admin panels. Counts only when
+      the product's own code is the sole path to the flaw. A general-purpose PHP
+      library that such a product happens to use does NOT count.
+    keywords: [WordPress, Drupal, Joomla, Magento]
+    why: "ни один сервис не построен на PHP-CMS"
+  - id: electron
+    requires: no_electron_in_projects
+    describe: >-
+      The Electron desktop runtime: nodeIntegration, contextIsolation, the
+      renderer and main process bridge, webview and protocol handlers.
+    keywords: [Electron, nodeIntegration, contextIsolation]
+    why: "сервисы — серверные приложения в подах, не десктопные программы на Electron"
 
 # Правила сканеров, которые платформа закрывает по существу. Только те, где
 # проверка буквально не о приложении. Каждая запись обязана назвать факт выше,

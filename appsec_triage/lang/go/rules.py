@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
+from ..base import Bindings, CallMatch, LanguageRules, blank_comments, call_regex, line_of
 
 _IMPORT_ONE = re.compile(r'^\s*import\s+(?P<alias>[\w.]+\s+)?"(?P<path>[^"]+)"', re.M)
 _IMPORT_BLOCK = re.compile(r"^\s*import\s*\((?P<body>.*?)\)", re.M | re.S)
@@ -31,6 +31,7 @@ def in_module(path: str, module: str) -> bool:
 class GoRules(LanguageRules):
     name = "go"
     suffixes = frozenset({".go"})
+    ecosystems = frozenset({"go", "golang"})
 
     def strip_comments(self, text: str) -> str:
         return blank_comments(text, line_comments=("//",))
