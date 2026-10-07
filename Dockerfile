@@ -66,8 +66,8 @@ RUN composer global require "psalm/phar:^6" --no-interaction --no-progress \
     && ln -sf /opt/composer/vendor/bin/psalm.phar /usr/local/bin/psalm \
     && psalm --version
 
-# Opengrep (patterns + intra-file taint) — runs before Psalm on PHP code, as an extra
-# pass, not instead of it. The rule packs are fetched here, at build time, so a scan
+# Opengrep (patterns + intra-file taint) — runs first on every language, as an extra
+# pass before Psalm/CodeQL, not instead of them. The rule packs are fetched here, at build time, so a scan
 # never needs the network for them (configs/scanners/opengrep.yaml points at them).
 ARG OPENGREP_VERSION=v1.27.1
 RUN case "$(uname -m)" in aarch64|arm64) arch=aarch64 ;; *) arch=x86 ;; esac \

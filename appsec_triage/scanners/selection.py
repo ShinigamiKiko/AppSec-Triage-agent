@@ -8,8 +8,8 @@ from pathlib import Path
 from . import probe_all
 
 
-# Order is run order: on PHP code Opengrep's quick pass comes first, then Psalm.
-_PHP = ["opengrep", "psalm"]
+# Each language's own scanner. Opengrep is not listed here: it runs on top of them.
+_PHP = ["psalm"]
 _LANG_SCANNERS = {
     ".php": _PHP,
     ".phtml": _PHP, ".inc": _PHP,
@@ -27,6 +27,9 @@ _LANG_SCANNERS = {
     ".rs": ["codeql"], ".swift": ["codeql"],
 }
 _ALWAYS_SCANNERS = ["wolfee"]
+# A quick extra pass over any language the tree has, before that language's own scanner:
+# it adds findings, it replaces none.
+_FIRST_PASS = ["opengrep"]
 _SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "vendor", "target", "build", "dist", "__pycache__"}
 
 
@@ -43,6 +46,8 @@ def scanners_for_target(target: Path) -> list[str]:
             for s in _LANG_SCANNERS[ext]:
                 if s not in wanted:
                     wanted.append(s)
+    if seen_ext:
+        wanted = _FIRST_PASS + [s for s in wanted if s not in _FIRST_PASS]
     wanted += [s for s in _ALWAYS_SCANNERS if s not in wanted]
 
     probed = probe_all()

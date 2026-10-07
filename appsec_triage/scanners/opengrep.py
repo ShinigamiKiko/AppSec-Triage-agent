@@ -1,7 +1,8 @@
-"""Opengrep: fast pattern and intra-file taint rules, run before Psalm on PHP code.
+"""Opengrep: fast pattern and intra-file taint rules, an extra pass over every language.
 
-It does not replace Psalm. Opengrep reads every file — templates included — in
-seconds and finds what a pattern can see; Psalm then follows the data across
+It replaces no scanner. It runs first, on any language the tree has, and reads
+every file — templates and configs included — in seconds, finding what a pattern
+can see; each language's own scanner (Psalm, CodeQL) then follows the data across
 functions. Every Opengrep result goes to the model for confirmation (see
 `pipeline._model_confirms`): a pattern match is a lead, never a verdict.
 """
