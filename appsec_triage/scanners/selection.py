@@ -8,15 +8,13 @@ from pathlib import Path
 from . import probe_all
 
 
-def usable_scanners() -> list[str]:
-    return [n for n, a in probe_all().items() if a.usable]
-
-
+# Order is run order: on PHP code Opengrep's quick pass comes first, then Psalm.
+_PHP = ["opengrep", "psalm"]
 _LANG_SCANNERS = {
-    ".php": ["psalm"],
-    ".phtml": ["psalm"], ".inc": ["psalm"],
-    ".php3": ["psalm"], ".php4": ["psalm"], ".php5": ["psalm"],
-    ".php7": ["psalm"], ".php8": ["psalm"],
+    ".php": _PHP,
+    ".phtml": _PHP, ".inc": _PHP,
+    ".php3": _PHP, ".php4": _PHP, ".php5": _PHP,
+    ".php7": _PHP, ".php8": _PHP,
     ".go":  ["codeql"],
     ".ts": ["codeql"], ".tsx": ["codeql"],
     ".js": ["codeql"], ".jsx": ["codeql"],
@@ -47,10 +45,11 @@ def scanners_for_target(target: Path) -> list[str]:
                     wanted.append(s)
     wanted += [s for s in _ALWAYS_SCANNERS if s not in wanted]
 
-    usable = set(usable_scanners())
+    probed = probe_all()
+    usable = {n for n, a in probed.items() if a.usable}
     chosen = [s for s in wanted if s in usable]
-    skipped = [s for s in wanted if s not in usable]
-    if skipped:
-        print(f"→ language-relevant but unavailable: {', '.join(skipped)} "
-              "(run `appsec-triage doctor`)", file=sys.stderr)
+    # A scanner the languages call for and that will not run: its own line, with the reason.
+    for s in wanted:
+        if s not in usable:
+            print(f"  ✗ {s:<10} не запущен: {probed.get(s, 'нет в реестре')}", file=sys.stderr)
     return chosen if seen_ext or chosen else sorted(usable)

@@ -66,6 +66,20 @@ RUN composer global require "psalm/phar:^6" --no-interaction --no-progress \
     && ln -sf /opt/composer/vendor/bin/psalm.phar /usr/local/bin/psalm \
     && psalm --version
 
+# Opengrep (patterns + intra-file taint) — runs before Psalm on PHP code, as an extra
+# pass, not instead of it. The rule packs are fetched here, at build time, so a scan
+# never needs the network for them (configs/scanners/opengrep.yaml points at them).
+ARG OPENGREP_VERSION=v1.27.1
+RUN case "$(uname -m)" in aarch64|arm64) arch=aarch64 ;; *) arch=x86 ;; esac \
+    && curl -fsSL "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_${arch}" \
+        -o /usr/local/bin/opengrep \
+    && chmod +x /usr/local/bin/opengrep \
+    && opengrep --version \
+    && mkdir -p /opt/opengrep-rules \
+    && for pack in security-audit owasp-top-ten; do \
+         curl -fsSL "https://semgrep.dev/c/p/${pack}" -o "/opt/opengrep-rules/${pack}.yaml" || exit 1; \
+       done
+
 RUN pip install \
         "python-lsp-server==${PYLSP_VERSION}" \
     && pylsp --help >/dev/null

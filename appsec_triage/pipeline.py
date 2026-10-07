@@ -249,12 +249,15 @@ class TriagePipeline:
     def _triage_one(self, finding: Finding, timings: dict[str, float]) -> TriageRecord:
         if records.is_license(finding):
             return records.license_risk(finding, provider=self.provider_cfg.name)
-        if finding.misconfiguration:
+        # An Opengrep result is a pattern match: the model confirms or refutes it, and no
+        # deterministic pre-check below closes it first.
+        confirm = _model_confirms(finding)
+        if finding.misconfiguration and not confirm:
             if entry := self.deployment.handled_by_platform(finding.rule_id):
                 return records.platform_handled(finding, entry, provider=self.provider_cfg.name)
             return records.misconfiguration(finding, provider=self.provider_cfg.name)
 
-        if self.cfg.secrets_without_model and _is_secret_family(finding.cwe):
+        if self.cfg.secrets_without_model and _is_secret_family(finding.cwe) and not confirm:
             record = records.secret(finding, provider=self.provider_cfg.name)
             if record is not None:
                 return record
@@ -276,7 +279,7 @@ class TriagePipeline:
 
         authoritative_gov = postvalidation.is_authoritative_govulncheck(finding)
 
-        if heur.hard_fp and not authoritative_gov:
+        if heur.hard_fp and not authoritative_gov and not confirm:
             verdict = Verdict(
                 verdict=VerdictLabel.false_positive,
                 evidence_class=EvidenceClass.test_placeholder,
@@ -322,7 +325,7 @@ class TriagePipeline:
             "sca": None,
         }
 
-        mismatch_reason = postvalidation.check_deployment_mismatch(finding, pkg)
+        mismatch_reason = None if confirm else postvalidation.check_deployment_mismatch(finding, pkg)
         if mismatch_reason:
             return _deployment_closed(base, finding, mismatch_reason)
 
@@ -857,6 +860,12 @@ def _deployment_closed(base: dict, finding: Finding, reason: str) -> TriageRecor
 
 def _fatal_of(client):
     return getattr(client, "fatal_error", None)
+
+
+def _model_confirms(finding: Finding) -> bool:
+    """Opengrep found it, alone or alongside another scanner: the model decides, nothing before it."""
+    scanners = [finding.scanner or "", *(finding.corroborated_by or [])]
+    return any("opengrep" in name.lower() for name in scanners)
 
 
 def _is_secret_family(cwe: str | None) -> bool:

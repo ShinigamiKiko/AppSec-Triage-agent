@@ -14,6 +14,7 @@ from xml.sax.saxutils import quoteattr
 
 from ..config import CONFIG_DIR
 from .base import Availability, Scanner, ScannerError, ScanResult
+from .opengrep import OpengrepScanner
 
 log = logging.getLogger(__name__)
 
@@ -477,5 +478,6 @@ class CodeQLScanner(Scanner):
 REGISTRY: dict[str, type[Scanner]] = {
     "wolfee": WolfeeScanner,
     "codeql": CodeQLScanner,
+    "opengrep": OpengrepScanner,
     "psalm": PsalmScanner,
 }

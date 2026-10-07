@@ -1,0 +1,21 @@
+# Opengrep — быстрый первый проход по PHP-проекту, ДО Psalm, а не вместо него.
+#
+# Шаблоны и taint внутри одного файла: находит за секунды то, что видно в одном
+# месте, включая шаблоны Twig. Межфункциональный поток данных остаётся за Psalm.
+# Каждая находка Opengrep уходит модели на подтверждение — детерминированные
+# пред-проверки (секреты, эвристики, правила деплоя) её не закрывают.
+#
+# Правила — те же пакеты, что в ручном запуске:
+#   opengrep scan --config p/security-audit --config p/owasp-top-ten ...
+# В образе они скачаны на сборке в /opt/opengrep-rules (скан не ходит в сеть).
+# Без образа можно указать сами пакеты: rules: [p/security-audit, p/owasp-top-ten]
+# — тогда Opengrep скачает их при каждом скане.
+mode: native
+binary:
+  - opengrep
+  - /usr/local/bin/opengrep
+rules:
+  - /opt/opengrep-rules/security-audit.yaml
+  - /opt/opengrep-rules/owasp-top-ten.yaml
+per_file_timeout_s: 30        # секунд на правило в одном файле
+timeout_s: 900

@@ -171,7 +171,7 @@ class DependencyChain(ChainSupport):
             kind, route = "not_shipped", "package"
             audit = unreached_mod.not_rechecked(kind)
             decision = decide(None, None, None, dev_only=True, closure_audit=audit)
-        elif placement is not None and placement.direct:
+        elif placement is not None and placement.direct and not self._framework_invoked(dependency):
             paths = tuple(getattr(advisory, "import_paths", None) or ())
             package_used, package_used_detail = (
                 presence_mod.import_path_used(self._roots[0], dependency.ecosystem or "", paths)
@@ -465,6 +465,15 @@ class DependencyChain(ChainSupport):
             elif entry_audit is not None and lsp_audit is None:
                 lsp_audit = entry_audit
 
+        invoked = self._framework_invoked(dependency, symbol)
+        if invoked:
+            problems.append(f"{dependency.package} запускает сам фреймворк: {invoked}")
+            if lsp_audit is not None and not lsp_audit.reopens:
+                lsp_audit = unreached_mod.Audit(
+                    kind="not_called", checked=True, invisible_path=True, quote=invoked,
+                    subject="закрытие «not_called» не выдержало проверки",
+                    why=f"{dependency.package} запускает сам фреймворк, а не код проекта")
+
         if lsp_audit is not None and symbol.function and not lsp_audit.reopens:
             registered = unreached_mod.callback_registration(
                 symbol.function, self._resolver._source_for(
@@ -557,6 +566,9 @@ class DependencyChain(ChainSupport):
         used, used_detail, test_only = None, "", False
         if self._roots and not settled_earlier and not path_decides:
             used, used_detail, test_only = self._package_usage(dependency, used_package, record=codeql_calls)
+        if invoked:
+            package_used = None if package_used is False else package_used
+            used, test_only = (None, False) if used is False else (used, test_only)
 
         input_driven = (reach_mod.needs_input_path(finding.cwe)
                         or any(reach_mod.needs_input_path(c) for c in advisory.cwe_ids) or None)

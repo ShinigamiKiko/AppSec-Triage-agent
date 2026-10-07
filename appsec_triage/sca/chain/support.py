@@ -15,6 +15,8 @@ from ..graph import DependencyGraph, Placement
 from .helpers import _CODEQL_LANGUAGE, _ID_PREFIXES, _pairs, _walk_as_bridge
 from .. import resolve_cache
 from ..resolve import SymbolResolver, VulnerableSymbol
+from ..entrypoints import READERS as _ENTRYPOINTS, php as php_entrypoints
+from ..lang import rules_for_ecosystem
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +52,7 @@ class ChainSupport:
         self._api_answers: dict[tuple[str, tuple], codeql_api.ApiAnswer] = {}
         self._import_answers: dict[tuple[str, str], codeql_api.ImportAnswer] = {}
         self._dataflow_lock = threading.Lock()
+        self._invoked: dict[str, dict[str, str]] = {}
         self._pending: dict[tuple[int, object], threading.Event] = {}
         self._advisories: dict[tuple[str, str, str, str], adv.Advisory] = {}
         self._graphs: dict[str, DependencyGraph] = {}
@@ -486,4 +489,41 @@ class ChainSupport:
             version = graph.version_of(package)
             if version:
                 return version
+        return ""
+
+    def _framework_invoked(self, dependency, symbol=None) -> str:
+        """The entry line through which the framework starts this package itself, or "".
+
+        Such a package has no caller in project code by construction (see
+        sca/entrypoints/): "nothing in the project calls it" closes nothing.
+        """
+        rules = rules_for_ecosystem(getattr(dependency, "ecosystem", "") or "")
+        reader = _ENTRYPOINTS.get(rules.name) if rules is not None else None
+        if reader is None or not self._roots or not getattr(dependency, "package", ""):
+            return ""
+        key = f"{rules.name}:{self._roots[0]}"
+        with self._dataflow_lock:
+            invoked = self._invoked.get(key)
+        if invoked is None:
+            try:
+                invoked = reader(self._roots[0])
+            except Exception:  # noqa: BLE001 - a reader that fails claims nothing
+                log.debug("entry points of %s not read", self._roots[0], exc_info=True)
+                invoked = {}
+            with self._dataflow_lock:
+                self._invoked[key] = invoked
+        package = dependency.package.lower()
+        if package in invoked:
+            return invoked[package]
+        # A file autoloaded on every request defines the package's functions, not its classes:
+        # it counts unless the flaw is known to sit in a class (no symbol yet: it counts).
+        if rules.name == "php" and not getattr(symbol, "klass", ""):
+            key = f"php-functions:{self._roots[0]}"
+            with self._dataflow_lock:
+                loaded = self._invoked.get(key)
+            if loaded is None:
+                loaded = php_entrypoints.functions_loaded(self._roots[0])
+                with self._dataflow_lock:
+                    self._invoked[key] = loaded
+            return loaded.get(package, "")
         return ""

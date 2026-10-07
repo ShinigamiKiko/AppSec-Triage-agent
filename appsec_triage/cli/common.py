@@ -16,7 +16,8 @@ from ..config import (OLLAMA_PIPELINE, keep_ollama_only_settings, load_lsp_confi
 from ..context.source import SourceResolver
 from ..llm.base import LLMAuthError, LLMError
 from ..llm.factory import build_client
-from ..lsp.service import LSPService, required_languages as lsp_required_languages
+from ..lsp.service import LSPService, present_languages as lsp_present_languages
+from ..lsp.service import required_languages as lsp_required_languages
 from ..pipeline import TriagePipeline
 from ..report import audit, html
 
@@ -214,12 +215,18 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
                 reason = "no --source-root given" if not source_roots else "lsp.yaml has enabled: false"
                 print(f"error: findings in {langs} present, and the language server is mandatory for them ({reason}).\n       Pass --source-root <repo> with LSP enabled, or accept degraded triage explicitly with --no-lsp.", file=sys.stderr)
                 return 2
-        else:
-            for lang in required_present:
-                if err := symbols.ensure_ready(lang):
-                    print(f"error: the {lang} language server is mandatory but not usable: {err}\n       Fix it (see `appsec-triage doctor`), or accept degraded triage explicitly with --no-lsp.", file=sys.stderr)
-                    symbols.close()
-                    return 2
+    if symbols is not None:
+        # Every server the findings or the project's own code need, started now: the log
+        # shows which ones are alive.
+        wanted = set(lsp_present_languages(findings, lsp_cfg, cfg.scope.only_ecosystems))
+        for lang in sorted(wanted | set(symbols.project_languages())):
+            err = symbols.ensure_ready(lang)
+            server = ((lsp_cfg.servers.get(lang) or {}).get("command") or ["?"])[0]
+            print(f"  {'✗' if err else '✓'} lsp {lang:<10} {err or f'жив ({server})'}", file=sys.stderr)
+            if err and lang in required_present:
+                print(f"error: the {lang} language server is mandatory but not usable: {err}\n       Fix it (see `appsec-triage doctor`), or accept degraded triage explicitly with --no-lsp.", file=sys.stderr)
+                symbols.close()
+                return 2
 
     out.mkdir(parents=True, exist_ok=True)
     journal_path = out / f"verdicts-{provider_cfg.name}.jsonl.partial"

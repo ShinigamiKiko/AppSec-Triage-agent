@@ -58,6 +58,12 @@ _ECOSYSTEM_LANGUAGE = {"npm": "typescript", "composer": "php", "go": "go",
 
 def required_languages(findings, cfg: LSPConfig, only_ecosystems=()) -> list[str]:
     """Mandatory languages these findings bring in, including SCA ones."""
+    return [language for language in present_languages(findings, cfg, only_ecosystems)
+            if language in cfg.required_languages]
+
+
+def present_languages(findings, cfg: LSPConfig, only_ecosystems=()) -> list[str]:
+    """Languages with a server (or a mandatory one) that these findings bring in, SCA included."""
     from ..scope import _ecosystem
 
     allowed = {_ecosystem(e) for e in only_ecosystems if e and str(e).strip()}
@@ -71,7 +77,7 @@ def required_languages(findings, cfg: LSPConfig, only_ecosystems=()) -> list[str
             language = _ECOSYSTEM_LANGUAGE.get(ecosystem)
         else:
             language = cfg.language_for(finding.code_context.file_path)
-        if language and language in cfg.required_languages:
+        if language and (language in cfg.servers or language in cfg.required_languages):
             wanted.add(language)
     return sorted(wanted)
 
@@ -142,6 +148,20 @@ class LSPService:
         log.info("language server for %s ready (%s)", language, " ".join(command[:2]))
         self._clients[language] = client
         return client
+
+    def project_languages(self) -> list[str]:
+        """Configured languages the project's own files are written in (vendor and the like skipped)."""
+        import os
+
+        by_suffix = {s.lower(): language for language, spec in self.cfg.servers.items()
+                     for s in (spec or {}).get("extensions") or []}
+        found: set[str] = set()
+        skip = {"node_modules", "vendor", ".git", "dist", "build", "__pycache__", ".venv", "venv", "var"}
+        for root in self.roots:
+            for _, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+                found.update(by_suffix[s] for s in (Path(n).suffix.lower() for n in filenames) if s in by_suffix)
+        return sorted(found)
 
     def _warmup_file(self, language: str, spec: dict) -> tuple[Path, str] | None:
         """One project file of this language, opened before the index probe."""
