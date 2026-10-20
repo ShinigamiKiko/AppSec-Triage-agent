@@ -134,7 +134,10 @@ def _collected_window(evidence, pkg, path: str, line: object) -> str:
     if not resolved:
         return ""
     try:
-        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        from .context.evidence import _redact
+
+        # Through the same redaction as every other read: these lines go to the model too.
+        lines = _redact(resolved.read_text(encoding="utf-8", errors="replace")).splitlines()
     except OSError:
         return ""
     window = lines[line - 1:line + 79]
@@ -153,6 +156,8 @@ class CodeWalk:
         self.repository_evidence = evidence
         self.symbols = symbols
         self._code_tools = None
+        self._map: str | None = None
+        self._map_lock = threading.Lock()
 
     def ready(self) -> bool:
         """A walk needs the switch, a tool-calling client, evidence access and a live server."""
@@ -166,8 +171,34 @@ class CodeWalk:
             self._code_tools = CodeTools(self.symbols, self.symbols.roots[0])
         return bool(self._code_tools.available())
 
+    def project_map(self) -> str:
+        """Where things live in this project, built once per run from the stack profiles.
+
+        In the walk's question rather than in a system prompt: only the code walk
+        searches, and a system prompt is paid for on every call — and on a small
+        local context it is the part that gets cut first.
+        """
+        if not getattr(self.cfg, "project_map", True):
+            return ""
+        with self._map_lock:
+            if self._map is None:
+                source = getattr(self.repository_evidence, "source", None)
+                roots = list(getattr(source, "roots", None) or [])
+                try:
+                    from .context import project_map, stack
+
+                    self._map = project_map.render(stack.detect(roots), roots)
+                except Exception as exc:  # noqa: BLE001 - a map is a hint, never a reason to fail
+                    log.warning("project map not built: %s", exc)
+                    self._map = ""
+                if self._map:
+                    log.info("project map for the code walk:\n%s", self._map)
+            return self._map
+
     def retrieve(self, pkg, question: str, responses: list, *, walk: bool = False) -> bool:
         """Let the model read and search the repository itself; True when evidence was added."""
+        if where := self.project_map():
+            question = f"{where}\n\n{question}"
         evidence = self.repository_evidence
         added = False
         writing = threading.Lock()

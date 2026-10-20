@@ -1,6 +1,6 @@
 ---
 id: log-injection
-version: "1.0"
+version: "1.1"
 applies_to: ["CWE-117", "CWE-93", "CWE-116"]
 extends: base
 includes: [_sanitizers]
@@ -44,6 +44,22 @@ constrained — but only if you can see the parts.
 Do **not** treat "it comes from JSON" or "it went through a struct field" as a
 constraint. Neither restricts the characters.
 
+**The transport can be the constraint.** An HTTP request header read as it arrived —
+`ctx.Get("X-Request-Id")`, `r.Header.Get(...)`, `req.get(...)`, `req.headers[...]`,
+`$request->headers->get(...)` — cannot hold CR or LF: HTTP/1.1 ends the header line
+there, HTTP/2 treats it as malformed, and servers and proxies reject a bare CR. Such
+a value cannot start a second record, so it is a closure: quote the line that reads
+the header. Measured on a real Go service: both log-injection findings from
+`X-Request-Id` came back `confirmed` on the claim that "`\n` in the header adds a
+line" — which no client can send.
+This holds only for the raw header value. Query parameters, path segments, form
+fields and JSON bodies are decoded (`%0a`, `\n`) and do carry newlines, and so does
+a header value the application decodes itself (base64, URL-decoding, JSON). Cookies
+count as decoded: PHP's `$_COOKIE`, Symfony's `$request->cookies` and Express's
+`cookie-parser` URL-decode the value, so `%0a` arrives as a newline.
+Other control characters such as an ANSI escape can pass in a header; they affect
+only someone reading the raw log in a terminal and forge no record.
+
 ### 3. Who reads the log, and does the evidence say?
 
 This is what separates a real finding from a note.
@@ -65,6 +81,7 @@ consumer question in `blocking_question` so the reviewer settles it.
 |---|---|
 | Structured logger encodes the field | `false_positive`, `SANITIZED_DATAFLOW` — quote the call |
 | Value is typed or validated so it cannot hold a newline | `false_positive` — quote the constraint |
+| Value is a raw HTTP header, not decoded by the app (cookies are decoded) | `false_positive`, `IDENTIFIER_ONLY` — quote the header read |
 | Plain-text log call, unconstrained attacker-controlled string | `confirmed`, `EXPLOITABLE_DATAFLOW` |
 | Plain-text call, but the trace does not reach the value's origin | `unknown` — name the missing leg |
 

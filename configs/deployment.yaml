@@ -14,7 +14,9 @@ facts:
   no_ssh_in_workloads: true
   host_platform_owned: true
   no_gui_or_hardware_in_workloads: true
-  no_laravel_in_projects: true
+  # Неверно: api-develop написан на Laravel 8. С `true` CVE самого Laravel закрывались
+  # как «вне платформы» до поиска в коде — даже когда laravel/framework в проекте найден.
+  no_laravel_in_projects: false
   no_react_in_projects: true
 
 out_of_scope_components:

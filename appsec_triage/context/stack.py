@@ -28,6 +28,11 @@ class StackProfile:
     markers: tuple[str, ...]
     body: str
     path: Path
+    where: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    """Role -> path patterns, for the project map (`context.project_map`). Not part of `body`:
+    the conventions go to every prompt, the map only to the code walk."""
+    exclude: tuple[str, ...] = ()
+    """`where_exclude`: parts of the tree another stack owns, kept out of this map."""
 
     def matches(self, root: Path) -> bool:
         for filename in self.marker_files:
@@ -45,6 +50,20 @@ class StackProfile:
         return False
 
 
+def _where(raw) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """`where:` from the front matter as ((role, (pattern, ...)), ...), in file order."""
+    if not isinstance(raw, dict):
+        return ()
+    out = []
+    for role, patterns in raw.items():
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        clean = tuple(str(p).strip() for p in (patterns or []) if str(p).strip())
+        if clean:
+            out.append((str(role).strip(), clean))
+    return tuple(out)
+
+
 def _parse(path: Path) -> StackProfile:
     text = path.read_text(encoding="utf-8")
     m = _FRONT_MATTER.match(text)
@@ -60,6 +79,8 @@ def _parse(path: Path) -> StackProfile:
         markers=tuple(detect.get("contains") or []),
         body=text[m.end():].strip(),
         path=path,
+        where=_where(meta.get("where")),
+        exclude=tuple(str(p).strip() for p in (meta.get("where_exclude") or []) if str(p).strip()),
     )
 
 

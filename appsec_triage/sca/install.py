@@ -25,6 +25,13 @@ zip files the scan host cannot fetch, but every locked package also names its
 source repository and the exact commit: a GitHub one is fetched from GitHub's own
 archive of that commit, a package whose source is on a private host is dropped
 and named, and the project's `repositories` stop pointing at the mirror.
+
+Every project in the tree is installed, not only the root: a backend at the root and
+a frontend in `frontend/` are two projects with two manifests. Measured on OWASP
+Juice Shop, whose Angular app lives in `frontend/`: with only the root installed,
+CodeQL resolved `ActivatedRoute` 0 times and `DomSanitizer` once in nine calls — its
+Angular model works from those types — and both DOM XSS through
+`bypassSecurityTrustHtml` went unreported.
 """
 
 from __future__ import annotations
@@ -48,6 +55,12 @@ _COMPOSER_ATTEMPTS = max(1, min(_ATTEMPTS, 3))
 _YARN = os.environ.get("APPSEC_YARN", "yarn@1.22.22")
 
 _COPY_SKIP = {".git", "node_modules", ".codeql", "coverage", ".nuxt", ".next"}
+# Where a manifest is not a project that ships: installed trees, build output, tests,
+# examples and docs. A nested project deeper than this is somebody's fixture.
+_PROJECT_SKIP = {"node_modules", "vendor", "dist", "build", "coverage", "test", "tests", "__tests__",
+                 "e2e", "cypress", "fixtures", "testdata", "examples", "example", "docs"}
+_MAX_PROJECT_DEPTH = 3
+_MAX_PROJECTS = 12
 _REGISTRY_CONFIG = (".npmrc", ".yarnrc", ".yarnrc.yml", "auth.json")
 _PUBLIC_HOSTS = {"github.com", "api.github.com", "codeload.github.com", "gitlab.com",
                  "bitbucket.org", "repo.packagist.org", "packagist.org"}
@@ -74,14 +87,63 @@ class InstallResult:
     dropped: list[str] = field(default_factory=list)
     rewritten: int = 0
     problem: str = ""
+    unlocked: list[str] = field(default_factory=list)
+    """Projects installed without a lock file: their versions were resolved afresh."""
 
     @property
     def usable(self) -> bool:
         return self.workspace is not None and self.installed > 0
 
+    def note(self, label: str, problem: str) -> None:
+        if problem:
+            self.problem = "; ".join(p for p in (self.problem, f"{label}: {problem}" if label else problem) if p)
+
+
+def projects(root: Path, manifest: str) -> list[Path]:
+    """Directories under `root` holding `manifest`, the root first.
+
+    An npm or Yarn workspace root installs its members itself, so a root that
+    declares `workspaces` stands for the whole tree.
+    """
+    root = Path(root)
+    found = [root] if (root / manifest).is_file() else []
+    if manifest == "package.json" and found and _declares_workspaces(root / manifest):
+        return found
+    for directory, dirnames, _ in os.walk(root):
+        current = Path(directory)
+        depth = len(current.relative_to(root).parts)
+        dirnames[:] = sorted(d for d in dirnames
+                             if d.lower() not in _PROJECT_SKIP and not d.startswith(".")
+                             and not d.lower().startswith("appsec-out")
+                             and not (current / d).is_symlink() and depth < _MAX_PROJECT_DEPTH)
+        if current != root and (current / manifest).is_file():
+            found.append(current)
+            if len(found) >= _MAX_PROJECTS:
+                log.warning("more than %d %s projects under %s; installing the first %d",
+                            _MAX_PROJECTS, manifest, root, _MAX_PROJECTS)
+                break
+    return found
+
+
+def _declares_workspaces(manifest: Path) -> bool:
+    try:
+        return bool(json.loads(manifest.read_text(encoding="utf-8")).get("workspaces"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def npm_projects(root: Path) -> list[Path]:
+    """Projects under `root` with a package.json and no installed node_modules."""
+    return [p for p in projects(root, "package.json") if _needs_npm(p)]
+
+
+def composer_projects(root: Path) -> list[Path]:
+    """Projects under `root` with a composer.lock and no installed vendor/."""
+    return [p for p in projects(root, "composer.lock") if _needs_composer(p)]
+
 
 def needs_install(project: Path) -> bool:
-    return _needs_npm(project) or _needs_composer(project)
+    return bool(npm_projects(project) or composer_projects(project))
 
 
 def _needs_npm(project: Path) -> bool:
@@ -263,26 +325,36 @@ def install(source: Path, workspace: Path, *, registry: str = PUBLIC_REGISTRY,
     except OSError as exc:
         result.problem = f"копия проекта не создана: {exc}"
         return result
-    tools = []
-    if _needs_npm(workspace):
-        _install_npm(workspace, result, registry, attempts, timeout_s)
-        tools.append(result.tool)
-    if _needs_composer(workspace):
-        _install_composer(workspace, result, timeout_s)
+    tools: list[str] = []
+    for directory in npm_projects(workspace):
+        tools.append(_install_npm(directory, result, registry, attempts, timeout_s,
+                                  label=_label(workspace, directory)))
+    for directory in composer_projects(workspace):
+        _install_composer(directory, result, timeout_s, label=_label(workspace, directory),
+                          home_base=workspace)
         tools.append("composer")
-    result.tool = "+".join(t for t in tools if t)
+    result.tool = "+".join(dict.fromkeys(t for t in tools if t))
+    result.faithful = bool(tools) and not result.unlocked
     result.workspace = workspace if result.installed else None
     return result
 
 
-def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) -> None:
+def _label(workspace: Path, directory: Path) -> str:
+    """`frontend/` for a nested project, "" for the root — the prefix of what it reports."""
+    relative = directory.relative_to(workspace).as_posix()
+    return "" if relative == "." else f"{relative}/"
+
+
+def _install_composer(workspace: Path, result: InstallResult, timeout_s: int, label: str = "",
+                      home_base: Path | None = None) -> None:
     rewritten, dropped = rewrite_composer_lock(workspace / "composer.lock")
     result.rewritten += rewritten
-    result.dropped += [f"{name} (исходники только на приватном хосте)" for name in dropped]
+    result.dropped += [f"{label}{name} (исходники только на приватном хосте)" for name in dropped]
     if (workspace / "composer.json").is_file():
         public_composer_manifest(workspace / "composer.json", dropped)
-    result.faithful = True
-    home = workspace.parent / f".{workspace.name}-composer-home"
+    # Beside the copy, never inside it: a nested project's parent is the scanned tree.
+    base = home_base or workspace
+    home = base.parent / f".{base.name}-composer-home"
     shutil.rmtree(home, ignore_errors=True)
     env = {**os.environ, "COMPOSER_HOME": str(home), "COMPOSER_NO_INTERACTION": "1",
            "COMPOSER_ALLOW_SUPERUSER": "1", "COMPOSER_NO_AUDIT": "1"}
@@ -310,50 +382,52 @@ def _install_composer(workspace: Path, result: InstallResult, timeout_s: int) ->
             log.warning("composer install failed (attempt %d of %d), trying again: %s", attempt,
                         _COMPOSER_ATTEMPTS, f"{proc.stdout}\n{proc.stderr}".strip().splitlines()[-1:])
     except subprocess.TimeoutExpired:
-        result.problem = "composer config не уложился в 60s"
+        result.note(label, "composer config не уложился в 60s")
         return
     except OSError as exc:
-        result.problem = f"composer не запустился: {exc}"
+        result.note(label, f"composer не запустился: {exc}")
         return
     if proc is None:
         result.installed += _installed_composer(workspace / "vendor")
-        result.problem = f"composer не уложился в {timeout_s}s ни в одной из {_COMPOSER_ATTEMPTS} попыток"
+        result.note(label, f"composer не уложился в {timeout_s}s ни в одной из {_COMPOSER_ATTEMPTS} попыток")
         return
     installed = _installed_composer(workspace / "vendor")
     result.installed += installed
     if proc.returncode != 0:
         lines = f"{proc.stdout}\n{proc.stderr}".strip().splitlines()
         said = [line.strip() for line in lines if re.search(r"\b(?:error|failed|could not)\b", line, re.I)]
-        result.problem = (f"composer завершился с кодом {proc.returncode}"
-                          f"{f' (поставлено пакетов: {installed})' if installed else ''}: "
-                          f"{chr(10).join(said[:3] or lines[-4:])[:400]}")
+        result.note(label, f"composer завершился с кодом {proc.returncode}"
+                           f"{f' (поставлено пакетов: {installed})' if installed else ''}: "
+                           f"{chr(10).join(said[:3] or lines[-4:])[:400]}")
 
 
 def _install_npm(workspace: Path, result: InstallResult, registry: str, attempts: int,
-                 timeout_s: int) -> None:
+                 timeout_s: int, label: str = "") -> str:
+    """Install one npm/Yarn project; returns the tool it used."""
     manifest = workspace / "package.json"
-    result.dropped += drop_unregistered(manifest)
-    result.rewritten = (rewrite_lock(workspace / "yarn.lock", registry)
-                        + rewrite_lock(workspace / "package-lock.json", registry))
-    result.faithful = any((workspace / name).is_file() for name in ("yarn.lock", "package-lock.json"))
-    result.tool, argv = _command(workspace, registry)
+    result.dropped += [f"{label}{item}" for item in drop_unregistered(manifest)]
+    result.rewritten += (rewrite_lock(workspace / "yarn.lock", registry)
+                         + rewrite_lock(workspace / "package-lock.json", registry))
+    if not any((workspace / name).is_file() for name in ("yarn.lock", "package-lock.json")):
+        result.unlocked.append(label or "./")
+    tool, argv = _command(workspace, registry)
     env = {**os.environ, "npm_config_registry": registry, "YARN_REGISTRY": registry,
            "npm_config_userconfig": os.devnull}
 
+    problem = ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
             proc = subprocess.run(argv, cwd=workspace, capture_output=True, text=True,
                                   timeout=timeout_s, env=env, encoding="utf-8", errors="replace",
                                   check=False)
         except subprocess.TimeoutExpired:
-            result.problem = f"{result.tool} не уложился в {timeout_s}s"
+            problem = f"{tool} не уложился в {timeout_s}s"
             break
         except OSError as exc:
-            result.problem = f"{result.tool} не запустился: {exc}"
+            problem = f"{tool} не запустился: {exc}"
             break
         output = f"{proc.stdout}\n{proc.stderr}"
         if proc.returncode == 0:
-            result.problem = ""
             break
         missing = missing_packages(output)
         removable = {name for name in missing if drop_dependency(manifest, name)}
@@ -362,10 +436,12 @@ def _install_npm(workspace: Path, result: InstallResult, registry: str, attempts
             said = [line.strip() for line in lines if re.search(r"\berr(?:or)?\b", line, re.I)
                     and not line.lstrip().startswith("at ")]
             reason = "\n".join(said[:3] or lines[-4:])
-            result.problem = f"{result.tool} завершился с кодом {proc.returncode}: {reason[:400]}"
+            problem = f"{tool} завершился с кодом {proc.returncode}: {reason[:400]}"
             break
-        result.dropped += [f"{name} (нет в публичном реестре)" for name in sorted(removable)]
+        result.dropped += [f"{label}{name} (нет в публичном реестре)" for name in sorted(removable)]
         log.info("attempt %d: dropped %s, retrying", attempt, ", ".join(sorted(removable)))
 
+    result.note(label, problem)
     installed = workspace / "node_modules"
     result.installed += sum(1 for _ in installed.iterdir()) if installed.is_dir() else 0
+    return tool
