@@ -60,20 +60,23 @@ def preflight_provider(provider_cfg) -> str | None:
 def node_modules_problem(roots: list[Path]) -> str | None:
     """A JS project without an installed tree: the language server and the
     package-source lookups are blind, and the run should say so up front."""
+    from ..sca.install import projects
+
     for root in roots:
-        root = Path(root)
-        if not (root / "package.json").is_file():
-            continue
-        modules = root / "node_modules"
-        try:
-            empty = not modules.is_dir() or not any(modules.iterdir())
-        except OSError:
-            empty = True
-        if empty:
-            return (f"{root}: package.json есть, а node_modules пуст или отсутствует — "
-                    "typescript-language-server не построит индекс, исходники пакетов недоступны. "
-                    "Выполните `yarn install --ignore-scripts` (или `npm ci --ignore-scripts`) до прогона; "
-                    "без этого ответы LSP по JS/TS будут неполными, а медленный сервер отключится сам.")
+        # Every project in the tree, not only the root: a frontend in `frontend/` without
+        # node_modules leaves CodeQL's type-based framework models (Angular, Vue) blind too.
+        for project in projects(Path(root), "package.json"):
+            modules = project / "node_modules"
+            try:
+                empty = not modules.is_dir() or not any(modules.iterdir())
+            except OSError:
+                empty = True
+            if empty:
+                return (f"{project}: package.json есть, а node_modules пуст или отсутствует — "
+                        "typescript-language-server не построит индекс, исходники пакетов недоступны, "
+                        "а модели фреймворков в CodeQL не увидят типы. "
+                        "Выполните `yarn install --ignore-scripts` (или `npm ci --ignore-scripts`) до прогона "
+                        "или запустите `run --install-deps`; без этого ответы по JS/TS будут неполными.")
     return None
 
 

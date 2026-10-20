@@ -84,8 +84,13 @@ def _install_dependencies(target: Path) -> Path:
         return target
     workspace = Path(os.environ.get("APPSEC_WORKSPACE")
                      or Path(tempfile.gettempdir()) / "appsec-workspace")
-    sources = ([f"npm с {install_mod.PUBLIC_REGISTRY}"] if install_mod._needs_npm(target) else []) \
-        + (["composer с GitHub по коммитам из composer.lock"] if install_mod._needs_composer(target) else [])
+    def where(projects: list[Path]) -> str:
+        names = [p.relative_to(target).as_posix() + "/" if p != target else "./" for p in projects]
+        return f" ({', '.join(names)})"
+
+    npm, composer = install_mod.npm_projects(target), install_mod.composer_projects(target)
+    sources = ([f"npm с {install_mod.PUBLIC_REGISTRY}{where(npm)}"] if npm else []) \
+        + ([f"composer с GitHub по коммитам из composer.lock{where(composer)}"] if composer else [])
     print(f"→ зависимости: ставлю {', '.join(sources)} в копию проекта {workspace}", file=sys.stderr)
     result = install_mod.install(target, workspace)
     if result.rewritten:
@@ -99,7 +104,8 @@ def _install_dependencies(target: Path) -> Path:
         return target
     if result.problem:
         print(f"  ! установлено не всё: {result.problem}", file=sys.stderr)
-    versions = "из lock-файла" if result.faithful else "разрешены заново — lock-файла нет"
+    versions = ("из lock-файла" if result.faithful else
+                f"разрешены заново — нет lock-файла в {', '.join(result.unlocked)}")
     print(f"→ установлено пакетов: {result.installed} ({result.tool}, версии {versions})",
           file=sys.stderr)
     return result.workspace
