@@ -6,8 +6,18 @@ detect:
   files: ["composer.json", "composer.lock"]
   contains:
     - "symfony/framework-bundle"
-    - "symfony/http-kernel"
     - "doctrine/orm"
+  # Not symfony/http-kernel: Laravel depends on it, so a Laravel composer.lock read as Symfony.
+where:
+  routes and controllers: ["config/routes/", "config/routes.yaml", "src/Controller/", "src/*/Controller/"]
+  access control: ["config/packages/security.yaml", "src/Security/", "src/*/Security/", "src/Voter/"]
+  request input binding and validation: ["src/Dto/", "src/DTO/", "src/Request/", "src/Form/", "src/Serializer/", "src/ParamConverter/", "src/ArgumentResolver/", "src/Validator/"]
+  API Platform resources: ["config/api_platform/", "config/packages/api_platform.yaml", "src/ApiResource/", "src/State/", "src/DataProvider/", "src/DataTransformer/"]
+  persistence and queries: ["src/Repository/", "src/Entity/", "src/DBAL/", "src/Doctrine/", "config/packages/doctrine.yaml"]
+  listeners and request hooks: ["src/EventSubscriber/", "src/EventListener/", "src/Listener/"]
+  async and CLI entry points: ["src/MessageHandler/", "src/Command/", "config/packages/messenger.yaml"]
+  templates (output): ["templates/"]
+  service wiring: ["config/services.yaml", "config/packages/"]
 ---
 **Configuration placeholders.** `%env(VAR)%`, `%env(resolve:VAR)%`, `%env(int:VAR)%` and
 `%kernel.project_dir%` are resolved when the container is compiled. The literal in the YAML is a
@@ -34,6 +44,14 @@ injections live.
 **Twig.** Auto-escaping is on by default for HTML context. `{{ value }}` is escaped;
 `{{ value|raw }}`, `{% autoescape false %}` and `|json_encode` into an inline `<script>` are the
 places to look.
+
+**Escaping does not make a URL safe.** In `href="{{ value }}"`, `src="{{ value }}"`,
+`action="{{ value }}"` or `formaction` HTML escaping leaves `javascript:alert(1)` intact — a click
+runs it — and any `https://evil.example` stays an open redirect. Auto-escaping is no reason to close
+such a finding. It is safe when the URL comes from `path()`, `url()`, `ea_url()` or another router
+call, or when the value is checked to start with `/` (not `//` or `/\`) or an allowed `https://` host. A
+value from `$request->query` such as `referrer` / `returnUrl` passed straight to the template is
+the classic case.
 
 **Request input.** Untrusted sources are `$request->query`, `$request->request`,
 `$request->getContent()`, `$request->headers`, `$request->cookies`, route parameters via

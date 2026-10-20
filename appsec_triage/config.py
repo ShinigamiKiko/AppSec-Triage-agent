@@ -219,6 +219,9 @@ class PipelineConfig:
     max_evidence_chars: int = 32000
     context_retrieval_rounds: int = 2
     code_walk_first: bool = True
+    # Where things live in the project (routes, access control, ...) from the stack
+    # profiles, shown to the code walk as a starting point. Off to measure without it.
+    project_map: bool = True
     slow_finding_seconds: int = 900
     max_tool_calls: int = 20
     callsite_search_rounds: int = 3
