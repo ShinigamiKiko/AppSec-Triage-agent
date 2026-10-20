@@ -134,7 +134,10 @@ def _collected_window(evidence, pkg, path: str, line: object) -> str:
     if not resolved:
         return ""
     try:
-        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        from .context.evidence import _redact
+
+        # Through the same redaction as every other read: these lines go to the model too.
+        lines = _redact(resolved.read_text(encoding="utf-8", errors="replace")).splitlines()
     except OSError:
         return ""
     window = lines[line - 1:line + 79]

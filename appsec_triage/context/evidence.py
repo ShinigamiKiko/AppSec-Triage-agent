@@ -35,6 +35,18 @@ _EXCLUDED = frozenset({
 })
 _CODE_EXTENSIONS = _EXTENSIONS - {".yaml", ".yml", ".xml", ".json"}
 _INSTALLED = frozenset({"vendor", "node_modules"})
+
+
+def _tool_output(name: str) -> bool:
+    """This agent's own output and the CodeQL databases it builds, left in the scanned tree.
+
+    Not the project's code. Measured on a Vue + Express repository: two of 36 code-walk
+    calls came back with `appsec-out-native/scans/dependencies.json` and a CodeQL
+    database's `baseline-info.json` instead of anything the application runs.
+    """
+    return name.startswith(("appsec-out", ".codeql-db"))
+
+
 _SECRET_NAME = r"(?:[\w.-]+[_.-])?(?:passwords?|secrets?|tokens?|api_keys?|private_keys?)"
 _SECRET_HEAD = re.compile(
     rf'''(?<![\w.-])["']?{_SECRET_NAME}["']?[ \t]*(?:=>|:=|:|=)[ \t]*''', re.IGNORECASE,
@@ -217,7 +229,7 @@ class RepositoryEvidence:
                 name = part.lower()
                 if installed and name in _INSTALLED:
                     continue
-                if (name in _EXCLUDED or
+                if (name in _EXCLUDED or _tool_output(name) or
                         name.endswith((".pem", ".key", ".p12", ".pfx", ".keystore")) or
                         name.startswith((".env", "id_rsa", "id_ed25519", "credentials"))):
                     return False
@@ -317,6 +329,7 @@ class RepositoryEvidence:
                     return sorted(paths, key=self._priority)
                 dirs[:] = sorted(
                     (d for d in dirs if d.lower() not in _EXCLUDED and not d.lower().startswith(".env")
+                     and not _tool_output(d.lower())
                      and not (Path(directory) == root and d == "config")
                      and not (Path(directory) == root / "config" and d == "packages")
                      and not (Path(directory) / d).is_symlink()),
@@ -455,7 +468,12 @@ class RepositoryEvidence:
         return scanned
 
     def _add(self, pkg, path, lines, lo, hi, label="source", limit=None) -> bool:
-        header = _redact("File: " + json.dumps(str(path), ensure_ascii=True))
+        # The path the model cites and reads again: relative to the project root, as the
+        # project map and read_file use it, and not redacted. Absolute, it carried the host's
+        # layout (`C:\Users\<name>\...`, `/src/...`) and came back wrong (`src/templates/...`
+        # for `/src/templates/...`); redacted, `templates/admin/crud/clickhouse/detail.html.twig`
+        # read as a 48-char high-entropy secret and the model could not tell which file it saw.
+        header = "File: " + json.dumps(self._relative(path), ensure_ascii=True)
         covered = set()
         for block in pkg.evidence_blocks:
             if block.split("\n", 1)[0] == header:
