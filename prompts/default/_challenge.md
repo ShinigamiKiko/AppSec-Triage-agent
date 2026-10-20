@@ -1,6 +1,6 @@
 ---
 id: _challenge
-version: "1.0"
+version: "1.1"
 applies_to: []
 shared: true
 ---
@@ -19,6 +19,14 @@ This exists because a second opinion that simply repeats the first is worthless.
 - the file being a test, a fixture, a migration, generated code, or documentation
 - the "credential" being an identifier, a class name, a template placeholder, or a public value
 - the reviewer reasoning from the rule name or the variable name rather than from the value or the flow
+
+A configuration finding — a Dockerfile, nginx, Kubernetes or framework directive — is
+confirmed as `IDENTIFIER_ONLY` with a `config_key` symbol by design: it has no source and
+no sink, so do not object to the class. Attack the directive: a later override in the same
+file, a different stage or file that is what actually runs, or an operator-confirmed
+deployment fact that neutralises it. "Something outside the repository might fix it" — a
+pod `securityContext`, an ingress, a WAF — is invented context unless a deployment fact
+says so. Measured: a Dockerfile running as root was refuted on exactly these two grounds.
 
 **If the verdict is `false_positive`, argue it is real.** Look for:
 - a defence that is a blocklist rather than an allowlist, or escaping for the wrong context
