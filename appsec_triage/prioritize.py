@@ -16,7 +16,7 @@ _EXPLOITABILITY_WEIGHT = {"trivial": 8, "moderate": 3, "difficult": 0}
 _IMPACT_WEIGHT = {"critical": 8, "high": 5, "medium": 2, "low": 0}
 
 _ALWAYS_REVIEW_SIGNALS = {"known_secret_shape", "tls_validation_disabled"}
-_ALWAYS_REVIEW_OVERRIDES = ("contradictory_rationale", "sanity_conflict")
+_ALWAYS_REVIEW_OVERRIDES = ("contradictory_rationale", "contradictory_trace", "sanity_conflict")
 
 _NORMALIZE = [
     (re.compile(r"""(["'])(?:\\.|(?!\1).)*\1"""), "S"),

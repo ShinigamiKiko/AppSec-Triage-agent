@@ -501,6 +501,14 @@ def validate(
         )
         result = _to_unknown(result)
 
+    if result.verdict is VerdictLabel.confirmed and finding.dependency is None and (
+            clean := _clean_end(result.dataflow)):
+        overrides.append(
+            f"contradictory_trace: verdict is `confirmed` but the model's own path marks the {clean} "
+            "as not attacker-controlled"
+        )
+        result = _to_unknown(result)
+
     strong = {s.name for s in pkg.heuristic_signals if s.direction == "toward_confirmed" and s.weight >= 0.7}
     if pkg.lsp_resolved_clean:
         cleared = strong & DATAFLOW_CLEARABLE_SIGNALS
@@ -625,6 +633,21 @@ def validate(
     return ValidationOutcome(result, overrides)
 
 
+def _clean_end(dataflow) -> str:
+    """"source" or "sink" when the path says the value there is not attacker-controlled.
+
+    A confirmed code finding rests on input reaching the sink. A path whose every source
+    is clean, or whose sink receives a clean value, argues the finding away — whatever
+    the verdict field says. Measured: `{{ field.formattedValue }}` confirmed while its own
+    path called the source "clean" (a URL from the router).
+    """
+    for role in ("source", "sink"):
+        steps = [s for s in dataflow if getattr(s.role, "value", s.role) == role]
+        if steps and not any(s.tainted for s in steps):
+            return role
+    return ""
+
+
 def _symbol_is_grounded(name: str, pkg: EvidencePackage, haystack: str, cfg: PostValidationConfig) -> bool:
     """Is the named symbol real?"""
     if quote_is_grounded(name, haystack, cfg.quote_match_threshold):
@@ -672,6 +695,11 @@ def _question_from_override(overrides: list[str], original: Verdict) -> str:
         "contradictory_rationale": (
             "The model's written explanation argues against its own verdict. "
             "Read the reason field and the code, and decide which one is right."
+        ),
+        "contradictory_trace": (
+            "The model confirmed the finding, yet its own path says the value is not attacker-controlled "
+            "at the source or the sink. Check where the value comes from: input, or something the "
+            "application builds itself (a router URL, a constant, configuration)."
         ),
         "unexplained_closure": (
             "A high-consequence finding was closed without naming what makes it safe. "

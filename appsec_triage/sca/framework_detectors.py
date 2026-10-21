@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -367,5 +368,94 @@ def detect_framework_condition(
                 "%s raised %s: %s",
                 detector.__class__.__name__, type(exc).__name__, exc
             )
-    
+
     return None
+
+
+# --- Twig sandbox ---------------------------------------------------------------------
+#
+# Twig's sandbox is off unless something turns it on: a SandboxExtension registered with
+# a SecurityPolicy (in PHP, or as a service), a `{% sandbox %}` tag, or an include with
+# `sandboxed`. A bundle can register it too, so the installed packages are read as well;
+# without them nothing is decided. Compiled templates under var/ name SandboxExtension in
+# every Twig 3 build and are left out, as are tests and Twig's own source.
+#
+# Code and configuration count only Twig's own names: PHP cannot use the class without
+# its namespace (a `use` line or the full name), and a bare `SecurityPolicy` is also a
+# key in AWS SDK data and the like. Templates count the tag and the include option.
+
+_SANDBOX_TOKEN = re.compile(r"sandbox|securitypolicy|sourcepolicy", re.IGNORECASE)
+_SANDBOX_ON = re.compile(
+    rb"Twig\\{1,2}(?:Extension\\{1,2}SandboxExtension|Sandbox\\{1,2}\w*Polic)"
+    rb"|Twig_(?:Extension_Sandbox|Sandbox_)|twig\.extension\.sandbox")
+_SANDBOX_ON_TEMPLATE = re.compile(rb"\{%-?\s*sandbox\b|\bsandboxed\b")
+_TEMPLATE_SUFFIXES = (".twig", ".html")
+_SANDBOX_SUFFIXES = (".php", ".yaml", ".yml", ".xml", ".neon", *_TEMPLATE_SUFFIXES)
+_SANDBOX_SKIP = {".git", "node_modules", "var", "tests", "test", "Tests", "Test", "fixtures", "Fixtures"}
+_SANDBOX_MAX_BYTES = 600_000
+_sandbox_seen: dict[str, tuple[str, int]] = {}
+
+
+def _sandbox_switch(root: Path) -> tuple[str, int]:
+    """(`path:line: code` of the first place that turns the sandbox on, or "", files read)."""
+    key = str(root)
+    if key in _sandbox_seen:
+        return _sandbox_seen[key]
+    twig_source = root / "vendor" / "twig" / "twig"
+    read = 0
+    for parent, dirnames, filenames in os.walk(root):
+        here = Path(parent)
+        dirnames[:] = [d for d in dirnames if d not in _SANDBOX_SKIP and not d.startswith("appsec-out")
+                       and here / d != twig_source]
+        for name in filenames:
+            if not name.endswith(_SANDBOX_SUFFIXES):
+                continue
+            path = here / name
+            try:
+                if path.stat().st_size > _SANDBOX_MAX_BYTES:
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                continue
+            read += 1
+            match = _SANDBOX_ON.search(data)
+            if match is None and name.endswith(_TEMPLATE_SUFFIXES):
+                match = _SANDBOX_ON_TEMPLATE.search(data)
+            if match is None:
+                continue
+            start = data.rfind(b"\n", 0, match.start()) + 1
+            end = data.find(b"\n", match.end())
+            code = data[start:end if end >= 0 else len(data)].decode("utf-8", "replace").strip()
+            line = data.count(b"\n", 0, match.start()) + 1
+            hit = f"{path.relative_to(root).as_posix()}:{line}: {code[:160]}"
+            _sandbox_seen[key] = (hit, read)
+            return _sandbox_seen[key]
+    _sandbox_seen[key] = ("", read)
+    return _sandbox_seen[key]
+
+
+def twig_sandbox(roots: list[Path], parts: list[list[str]]) -> DetectorResult | None:
+    """"absent" when a required part of the condition is the Twig sandbox and it is off.
+
+    Only a part made entirely of sandbox markers is decided: "the sandbox is on" as one of
+    several alternatives does not make the whole condition depend on it.
+    """
+    if not roots or not any(part and all(_SANDBOX_TOKEN.search(t) for t in part) for part in parts):
+        return None
+    read = 0
+    for root in roots:
+        root = Path(root)
+        if not (root / "vendor" / "twig" / "twig").is_dir():
+            return None  # the bundles that could register it are not installed: not decidable
+        hit, files = _sandbox_switch(root)
+        if hit:
+            log.info("twig sandbox switched on at %s", hit)
+            return None
+        read += files
+    return DetectorResult(
+        "absent",
+        evidence=(f"sandbox Twig нигде не включается: нет SandboxExtension, SecurityPolicy, "
+                  f"{{% sandbox %}} и sandboxed ни в коде, ни в конфигурации, ни в шаблонах, "
+                  f"ни в установленных пакетах ({read} файлов)"),
+        reason="уязвимость требует включённого sandbox Twig, а он выключен",
+    )

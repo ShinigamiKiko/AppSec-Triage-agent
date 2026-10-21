@@ -80,6 +80,43 @@ RUN case "$(uname -m)" in aarch64|arm64) arch=aarch64 ;; *) arch=x86 ;; esac \
          curl -fsSL "https://semgrep.dev/c/p/${pack}" -o "/opt/opengrep-rules/${pack}.yaml" || exit 1; \
        done
 
+# PHP rules the two packs lack, from opengrep-rules at a fixed commit: Symfony (non-literal
+# redirect, CSRF off, permissive CORS), Laravel, Doctrine DBAL and the PHP sinks the packs
+# leave out. Only rules not already in the packs, so a line is not reported twice; the
+# WordPress rules and the audits of harmless calls (unlink, ftp_*, base_convert) are left out.
+ARG OPENGREP_RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa
+RUN tmp=$(mktemp -d) \
+    && curl -fsSL "https://codeload.github.com/opengrep/opengrep-rules/tar.gz/${OPENGREP_RULES_COMMIT}" \
+        | tar -xz -C "$tmp" --strip-components=1 \
+    && for rule in \
+         symfony/security/audit/symfony-non-literal-redirect \
+         symfony/security/audit/symfony-csrf-protection-disabled \
+         symfony/security/audit/symfony-permissive-cors \
+         laravel/security/laravel-active-debug-code \
+         laravel/security/laravel-blade-form-missing-csrf \
+         laravel/security/laravel-cookie-http-only \
+         laravel/security/laravel-cookie-long-timeout \
+         laravel/security/laravel-cookie-null-domain \
+         laravel/security/laravel-cookie-same-site \
+         laravel/security/laravel-cookie-secure-set \
+         laravel/security/laravel-dangerous-model-construction \
+         doctrine/security/audit/doctrine-dbal-dangerous-query \
+         lang/security/file-inclusion \
+         lang/security/php-ssrf \
+         lang/security/unserialize-use \
+         lang/security/eval-use \
+         lang/security/exec-use \
+         lang/security/backticks-use \
+         lang/security/mb-ereg-replace-eval \
+         lang/security/php-permissive-cors \
+         lang/security/ldap-bind-without-password \
+         lang/security/weak-crypto \
+         lang/security/mcrypt-use \
+         lang/security/audit/openssl-decrypt-validate; do \
+         install -D -m 644 "$tmp/php/${rule}.yaml" "/opt/opengrep-rules/php/${rule}.yaml" || exit 1; \
+       done \
+    && rm -rf "$tmp"
+
 RUN pip install \
         "python-lsp-server==${PYLSP_VERSION}" \
     && pylsp --help >/dev/null

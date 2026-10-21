@@ -212,6 +212,7 @@ def check(
     *,
     decidable: bool = True,
     groups=None,
+    package: str = "",
 ) -> Condition:
     """Look for `tokens` in the project, or say why the answer is not here.
 
@@ -237,9 +238,13 @@ def check(
         return Condition(ConditionState.EXTERNAL, statement, tokens, where,
                          reason="не задан ни один корень исходников — искать негде")
 
-    from .framework_detectors import detect_framework_condition
+    from .framework_detectors import detect_framework_condition, twig_sandbox
 
-    detected = detect_framework_condition([Path(root) for root in roots], tokens)
+    detected = None
+    if (package or "").strip().lower() == "twig/twig":
+        detected = twig_sandbox([Path(root) for root in roots], parts)
+    if detected is None:
+        detected = detect_framework_condition([Path(root) for root in roots], tokens)
     if detected is not None:
         return Condition(
             ConditionState(detected.state), statement, tokens, where,
