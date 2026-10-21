@@ -22,7 +22,13 @@ class PlatformRule:
 
 @dataclass(slots=True)
 class OutOfScopeComponent:
-    """A component no service on this platform runs, and the fact that says so."""
+    """A component no service on this platform runs, and the fact that says so.
+
+    The fact is either a platform-wide one (`requires:`, from `facts:`), or the scanned
+    repository itself (`present_if:` — manifests that name the component): a framework one
+    repository is written in and another is not. The second is out of scope only where
+    the repository was read and none of its manifests names the component.
+    """
 
     id: str
     requires: str
@@ -31,6 +37,23 @@ class OutOfScopeComponent:
     keywords: list[str] = field(default_factory=list)
     markers: list[str] = field(default_factory=list)
     owner: str = "platform-security"
+    present_files: list[str] = field(default_factory=list)
+    present_contains: list[str] = field(default_factory=list)
+    present_at: str | None = None
+    """Where the repository names it (`composer.lock:812 ("laravel/framework")`), "" when it
+    does not, None while no repository was read."""
+
+    @property
+    def per_repository(self) -> bool:
+        return bool(self.present_files and self.present_contains)
+
+    @property
+    def basis(self) -> str:
+        """The fact the closure rests on, as the report says it."""
+        if self.per_repository:
+            return (f"в этом репозитории нет {self.id}: ни один из {', '.join(self.present_files)} "
+                    f"не содержит {', '.join(self.present_contains)}")
+        return f"факт среды {self.requires}"
 
 
 @dataclass(slots=True)
@@ -46,10 +69,30 @@ class DeploymentContext:
         return self.enabled and bool(self.description or self.facts)
 
     def components_out_of_scope(self) -> list[OutOfScopeComponent]:
-        """Entries whose fact is set."""
+        """Entries whose fact is set: platform-wide, or this repository not naming them."""
         if not self.enabled:
             return []
-        return [c for c in self.out_of_scope if c.requires and self.facts.get(c.requires) is True]
+        return [c for c in self.out_of_scope
+                if (c.present_at == "" if c.per_repository
+                    else c.requires and self.facts.get(c.requires) is True)]
+
+    def scope_to(self, roots) -> list[str]:
+        """Read the repository for the per-repository components; one line per component."""
+        from .context.stack import find_marker
+
+        lines = []
+        for component in self.out_of_scope:
+            if not component.per_repository:
+                continue
+            component.present_at = (find_marker(roots, component.present_files, component.present_contains)
+                                    if roots else None)
+            if component.present_at is None:
+                lines.append(f"{component.id}: не проверено — корень исходников не задан")
+            elif component.present_at:
+                lines.append(f"{component.id}: есть ({component.present_at})")
+            else:
+                lines.append(f"{component.id}: нет — CVE только про него закрываются")
+        return lines
 
     def handled_by_platform(self, rule_id: str | None) -> PlatformRule | None:
         """The entry covering this rule, if its supporting fact is actually set."""
@@ -73,6 +116,11 @@ class DeploymentContext:
         stated = [name for name, value in self.facts.items() if value is True]
         if stated:
             lines += ["Confirmed about the environment:", *(f"- {name.replace('_', ' ')}" for name in stated), ""]
+        read = [c for c in self.out_of_scope if c.per_repository and c.present_at is not None]
+        if read:
+            lines += ["Read from this repository's manifests:",
+                      *(f"- {c.id}: used ({c.present_at})" if c.present_at
+                        else f"- {c.id}: not used — no {', '.join(c.present_files)} names it" for c in read), ""]
         lines += [
             "Use these deployment facts when checking advisory preconditions, exposure,",
             "and priority. They are operator-provided facts, not guesses from conventions.",
@@ -113,6 +161,9 @@ def load(path: Path | None = None) -> DeploymentContext:
             keywords=[str(k) for k in (e.get("keywords") or []) if str(k).strip()],
             markers=[str(m) for m in (e.get("markers") or []) if str(m).strip()],
             owner=str(e.get("owner") or "platform-security"),
+            present_files=[str(f) for f in ((e.get("present_if") or {}).get("files") or []) if str(f).strip()],
+            present_contains=[str(m) for m in ((e.get("present_if") or {}).get("contains") or [])
+                              if str(m).strip()],
         )
         for e in (data.get("out_of_scope_components") or [])
         if isinstance(e, dict) and e.get("id")

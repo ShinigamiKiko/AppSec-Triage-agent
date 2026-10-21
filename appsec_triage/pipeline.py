@@ -149,6 +149,12 @@ class TriagePipeline:
         self._walk = codewalk.CodeWalk(client, cfg, self.repository_evidence, symbols)
         self.stacks = stack_detect.detect(list(source.roots)) if source else []
         self.deps_roots = list(source.roots) if source else []
+        # One deployment context for the whole run, read against this repository: a framework
+        # this repository does not use closes its CVEs, one it does use is analysed.
+        self.deployment = deployment_ctx.load(getattr(cfg, "deployment_config", None))
+        self.repository_components = self.deployment.scope_to(self.deps_roots) if self.deployment.enabled else []
+        for line in self.repository_components:
+            log.info("repository component %s", line)
         self.deps_index = deps.build_index(self.deps_roots) if self.deps_roots else None
         self.routes = route_index.build_index(self.deps_roots) if self.deps_roots else None
         if self.deps_index and self.deps_index.usable:
@@ -211,7 +217,7 @@ class TriagePipeline:
             self.dep_chain = DependencyChain(
                 client, self.deps_roots, lsp=symbols, routes=self.routes,
                 nvd_api_key=getattr(cfg, "nvd_api_key", None),
-                deployment=deployment_ctx.load(getattr(cfg, "deployment_config", None)),
+                deployment=self.deployment,
                 reachability=reachability, codeql_databases=databases,
                 codeql_binary=codeql_binary, psalm_binary=psalm_binary,
                 parallel_llm=cfg.parallel_llm,
@@ -225,7 +231,6 @@ class TriagePipeline:
             log.info("dependency symbol chain enabled (databases will be queried per CVE)")
         self._codeql_findings: list[Finding] = []
         self._walk_cache: dict[tuple[str, str, str], tuple[list[str], list[str]]] = {}
-        self.deployment = deployment_ctx.load(getattr(cfg, "deployment_config", None))
         self.stack_section = stack_detect.render(self.stacks)
         if self.deployment.usable:
             sections = (self.stack_section, self.deployment.render())

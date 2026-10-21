@@ -14,10 +14,9 @@ facts:
   no_ssh_in_workloads: true
   host_platform_owned: true
   no_gui_or_hardware_in_workloads: true
-  # Неверно: api-develop написан на Laravel 8. С `true` CVE самого Laravel закрывались
-  # как «вне платформы» до поиска в коде — даже когда laravel/framework в проекте найден.
-  no_laravel_in_projects: false
-  no_react_in_projects: true
+  # Laravel и React — не факты платформы: на одном фреймворке написан один сервис, на
+  # другом — другой. Они решаются по манифестам сканируемого репозитория (`present_if:`
+  # у компонента ниже): нет в нём Laravel — его CVE закрываются, есть — разбираются.
 
 out_of_scope_components:
   - id: ssh
@@ -44,7 +43,12 @@ out_of_scope_components:
     markers: ["/proc/", "/sys/", "CAP_SYS_ADMIN", "privileged: true", "hostPID: true", "hostNetwork: true"]
     why: "уязвимость относится к машине, node или container runtime; это зона platform-security, а не приложения в pod"
   - id: laravel
-    requires: no_laravel_in_projects
+    # Вне области только там, где ни composer.json, ни composer.lock (в корне и до двух
+    # уровней вглубь, без vendor/) не называют Laravel, Lumen или пакет illuminate/*:
+    # Illuminate, поставленный отдельно (Eloquent в Symfony-проекте), тоже считается.
+    present_if:
+      files: [composer.json, composer.lock]
+      contains: ['"laravel/framework"', '"laravel/lumen-framework"', '"illuminate/']
     describe: >-
       The Laravel framework and its Illuminate components: Laravel routing,
       Eloquent, Blade templates, the artisan console, the service container,
@@ -54,9 +58,12 @@ out_of_scope_components:
       precondition to check, not a framework this platform does not run.
     keywords: [laravel, illuminate, blade, eloquent, artisan, horizon]
     markers: ["laravel/framework", "Illuminate\\", "laravel/", "artisan", "config/app.php", "Blade::"]
-    why: "ни один сервис не написан на Laravel; уязвимость только во фреймворке Laravel к этим сервисам не относится"
+    why: "сервис написан не на Laravel; уязвимость только во фреймворке Laravel к нему не относится"
   - id: react
-    requires: no_react_in_projects
+    # Только прямые зависимости: React, пришедший транзитивно, сервис не рендерит.
+    present_if:
+      files: [package.json]
+      contains: ['"react"', '"react-dom"', '"preact"', '"next"']
     describe: >-
       The React UI library and its immediate ecosystem: React DOM, React Native,
       the JSX runtime, React server components. Counts only when React's own
@@ -64,7 +71,7 @@ out_of_scope_components:
       JavaScript library that happens to be popular with React does NOT count.
     keywords: [react, "react-dom", "react-native", jsx, preact]
     markers: ["\"react\":", "from 'react'", "from \"react\"", "react-dom", "ReactDOM", ".jsx", ".tsx"]
-    why: "ни один сервис не рендерит React; уязвимость только в React к этим сервисам не относится"
+    why: "сервис не рендерит React; уязвимость только в React к нему не относится"
   - id: gui_or_hardware
     requires: no_gui_or_hardware_in_workloads
     owner: platform-security

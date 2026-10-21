@@ -3,9 +3,10 @@ id: laravel
 version: "1.0"
 name: Laravel / Eloquent (PHP)
 detect:
-  files: ["composer.json"]
+  files: ["composer.json", "composer.lock"]
   contains:
     - '"laravel/framework"'
+    - '"laravel/lumen-framework"'
 where:
   routes and controllers: ["routes/", "app/Http/Controllers/", "app/*/Controllers/"]
   access control: ["app/Http/Kernel.php", "app/Http/Middleware/", "app/Policies/", "app/Providers/AuthServiceProvider.php", "config/auth.php", "config/jwt.php", "config/sanctum.php", "config/cors.php"]

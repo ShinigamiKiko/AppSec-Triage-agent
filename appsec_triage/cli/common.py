@@ -250,6 +250,11 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
             except GovulncheckUnavailable as exc:
                 print(f"error: граф вызовов запрошен, но недоступен — {exc}", file=sys.stderr)
                 return 2
+            if source_roots:
+                print(f"→ стек проекта: {', '.join(s.id for s in pipeline.stacks) or 'не распознан'}",
+                      file=sys.stderr)
+                for line in pipeline.repository_components:
+                    print(f"  · {line}", file=sys.stderr)
             try:
                 run = pipeline.run(findings, progress=progress, on_record=journal.append)
             except LLMAuthError as exc:

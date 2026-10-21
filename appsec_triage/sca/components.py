@@ -47,7 +47,7 @@ class Exclusion:
     markers: list[str] = field(default_factory=list)
 
     def render(self) -> str:
-        head = (f"вне платформы: {self.component.why} (факт среды {self.component.requires}); "
+        head = (f"вне платформы: {self.component.why} ({self.component.basis}); "
                 f"advisory: «{self.quote[:160]}»")
         if not self.markers:
             return head
@@ -55,10 +55,12 @@ class Exclusion:
                 f"не запускает — {', '.join(self.markers)}")
 
     def decision(self) -> CVEDecision:
+        per_repository = getattr(self.component, "per_repository", False)
         reasons = [f"advisory требует компонент «{self.component.id}»: «{self.quote[:200]}»",
-                   f"по факту среды {self.component.requires}: {self.component.why}",
+                   f"{self.component.basis}: {self.component.why}",
                    f"владелец: {self.component.owner}",
-                   "закрыто по заявленному факту платформы, до поиска в коде и до CodeQL"]
+                   ("закрыто по манифестам этого репозитория, до поиска в коде и до CodeQL" if per_repository
+                    else "закрыто по заявленному факту платформы, до поиска в коде и до CodeQL")]
         if self.why:
             reasons.insert(1, self.why)
         if self.markers:

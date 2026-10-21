@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,42 @@ STACKS_ROOT = REPO_ROOT / "prompts" / "stacks"
 _FRONT_MATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 _MAX_MARKER_BYTES = 400_000
+# A project inside the repository counts down to this depth (`services/api/composer.json`);
+# installed packages, tests and samples carry manifests that are not the project's own.
+_MAX_MARKER_DEPTH = 3
+_SKIP_MARKER_DIRS = {".git", "vendor", "node_modules", "var", "dist", "build", "tests", "test",
+                     "fixtures", "samples", "examples", "docs"}
+
+
+def find_marker(roots, files, markers) -> str:
+    """`path:line (marker)` of the first manifest among `files` that contains a marker, or ""."""
+    names = {str(f) for f in files if str(f)}
+    wanted = [str(m) for m in markers if str(m)]
+    if not names or not wanted:
+        return ""
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for parent, dirnames, filenames in os.walk(root):
+            here = Path(parent)
+            depth = len(here.relative_to(root).parts)
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_MARKER_DIRS and not d.startswith(".")
+                                 and not d.startswith("appsec-out")) if depth < _MAX_MARKER_DEPTH - 1 else []
+            for name in sorted(names & set(filenames)):
+                path = here / name
+                try:
+                    if path.stat().st_size > _MAX_MARKER_BYTES:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for marker in wanted:
+                    index = text.find(marker)
+                    if index >= 0:
+                        line = text.count("\n", 0, index) + 1
+                        return f"{path.relative_to(root).as_posix()}:{line} ({marker})"
+    return ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -35,19 +72,7 @@ class StackProfile:
     """`where_exclude`: parts of the tree another stack owns, kept out of this map."""
 
     def matches(self, root: Path) -> bool:
-        for filename in self.marker_files:
-            for candidate in (root / filename, *root.glob(f"*/{filename}")):
-                if not candidate.is_file():
-                    continue
-                try:
-                    if candidate.stat().st_size > _MAX_MARKER_BYTES:
-                        continue
-                    text = candidate.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                if any(marker in text for marker in self.markers):
-                    return True
-        return False
+        return bool(find_marker([root], self.marker_files, self.markers))
 
 
 def _where(raw) -> tuple[tuple[str, tuple[str, ...]], ...]:
