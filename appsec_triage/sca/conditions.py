@@ -213,6 +213,7 @@ def check(
     decidable: bool = True,
     groups=None,
     package: str = "",
+    deployment=None,
 ) -> Condition:
     """Look for `tokens` in the project, or say why the answer is not here.
 
@@ -227,6 +228,16 @@ def check(
         tokens = [t for part in parts for t in part][:12]
     if not statement:
         return Condition(ConditionState.NONE)
+    if roots and deployment is not None:
+        # A php.ini setting is "outside the code" to the model, yet the production image is
+        # read from the repository's Dockerfile and the operator's facts about base images.
+        from .framework_detectors import php_argc_argv
+
+        detected = php_argc_argv([Path(root) for root in roots], statement, tokens,
+                                 getattr(deployment, "php_images", None))
+        if detected is not None:
+            return Condition(ConditionState(detected.state), statement, tokens, where,
+                             hits=[detected.evidence], reason=detected.reason, source="detector")
     if not decidable or not tokens:
         return Condition(
             ConditionState.EXTERNAL, statement, tokens, where,

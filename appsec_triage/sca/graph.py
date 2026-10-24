@@ -298,20 +298,45 @@ def _package_lock_nodes(data: dict) -> dict[str, Node]:
     return nodes
 
 
+def _composer_lock_nodes(data: dict) -> dict[str, Node]:
+    """composer.lock: `packages` ship, `packages-dev` do not; each entry lists what it requires.
+
+    Composer resolves the two sections itself, so a package in `packages-dev` is
+    development-only however it got there — directly or through another dev package.
+    """
+    nodes: dict[str, Node] = {}
+    for section, dev in (("packages", False), ("packages-dev", True)):
+        for meta in data.get(section) or []:
+            if not isinstance(meta, dict) or not meta.get("name"):
+                continue
+            name = str(meta["name"]).lower()
+            node = nodes.setdefault(name, Node(name, str(meta.get("version", "")), dev, {}, "composer"))
+            for dep in (meta.get("require") or {}):
+                if "/" in dep:  # php, ext-* and lib-* are platform requirements, not packages
+                    node.requires.setdefault(dep.lower(), "")
+    return nodes
+
+
 def lockfile_nodes(root: Path) -> dict[str, Node]:
-    """Resolved packages and edges straight from the project's lock file, when there is one."""
+    """Resolved packages and edges straight from the project's lock files, when there are any."""
     root = Path(root)
+    nodes: dict[str, Node] = {}
     lock = root / "yarn.lock"
     if lock.is_file():
         text = lock.read_text(encoding="utf-8", errors="replace")
-        return _berry_nodes(text) if "__metadata:" in text else _yarn_v1_nodes(text)
-    lock = root / "package-lock.json"
+        nodes.update(_berry_nodes(text) if "__metadata:" in text else _yarn_v1_nodes(text))
+    elif (lock := root / "package-lock.json").is_file():
+        try:
+            nodes.update(_package_lock_nodes(json.loads(lock.read_text(encoding="utf-8", errors="replace"))))
+        except ValueError:
+            pass
+    lock = root / "composer.lock"
     if lock.is_file():
         try:
-            return _package_lock_nodes(json.loads(lock.read_text(encoding="utf-8", errors="replace")))
+            nodes.update(_composer_lock_nodes(json.loads(lock.read_text(encoding="utf-8", errors="replace"))))
         except ValueError:
-            return {}
-    return {}
+            pass
+    return nodes
 
 
 class DependencyGraph:
@@ -344,8 +369,10 @@ class DependencyGraph:
         root = Path(root)
         if document is not None:
             graph = cls._from_sbom(document)
-            graph.trust_manifests(root)
+            # Lock files first: a package the SBOM left out but the lock file has can
+            # then still be one of the roots the manifests name.
             graph.adopt_lockfile_edges(root)
+            graph.trust_manifests(root)
             log.info("dependency graph from the run's SBOM: %d components", len(graph))
             return graph
         if not sbom_mod.available():
@@ -369,8 +396,8 @@ class DependencyGraph:
             graph.problem = f"cdxgen отработал, но компонентов в SBOM нет ({root})"
             log.warning("%s", graph.problem)
             return graph
-        graph.trust_manifests(root)
         graph.adopt_lockfile_edges(root)
+        graph.trust_manifests(root)
         log.info("dependency graph from cdxgen: %d components, %d direct",
                  len(graph), len(graph._roots) + len(graph._dev_roots))
         return graph
@@ -409,30 +436,42 @@ class DependencyGraph:
             return None
         prod, dev = declared
         graph = cls(nodes, {p for p in prod if p in nodes}, {d for d in dev - prod if d in nodes})
+        graph._lock_dev = {name: node.dev for name, node in nodes.items() if node.ecosystem == "composer"}
         log.info("dependency graph from the lock file: %d packages", len(graph))
         return graph
 
     def adopt_lockfile_edges(self, root: Path) -> None:
-        """Take the edges from the lock file when the SBOM brought none.
+        """Take the edges from the lock files for every package the SBOM gave none.
 
         Without an installed tree cdxgen can hang every package off the root;
-        then nothing is transitive and nothing can be told apart as dev-only.
+        then nothing is transitive and nothing can be told apart as dev-only. The
+        SBOM can also carry one ecosystem's edges and not another's (npm edges, no
+        composer ones): each package is filled on its own, not all or nothing.
         """
-        if any(node.requires for node in self._nodes.values()):
-            return
         nodes = lockfile_nodes(root)
         if not nodes:
             return
+        # Which composer.lock section each package sits in, kept whatever the edges say:
+        # composer itself puts in `packages-dev` only what no production package needs.
+        self._lock_dev = {name: node.dev for name, node in nodes.items() if node.ecosystem == "composer"}
+        self._scope_cache = None
+        adopted = 0
         for name, node in nodes.items():
-            if name in self._nodes:
-                self._nodes[name].requires = dict(node.requires)
-            else:
+            mine = self._nodes.get(name)
+            if mine is None:
                 self._nodes[name] = node
+                adopted += 1
+            elif not mine.requires and node.requires:
+                mine.requires = dict(node.requires)
+                adopted += 1
+        if not adopted:
+            return
         self._parents = {}
         for node in self._nodes.values():
             for requirement in node.requires:
                 self._parents.setdefault(requirement, set()).add(node.name)
-        log.info("рёбра графа зависимостей взяты из lock-файла (%d пакетов)", len(nodes))
+        self._scope_cache = None
+        log.info("рёбра графа зависимостей взяты из lock-файла (%d пакетов)", adopted)
 
     def _reach(self, starts: set[str]) -> set[str]:
         seen = {s for s in starts if s in self._nodes}
@@ -446,19 +485,28 @@ class DependencyGraph:
 
     def scope(self, package: str) -> str:
         """`runtime` when some production dependency pulls the package in, `dev` when only
-        development dependencies do, `unknown` when the graph cannot tell."""
+        development dependencies do, `unknown` when the graph cannot tell.
+
+        A composer package the edges cannot place takes its composer.lock section. The
+        edges break where a package is gone from the tree — the installer drops what only
+        a private host serves, and with `rdw-soft/test-bundle` gone `guzzlehttp/guzzle`
+        hangs off nothing — while the section composer resolved stays where it was.
+        """
+        key = package.lower()
+        locked = getattr(self, "_lock_dev", {}).get(key)
         if not (self._roots or self._dev_roots):
-            return "unknown"
+            return "unknown" if locked is None else ("dev" if locked else "runtime")
         cache = getattr(self, "_scope_cache", None)
         if cache is None:
             cache = (self._reach(self._roots), self._reach(self._dev_roots))
             self._scope_cache = cache
         prod, dev = cache
-        key = package.lower()
         if key in prod:
             return "runtime"
         if key in dev:
             return "dev"
+        if locked is not None:
+            return "dev" if locked else "runtime"
         return "unknown"
 
     def roots_of(self, package: str) -> set[str]:

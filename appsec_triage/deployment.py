@@ -57,12 +57,24 @@ class OutOfScopeComponent:
 
 
 @dataclass(slots=True)
+class PhpImageFact:
+    """A PHP base image and a php.ini setting of its FPM, as the operator checked it."""
+
+    image: str
+    """Image reference prefix: `harbor.example/php-fpm/ubuntu/` matches every tag under it."""
+    register_argc_argv: str
+    checked: str = ""
+    """How and when it was checked — shown with every closure that rests on it."""
+
+
+@dataclass(slots=True)
 class DeploymentContext:
     enabled: bool = False
     description: str = ""
     facts: dict[str, bool] = field(default_factory=dict)
     platform_handles: list[PlatformRule] = field(default_factory=list)
     out_of_scope: list[OutOfScopeComponent] = field(default_factory=list)
+    php_images: list[PhpImageFact] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -168,10 +180,26 @@ def load(path: Path | None = None) -> DeploymentContext:
         for e in (data.get("out_of_scope_components") or [])
         if isinstance(e, dict) and e.get("id")
     ]
+    def on_off(value) -> str:
+        # YAML reads a bare Off as false and On as true; php.ini also writes 0/1.
+        text = str(value).strip().lower()
+        if value is True or text in ("on", "1", "true", "yes"):
+            return "On"
+        if value is False or text in ("off", "0", "false", "no"):
+            return "Off"
+        return ""  # anything else is not a stated fact
+
+    php_images = [
+        PhpImageFact(image=str(e["image"]).strip(), register_argc_argv=on_off(e["register_argc_argv"]),
+                     checked=str(e.get("checked") or "").strip())
+        for e in (data.get("php_ini_by_image") or [])
+        if isinstance(e, dict) and str(e.get("image") or "").strip() and on_off(e.get("register_argc_argv")) != ""
+    ]
     return DeploymentContext(
         enabled=bool(data.get("enabled", False)),
         description=str(data.get("description") or ""),
         facts=facts,
         platform_handles=handles,
         out_of_scope=out_of_scope,
+        php_images=php_images,
     )

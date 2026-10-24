@@ -97,6 +97,10 @@ def score(record: TriageRecord, finding: Finding | None = None) -> tuple[int, li
             total -= 12
             reasons.append("non-production path (-12)")
 
+    if (record.exposure or "").startswith("authenticated:"):
+        total -= 8
+        reasons.append("reachable only after login (-8): " + record.exposure.split(":", 1)[1].strip()[:100])
+
     for sig_name in _ALWAYS_REVIEW_SIGNALS:
         if any(sig_name in o for o in record.overrides):
             total += 15

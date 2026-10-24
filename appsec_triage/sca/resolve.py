@@ -265,6 +265,61 @@ def _declaration_state(name: str, files: dict[str, str]) -> bool | None:
     return False
 
 
+_PHP_ECOSYSTEMS = {"composer", "packagist", "php"}
+_PHP_CLASS = re.compile(r"^\\?[A-Za-z_][\w]*(?:\\[A-Za-z_][\w]*)*$")
+
+
+def _class_declared(klass: str, files: dict[str, str]) -> bool:
+    short = re.escape(klass.rsplit("\\", 1)[-1])
+    pattern = re.compile(rf"\b(?:class|trait|interface|enum)\s+{short}\b")
+    return any(pattern.search(text) for path, text in files.items() if path.endswith(".php"))
+
+
+def _keep_what_the_package_declares(symbol: "VulnerableSymbol", installed: dict[str, str], package: str) -> None:
+    """Every path to a symbol ends here: a PHP class or function the vulnerable package does
+    not declare is not the flaw, whatever named it.
+
+    Measured: league/commonmark's flaw resolved to `Illuminate\\Console\\Parser::parse` (a
+    Laravel class), phpseclib's to `guardrail::isPrime` and `timing/padding-oracle::_unpad`
+    (words from the advisory). The bridge then searched the parents for names that exist
+    nowhere and could neither close nor confirm. A name in another form (`_unpad` of
+    phpseclib 2 for `unpad` of phpseclib 3) is taken in the form installed.
+    """
+    dropped: list[str] = []
+    foreign = False
+    if symbol.klass and (not _PHP_CLASS.match(symbol.klass) or not _class_declared(symbol.klass, installed)):
+        # A namespaced class the package does not declare is another package's class, and the
+        # method named with it is that class's method: `parse` of Illuminate\Console\Parser is
+        # not one of commonmark's many parse() functions. A bare word (`guardrail`) only
+        # mislabels the function, which is then judged on its own.
+        foreign = "\\" in symbol.klass.strip("\\") and bool(_PHP_CLASS.match(symbol.klass))
+        dropped.append(f"класс {symbol.klass}")
+        symbol.klass = ""
+    if symbol.function and foreign:
+        dropped.append(f"его метод {symbol.function}")
+        symbol.function = ""
+    if symbol.function and _declaration_state(symbol.function, installed) is False:
+        variant = symbol.function.lstrip("_")
+        if variant and variant != symbol.function and _declaration_state(variant, installed) is True:
+            symbol.note = (f"{symbol.function} в установленном {package} называется {variant}; "
+                           + (symbol.note or ""))[:400]
+            symbol.function = variant
+        else:
+            dropped.append(f"функция {symbol.function}")
+            symbol.function = ""
+    if symbol.candidates:
+        symbol.candidates = tuple((name, klass) for name, klass in symbol.candidates
+                                  if _declaration_state(name, installed) is not False
+                                  and (not klass or _class_declared(klass, installed)))
+    if dropped:
+        symbol.note = (f"{', '.join(dropped)} не объявлен(а) в установленном {package} — "
+                       "это не уязвимый код пакета, поиск по нему не ведётся. "
+                       + (symbol.note or ""))[:400]
+        if not symbol.function and symbol.candidates:
+            symbol.function, symbol.klass = symbol.candidates[0]
+            symbol.note = (f"вместо неё — {symbol.function}, объявлена в {package}. " + symbol.note)[:400]
+
+
 _MAX_LISTED = 40
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][\w$]*$")
 
@@ -672,6 +727,14 @@ class SymbolResolver:
         return symbol, getattr(_TROUBLE, "count", 0) == 0
 
     def resolve(self, advisory: Advisory, version: str = "") -> VulnerableSymbol:
+        symbol = self._resolve(advisory, version)
+        if (advisory.ecosystem or "").lower() in _PHP_ECOSYSTEMS and (symbol.function or symbol.klass):
+            installed = self._source_for(advisory.ecosystem, advisory.package, version)
+            if installed:
+                _keep_what_the_package_declares(symbol, installed, advisory.package)
+        return symbol
+
+    def _resolve(self, advisory: Advisory, version: str = "") -> VulnerableSymbol:
         base = VulnerableSymbol(
             advisory_id=advisory.advisory_id, package=advisory.package,
             aliases=tuple(advisory.aliases),

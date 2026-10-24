@@ -9,6 +9,7 @@ from pathlib import Path
 from .. import review
 from ..models import TriageRecord, VerdictLabel
 from ..pipeline import TriageRun
+from . import upgrades as upgrades_mod
 
 _TABLE_CSS = """
 table.findings{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:13px;
@@ -497,18 +498,27 @@ def _priority(r: TriageRecord) -> tuple[int, str, list[str]]:
     transitive = bool(r.sca and r.sca.placement.startswith("транзитивная"))
     if r.sca and r.sca.placement:
         signals.append("транзитивная зависимость" if transitive else r.sca.placement[:60])
+    # Behind a login the attacker has to be a user first: one step down the queue, no lower
+    # than P3 — it is still a finding, only not the first one to fix.
+    behind_login = (r.exposure or "").startswith("authenticated:")
+    if behind_login:
+        signals.append("доступно только после входа: " + r.exposure.split(":", 1)[1].strip()[:140])
+
+    def ranked(rank: int) -> tuple[int, str, list[str]]:
+        rank = min(rank + 1, 3) if behind_login else rank
+        return rank, f"P{rank}", signals
 
     if answer == "confirmed":
         if severe and reached:
-            return 1, "P1", signals
+            return ranked(1)
         if severe or reached:
-            return 2, "P2", signals
-        return 3, "P3", signals
+            return ranked(2)
+        return ranked(3)
 
     signals.append("вердикт не вынесен — нужен человек")
     if severe and not transitive:
-        return 2, "P2", signals
-    return 3, "P3", signals
+        return ranked(2)
+    return ranked(3)
 
 
 def _priority_cell(r: TriageRecord) -> str:
@@ -920,6 +930,7 @@ def render(run: TriageRun, *, title: str = "SAST LLM Triage", russian: bool = Fa
 {coverage_html}
 {_image_hygiene_html(run)}
 <div class="cards">{cards_html}</div>
+{upgrades_mod.render_html(upgrades_mod.plan(run.records))}
 <h2>По CWE</h2>
 <table><thead><tr><th>CWE</th><th>Подтверждено</th><th>Не решено</th><th>Закрыто</th><th>Всего</th></tr></thead>
 <tbody>{rows}</tbody></table>

@@ -259,6 +259,8 @@ class SCASummary(BaseModel):
     installed_version: str = ""
     placement: str = ""
     upgrade: str = ""
+    fixed_in: str = ""
+    """The lowest published fix above the installed version, "" when none is known."""
     symbol: str = ""
     what_changed: str = ""
     flaw: str = ""
@@ -324,3 +326,6 @@ class TriageRecord(BaseModel):
     sca: SCASummary | None = None
     code_questions: list[str] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
+    exposure: str = ""
+    """Who can reach the code: "" (not read), or "authenticated: …" when the application's
+    access control puts the file behind a login. It orders the queue; it closes nothing."""

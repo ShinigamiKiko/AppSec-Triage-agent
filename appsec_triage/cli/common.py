@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -282,6 +283,12 @@ def run_triage(args: argparse.Namespace, findings_path: Path, out: Path, source_
     title = f"AppSec-триаж — {provider_cfg.name}"
     report = html.write(run, out / f"report-{stem}.html", title=title)
     html.write(run, out / f"report-{stem}-ru.html", title=title, russian=True)
+    from ..report import upgrades as upgrades_mod
+    steps = upgrades_mod.plan(run.records)
+    if steps:
+        (out / f"upgrade-plan-{stem}.json").write_text(
+            json.dumps([s.as_dict() for s in steps], ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"→ {upgrades_mod.summary(steps)} -> {out / f'upgrade-plan-{stem}.json'}", file=sys.stderr)
     from ..models import VerdictLabel
     counts = run.counts()
     proven = sum(1 for r in run.records if r.verdict.verdict is VerdictLabel.confirmed and (r.sca is None or r.sca.outcome in _PROVEN_OUTCOMES))

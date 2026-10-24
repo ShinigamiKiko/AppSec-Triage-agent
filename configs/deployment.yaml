@@ -18,6 +18,27 @@ facts:
   # другом — другой. Они решаются по манифестам сканируемого репозитория (`present_if:`
   # у компонента ниже): нет в нём Laravel — его CVE закрываются, есть — разбираются.
 
+# register_argc_argv в php.ini PHP-FPM базовых образов. С On строка запроса веб-запроса
+# попадает в $_SERVER['argv'] и через --env меняет APP_ENV (symfony/runtime GHSA-fqc7,
+# laravel/framework GHSA-gv7v). Агент берёт базовый образ последней стадии продового
+# Dockerfile; если Dockerfile сам меняет register_argc_argv или копирует php.ini с ним —
+# решает это, а не список. Образа нет в списке — CVE уходит человеку, как раньше.
+#
+# Значение — только проверенное, не по умолчанию: в официальных образах php:*-fpm
+# php.ini нет вовсе, и тогда register_argc_argv = On (так задано в самом PHP).
+# Проверка (CLI всегда On — смотреть нужно конфиг FPM):
+#   docker run --rm --entrypoint sh <образ> -c 'grep -H "^register_argc_argv" /etc/php/*/fpm/php.ini /usr/local/etc/php/php.ini 2>/dev/null; ls /usr/local/etc/php 2>/dev/null'
+# Базовые образы в проектах из Downloads/Rabota (на 2026-10-24):
+#   harbor.rabota.space/sre/iac/docker-images/php-fpm/ubuntu-refactor/
+#   harbor.rabota.space/sre/iac/docker-images/php-fpm/ubuntu/
+#   harbor.rabota.space/sbs/iac/docker-images/php-fpm:8.0.10
+#   harbor.rabota.space/sberwork/iac/service-images/php/7-4
+#   harbor.rabota.space/sberwork/iac/service-images/symfony/7-4-8
+php_ini_by_image: []
+#  - image: harbor.rabota.space/sre/iac/docker-images/php-fpm/ubuntu/
+#    register_argc_argv: "Off"
+#    checked: "/etc/php/8.1/fpm/php.ini, 2026-10-24, <кто>"
+
 out_of_scope_components:
   - id: ssh
     requires: no_ssh_in_workloads

@@ -155,6 +155,9 @@ class TriagePipeline:
         self.repository_components = self.deployment.scope_to(self.deps_roots) if self.deployment.enabled else []
         for line in self.repository_components:
             log.info("repository component %s", line)
+        from .context import exposure as exposure_mod
+
+        self.exposure = exposure_mod.read(self.deps_roots) if self.deps_roots else None
         self.deps_index = deps.build_index(self.deps_roots) if self.deps_roots else None
         self.routes = route_index.build_index(self.deps_roots) if self.deps_roots else None
         if self.deps_index and self.deps_index.usable:
@@ -247,6 +250,11 @@ class TriagePipeline:
             record = self._triage_one(finding, timings)
         timings["total"] = round(time.monotonic() - started, 1)
         record.timings = {k: round(v, 1) for k, v in timings.items()}
+        if self.exposure is not None and finding.dependency is None and not finding.misconfiguration:
+            try:
+                record.exposure = self.exposure.of(finding.code_context.file_path or "")
+            except Exception:  # noqa: BLE001 - ordering help, never a reason to lose the verdict
+                log.debug("exposure of %s not read", finding.code_context.file_path, exc_info=True)
         log.info("finding %s stages: %s", finding.finding_id,
                  ", ".join(f"{k} {v:.0f}s" for k, v in record.timings.items()))
         return record
@@ -359,6 +367,7 @@ class TriagePipeline:
             else:
                 timings["chain"] = time.monotonic() - stage
                 sca_summary = chain.summary(finding.dependency)
+                sca_summary.fixed_in = self._fix_version(finding, chain) or ""
                 base["sca"] = sca_summary
                 finding = _with_advisory_severity(finding, chain)
                 base["severity"] = finding.severity
@@ -629,15 +638,22 @@ class TriagePipeline:
         )
 
 
+    @staticmethod
+    def _fix_version(finding: Finding, chain) -> str | None:
+        """The lowest published fix above the installed version: the scanner's, else the advisory's."""
+        dependency = finding.dependency
+        target = dependency.upgrade_target
+        advisory = chain.advisory
+        if not target and advisory is not None and getattr(advisory, "fixed_versions", None):
+            target = dependency.model_copy(update={"fixed_versions": list(advisory.fixed_versions)}).upgrade_target
+        return target
+
     def _dependency_policy(self, finding: Finding, chain):
         from .sca import policy as policy_mod
         from .sca.verdict import CVEVerdict
 
-        dependency = finding.dependency
         advisory = chain.advisory
-        target = dependency.upgrade_target
-        if not target and advisory is not None and getattr(advisory, "fixed_versions", None):
-            target = dependency.model_copy(update={"fixed_versions": list(advisory.fixed_versions)}).upgrade_target
+        target = self._fix_version(finding, chain)
         shipping = chain.shipping
         outcome = chain.decision.verdict if chain.decision is not None else None
         if outcome is not None and not isinstance(outcome, CVEVerdict):

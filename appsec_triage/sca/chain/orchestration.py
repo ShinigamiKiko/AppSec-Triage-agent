@@ -546,7 +546,8 @@ class DependencyChain(ChainSupport):
         condition = conditions_mod.check(
             self._roots, symbol.precondition, list(symbol.precondition_tokens),
             symbol.precondition_where, decidable=symbol.precondition_decidable,
-            groups=getattr(symbol, "precondition_groups", ()), package=dependency.package or "")
+            groups=getattr(symbol, "precondition_groups", ()), package=dependency.package or "",
+            deployment=self._deployment)
         if condition.needs_a_person and self._deployment is not None and getattr(self._deployment, "usable", False):
             condition = conditions_mod.check_against_deployment(condition, self._deployment, self._client)
         exploit = self._exploit.assess(

@@ -459,3 +459,139 @@ def twig_sandbox(roots: list[Path], parts: list[list[str]]) -> DetectorResult | 
                   f"ни в установленных пакетах ({read} файлов)"),
         reason="уязвимость требует включённого sandbox Twig, а он выключен",
     )
+
+
+# --- php.ini register_argc_argv -------------------------------------------------------
+#
+# With register_argc_argv On a web request's query string lands in $_SERVER['argv'], and a
+# runtime that reads `--env` from argv lets the request switch APP_ENV (symfony/runtime,
+# Laravel). What the running FPM uses is decided by the image the production Dockerfile's
+# last stage is built on, unless that Dockerfile changes it. The repository's own php.ini
+# files mostly serve docker-compose and count only when the Dockerfile copies them into
+# PHP's configuration.
+
+_ARGC = re.compile(r"register_argc_argv", re.IGNORECASE)
+_INI_SETTING = re.compile(r"^\s*register_argc_argv\s*=\s*\"?(?P<value>[^\s\";]+)", re.IGNORECASE | re.MULTILINE)
+_PHP_CONF_DEST = re.compile(r"(?:/etc/php|/usr/local/etc/php|php[\w.-]*\.ini|conf\.d)", re.IGNORECASE)
+_FROM = re.compile(r"^FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)(?:\s+AS\s+(?P<alias>\S+))?", re.IGNORECASE)
+_ARG = re.compile(r"^ARG\s+(?P<name>\w+)=(?P<value>\S+)", re.IGNORECASE)
+_COPY = re.compile(r"^(?:COPY|ADD)\s+(?P<args>.+)$", re.IGNORECASE)
+
+
+def _ini_value(text: str) -> str:
+    """"On", "Off" or "" for what a php.ini sets register_argc_argv to (last setting wins)."""
+    values = [m.group("value").lower() for m in _INI_SETTING.finditer(text)]
+    if not values:
+        return ""
+    return "On" if values[-1] in ("on", "1", "true", "yes") else "Off"
+
+
+def _dockerfile_lines(path: Path) -> list[tuple[int, str]]:
+    """(first line number, instruction) with continuations joined and comments dropped."""
+    out: list[tuple[int, str]] = []
+    pending, start = "", 0
+    for number, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        line = raw.strip()
+        if not pending and (not line or line.startswith("#")):
+            continue
+        if not pending:
+            start = number
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        out.append((start, (pending + line).strip()))
+        pending = ""
+    if pending:
+        out.append((start, pending.strip()))
+    return out
+
+
+def _final_stage_chain(lines: list[tuple[int, str]]):
+    """Stages from the last one back to the external image it is built on, and that image.
+
+    Returns ([(from_line, [instructions...]), ...] final first, base image, its line).
+    """
+    args: dict[str, str] = {}
+    stages: list[dict] = []
+    for number, instruction in lines:
+        if (arg := _ARG.match(instruction)) is not None:
+            args.setdefault(arg.group("name"), arg.group("value").strip("\"'"))
+            continue
+        if (from_ := _FROM.match(instruction)) is not None:
+            image = re.sub(r"\$\{?(\w+)\}?", lambda m: args.get(m.group(1), m.group(0)), from_.group("image"))
+            stages.append({"image": image, "alias": (from_.group("alias") or "").lower(), "line": number,
+                           "body": []})
+            continue
+        if stages:
+            stages[-1]["body"].append((number, instruction))
+    if not stages:
+        return [], "", 0
+    by_alias = {s["alias"]: s for s in stages if s["alias"]}
+    chain, stage, seen = [], stages[-1], set()
+    while True:
+        chain.append(stage)
+        seen.add(id(stage))
+        parent = by_alias.get(stage["image"].lower())
+        if parent is None or id(parent) in seen:
+            break
+        stage = parent
+    return chain, chain[-1]["image"], chain[-1]["line"]
+
+
+def php_argc_argv(roots: list[Path], statement: str, tokens: list[str], images) -> DetectorResult | None:
+    """"absent" when the condition needs register_argc_argv On and the production image has it Off."""
+    if not roots or not (_ARGC.search(statement or "") or any(_ARGC.search(t) for t in tokens or [])):
+        return None
+    for root in roots:
+        root = Path(root)
+        dockerfile = next((root / n for n in ("Dockerfile", "Containerfile") if (root / n).is_file()), None)
+        if dockerfile is None:
+            return None  # no production image in the repository: nothing to read
+        chain, base, base_line = _final_stage_chain(_dockerfile_lines(dockerfile))
+        if not chain:
+            return None
+        override = ""
+        for stage in chain:
+            for number, instruction in stage["body"]:
+                where = f"{dockerfile.name}:{number}"
+                if _ARGC.search(instruction):
+                    log.info("register_argc_argv set in %s — not decided", where)
+                    return None
+                copy = _COPY.match(instruction)
+                if copy is None:
+                    continue
+                parts = [p for p in copy.group("args").split() if not p.startswith("--chown") and not p.startswith("--chmod")]
+                if any(p.startswith("--from") for p in parts):
+                    if _PHP_CONF_DEST.search(parts[-1] if parts else ""):
+                        return None  # PHP configuration from another stage or image: not read
+                    continue
+                if len(parts) < 2 or not _PHP_CONF_DEST.search(parts[-1]):
+                    continue
+                for source in parts[:-1]:
+                    candidates = [root / source] if not any(c in source for c in "*?[") else list(root.glob(source))
+                    for path in candidates:
+                        files = sorted(path.rglob("*.ini")) if path.is_dir() else [path]
+                        for ini in files:
+                            try:
+                                value = _ini_value(ini.read_text(encoding="utf-8", errors="replace"))
+                            except OSError:
+                                continue
+                            if value == "On":
+                                return None
+                            if value == "Off" and not override:
+                                override = f"{where}: {instruction[:120]} → {ini.relative_to(root).as_posix()}: register_argc_argv = Off"
+        if override:
+            return DetectorResult(
+                "absent", evidence=override, file=dockerfile.name,
+                reason="продовый образ копирует php.ini с register_argc_argv = Off: строка запроса в argv не попадает")
+        fact = next((f for f in images or [] if base.startswith(f.image)), None)
+        if fact is None or fact.register_argc_argv != "Off":
+            return None
+        return DetectorResult(
+            "absent",
+            evidence=(f"{dockerfile.name}:{base_line}: FROM {base} — в этом образе register_argc_argv = Off "
+                      f"(профиль окружения, php_ini_by_image: {fact.image}"
+                      + (f"; проверено: {fact.checked}" if fact.checked else "") + ")"),
+            file=dockerfile.name,
+            reason="register_argc_argv выключен в рабочем образе: строка запроса в argv не попадает")
+    return None
